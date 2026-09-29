@@ -80,10 +80,10 @@ class Exchange:
         )
 
     async def account(self):
-        return [{"totalEq": "10000", "details": [{"ccy": "USDT", "availEq": "9500"}]}]
+        return [{"totalEq": "10000", "details": [{"ccy": "USDT", "eq": "10000", "availEq": "9500"}]}]
 
     async def account_config(self):
-        return [{"posMode": "net_mode"}]
+        return [{"posMode": "net_mode", "acctLv": "2"}]
 
     async def set_leverage(self, symbol, leverage):
         return None

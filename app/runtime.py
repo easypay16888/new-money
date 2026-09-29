@@ -180,21 +180,18 @@ class TradingRuntime:
             config = await self.client.account_config()
             if not config or config[0].get("posMode") != "net_mode":
                 raise RuntimeError("net position mode required")
+            derivatives_mode_eligible = config[0].get("acctLv") in {"2", "3", "4"}
             if (
                 self.settings.mode == Mode.LIVE
                 and config[0].get("uid") != self.settings.confirm_live_account_id
             ):
                 raise RuntimeError("live account ID mismatch")
             details = account[0]
-            equity = Decimal(details["totalEq"])
-            available = sum(
-                (
-                    Decimal(x.get("availEq") or "0")
-                    for x in details.get("details", [])
-                    if x.get("ccy") == "USDT"
-                ),
-                Decimal(0),
+            usdt: dict[str, Any] = next(
+                (x for x in details.get("details", []) if x.get("ccy") == "USDT"), {}
             )
+            equity = Decimal(usdt.get("eq") or "0")
+            available = Decimal(usdt.get("availEq") or usdt.get("availBal") or "0")
             remote_positions = {
                 p["instId"]: Decimal(p["pos"]) for p in positions if Decimal(p["pos"]) != 0
             }
@@ -327,7 +324,7 @@ class TradingRuntime:
                 if expected_positions != remote_positions:
                     await self.enter_halt("startup position mismatch")
                     return
-            if not self.portfolio.synchronized and not remote_positions:
+            if not self.portfolio.synchronized and not remote_positions and derivatives_mode_eligible:
                 for symbol in self.settings.symbols:
                     await self.client.set_leverage(symbol, self.settings.leverage)
             if self.portfolio.synchronized and remote_positions != self.portfolio.positions:
@@ -444,6 +441,10 @@ class TradingRuntime:
             )
             self.reconciliation_healthy = True
             await self._check_portfolio_limits(positions)
+            if not derivatives_mode_eligible:
+                await self.enter_halt("derivatives account mode required")
+            if equity <= 0 or available <= 0:
+                await self.enter_halt("USDT margin unavailable")
             await self.entry_controller.expire()
             if self.emergency.targets:
                 await self.emergency.step_all()

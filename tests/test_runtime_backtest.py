@@ -157,7 +157,7 @@ async def test_reconciliation_halts_on_unexpected_position(tmp_path):
 
     class FakeClient:
         async def account(self):
-            return [{"totalEq": "10000", "details": [{"ccy": "USDT", "availEq": "10000"}]}]
+            return [{"totalEq": "10000", "details": [{"ccy": "USDT", "eq": "10000", "availEq": "10000"}]}]
 
         async def positions(self):
             return [{"instId": "BTC-USDT-SWAP", "pos": "1", "mgnMode": "isolated", "margin": "100"}]
@@ -169,7 +169,7 @@ async def test_reconciliation_halts_on_unexpected_position(tmp_path):
             return []
 
         async def account_config(self):
-            return [{"posMode": "net_mode"}]
+            return [{"posMode": "net_mode", "acctLv": "2"}]
 
     runtime.client = FakeClient()
     await runtime.reconcile()
@@ -192,7 +192,7 @@ async def test_reconciliation_halts_on_unexplained_position_disappearance(tmp_pa
 
     class FakeClient:
         async def account(self):
-            return [{"totalEq": "10000", "details": [{"ccy": "USDT", "availEq": "10000"}]}]
+            return [{"totalEq": "10000", "details": [{"ccy": "USDT", "eq": "10000", "availEq": "10000"}]}]
 
         async def positions(self):
             return []
@@ -204,7 +204,7 @@ async def test_reconciliation_halts_on_unexplained_position_disappearance(tmp_pa
             return []
 
         async def account_config(self):
-            return [{"posMode": "net_mode"}]
+            return [{"posMode": "net_mode", "acctLv": "2"}]
 
     runtime.client = FakeClient()
     await runtime.reconcile()
@@ -228,7 +228,7 @@ async def test_restart_recovers_owned_position_with_protective_algo(tmp_path):
 
     class FakeClient:
         async def account(self):
-            return [{"totalEq": "10000", "details": [{"ccy": "USDT", "availEq": "9500"}]}]
+            return [{"totalEq": "10000", "details": [{"ccy": "USDT", "eq": "10000", "availEq": "9500"}]}]
 
         async def positions(self):
             return [
@@ -262,7 +262,7 @@ async def test_restart_recovers_owned_position_with_protective_algo(tmp_path):
             ]
 
         async def account_config(self):
-            return [{"posMode": "net_mode"}]
+            return [{"posMode": "net_mode", "acctLv": "2"}]
 
     runtime.client = FakeClient()
     await runtime.reconcile()

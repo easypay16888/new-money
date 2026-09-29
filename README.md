@@ -10,10 +10,23 @@ Python 3.12+ 的 OKX USDT 永续合约模拟交易基础工程。默认 `MODE=PA
 
 复制 `.env.example` 为 `.env`，只在本机填入 **Demo Trading API Key**、Secret 和 Passphrase。API 权限：Read=Yes、Trade=Yes、Withdraw=No，建议绑定 IP。请勿提交 `.env`。默认服务区域为 OKX 全球站；其他区域需按账户所属站点的官方文档设置 REST 和 WebSocket URL。
 
+运行 USDT 永续前，在 OKX **模拟交易**账户中选择「合约模式」（API `acctLv=2`）及单向持仓（`net_mode`），并确认有可用 USDT。首次切换账户模式须在 OKX 网站或 App 完成。系统使用 USDT 权益和可用保证金计算风险；现货模式或无可用 USDT 时保持 `HALT`。
+
 ```sh
 cp .env.example .env
 docker compose up --build
 ```
+
+本机未安装 Docker Compose 时，可用已有 Redis 启动本地 Demo 试运行；密钥仍从 `.env` 读取：
+
+```sh
+uv sync --extra dev
+REDIS_URL=redis://127.0.0.1:6379/15 \
+DATABASE_URL=sqlite+aiosqlite:///./data/demo-trading-usdt.db \
+MODE=PAPER uv run uvicorn app.main:app --host 127.0.0.1 --port 8000
+```
+
+此本机方案使用 SQLite，适合初步 Demo 连通性和交易链路观察；长期 Demo soak 应使用 PostgreSQL 和受监督的服务进程。
 
 `http://127.0.0.1:8000/status` 可查看连接、风控、阻断 symbol、emergency 目标仓位与保护单状态。初次启动回填 5 个周期最近的已收盘 K 线，再读取账户、仓位、普通挂单和条件单；对账、Redis 或行情不健康时保持 `HALT`。恢复本系统未完成 entry 时先读取交易所 `accFillSz`，核对已成交仓位及保护单，再撤销剩余 entry；撤单未确认也不会跳过保护核对。保护单必须匹配标的、方向、覆盖数量、触发价、`reduceOnly`、有效状态和失败码。保护不足或无法重新确认时进入 EMERGENCY，持久化目标仓位零并尝试只减仓平仓。外部风险增加订单会触发 HALT 和告警。
 
