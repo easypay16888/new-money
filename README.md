@@ -27,6 +27,7 @@ MODE=PAPER uv run uvicorn app.main:app --host 127.0.0.1 --port 8000
 ```
 
 此本机方案使用 SQLite，适合初步 Demo 连通性和交易链路观察；长期 Demo soak 应使用 PostgreSQL 和受监督的服务进程。
+本机服务与 Compose 共用 Demo 账户及 `8000` 端口，切换部署方式时先正常停止当前实例，避免两个交易引擎同时运行。
 
 `http://127.0.0.1:8000/status` 可查看连接、风控、阻断 symbol、emergency 目标仓位与保护单状态。初次启动回填 5 个周期最近的已收盘 K 线，再读取账户、仓位、普通挂单和条件单；对账、Redis 或行情不健康时保持 `HALT`。恢复本系统未完成 entry 时先读取交易所 `accFillSz`，核对已成交仓位及保护单，再撤销剩余 entry；撤单未确认也不会跳过保护核对。保护单必须匹配标的、方向、覆盖数量、触发价、`reduceOnly`、有效状态和失败码。保护不足或无法重新确认时进入 EMERGENCY，持久化目标仓位零并尝试只减仓平仓。外部风险增加订单会触发 HALT 和告警。
 
@@ -59,7 +60,7 @@ Live 与回测共用 `DecisionPipeline`。回测只使用决策时已收盘的 1
 
 ## Monitoring 与日复盘
 
-`http://127.0.0.1:3000` 是 Grafana 本地仪表板，Prometheus 在 `:9090` 抓取 `/metrics`。面板显示权益、当日盈亏、持仓数、风控状态和连接重试。默认 Grafana 管理员账号及密码均为 `admin`，仅绑定本机。日报每日按 UTC 日期生成到 `daily_reports`，包含权益变化、日内最大回撤、手续费；仅当全部成交提供 `fillPnl` 时汇总已实现盈亏，胜率和盈亏比因缺少可靠的完整交易配对仍显示 `null`。`/performance` 当前只显示权益与当日权益变化。
+`http://127.0.0.1:3300` 是 Grafana 本地仪表板，Prometheus 在 `:9090` 抓取 `/metrics`。面板显示权益、当日盈亏、持仓数、风控状态和连接重试。默认 Grafana 管理员账号及密码均为 `admin`，仅绑定本机。日报每日按 UTC 日期生成到 `daily_reports`，包含权益变化、日内最大回撤、手续费；仅当全部成交提供 `fillPnl` 时汇总已实现盈亏，胜率和盈亏比因缺少可靠的完整交易配对仍显示 `null`。`/performance` 当前只显示权益与当日权益变化。
 
 ## 切换到 LIVE
 
