@@ -7,7 +7,7 @@ from decimal import Decimal
 
 from app.backtest import EventDrivenBacktester, run_walk_forward, walk_forward_indices
 from app.config import Settings
-from app.models import Candle
+from app.models import Candle, DerivativeObservation
 from app.okx import OkxRestClient
 from app.storage import Store
 
@@ -18,7 +18,7 @@ async def run_backtest(symbol: str, equity: Decimal) -> None:
     client = OkxRestClient(settings)
     try:
         await store.initialize()
-        rows = await store.latest("market_candles", limit=100000)
+        rows = await store.all_for_symbol("market_candles", symbol)
         candles = sorted(
             (
                 Candle.model_validate(row)
@@ -40,11 +40,15 @@ async def run_backtest(symbol: str, equity: Decimal) -> None:
             )
             for timeframe in ("1H", "4H", "5m")
         }
+        derivatives = [
+            DerivativeObservation.model_validate(row)
+            for row in await store.all_for_symbol("market_derivatives", symbol)
+        ]
         instruments = await client.instruments()
         if symbol not in instruments:
             raise ValueError("instrument not available")
         result = await EventDrivenBacktester(settings, instruments[symbol]).run(
-            candles, equity, context=context
+            candles, equity, context=context, derivatives=derivatives
         )
         metrics = result.metrics()
         await store.append(
@@ -65,7 +69,7 @@ async def run_walk_forward_command(
     client = OkxRestClient(settings)
     try:
         await store.initialize()
-        rows = await store.latest("market_candles", limit=100000)
+        rows = await store.all_for_symbol("market_candles", symbol)
         candles = sorted(
             (
                 Candle.model_validate(row)
@@ -86,6 +90,10 @@ async def run_walk_forward_command(
             )
             for timeframe in ("1H", "4H", "5m")
         }
+        derivatives = [
+            DerivativeObservation.model_validate(row)
+            for row in await store.all_for_symbol("market_derivatives", symbol)
+        ]
         folds = await run_walk_forward(
             candles,
             settings,
@@ -95,6 +103,7 @@ async def run_walk_forward_command(
             validation,
             out_of_sample,
             context=context,
+            derivatives=derivatives,
         )
         if not folds:
             raise ValueError("not enough candles for one walk-forward fold")

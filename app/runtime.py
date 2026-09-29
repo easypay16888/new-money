@@ -68,6 +68,8 @@ class TradingRuntime:
         self.running = False
         self.evaluated_candles: dict[str, int] = {}
         self.dead_man_healthy = False
+        self._caa_lock = asyncio.Lock()
+        self._caa_shutting_down = False
         self.reconciliation_healthy = False
         self.strategies = build_strategies(settings)
         self.decision_pipeline = DecisionPipeline(settings, self.strategies)
@@ -82,6 +84,7 @@ class TradingRuntime:
 
     async def enter_halt(self, reason: str, *, emergency: bool = False) -> None:
         self.entry_controller.client = self.client
+        emergency = emergency or self.governor.state == GovernorState.EMERGENCY
         repeated = (
             self.governor.reason == reason
             and self.governor.state in {GovernorState.HALT, GovernorState.EMERGENCY}
@@ -101,9 +104,24 @@ class TradingRuntime:
 
     async def enter_emergency(self, symbol: str, reason: str) -> None:
         self.emergency.client = self.client
-        await self.enter_halt(reason, emergency=True)
+        self.entry_controller.client = self.client
+        self.governor.halt(reason, emergency=True)
         await self.emergency.target(symbol)
-        await self.emergency.step(symbol)
+        try:
+            await self.store.append(
+                "risk_events", {"event": "enter_emergency", "reason": reason, "symbol": symbol}
+            )
+        except Exception:
+            logger.error("EMERGENCY audit persistence unavailable")
+        cancellation, reduction = await asyncio.gather(
+            self.entry_controller.cancel_all(),
+            self.emergency.step(symbol),
+            return_exceptions=True,
+        )
+        if cancellation is not True:
+            await self.alert("ERROR", "Entry cancellation unconfirmed", reason)
+        if isinstance(reduction, BaseException):
+            await self.alert("ERROR", "Emergency reduction failed", reason)
 
     async def alert(self, level: str, title: str, message: str) -> None:
         try:
@@ -182,6 +200,9 @@ class TradingRuntime:
             }
             for algo in algos:
                 await self.algo_manager.ingest(algo)
+            startup_entries: list[dict[str, Any]] = []
+            partial_entries: list[dict[str, Any]] = []
+            foreign_order: dict[str, Any] | None = None
             for order in orders:
                 local = self.order_manager.orders.get(order.get("clOrdId", ""))
                 remote_reduce_only = str(order.get("reduceOnly", "false")).lower() in {"true", "1"}
@@ -192,13 +213,97 @@ class TradingRuntime:
                         or bool(local["reduce_only"]) != remote_reduce_only
                     )
                 ):
-                    await self.enter_halt("foreign risk-increasing pending order")
-                    await self.alert("ERROR", "Foreign pending order", str(order.get("ordId", "")))
-                    return
+                    foreign_order = order
+                    continue
                 if local and not local["reduce_only"] and not self.portfolio.synchronized:
-                    if not await self.entry_controller.cancel(local, force=True):
-                        await self.enter_halt("startup entry cancellation unconfirmed")
+                    raw_filled = order.get("accFillSz")
+                    if raw_filled in (None, ""):
+                        if remote_positions.get(local["symbol"]):
+                            await self.enter_emergency(
+                                local["symbol"], "startup entry fill size unavailable"
+                            )
+                        else:
+                            await self.enter_halt("startup entry fill size unavailable")
                         return
+                    filled = Decimal(str(raw_filled))
+                    if filled < 0 or filled < Decimal(local["filled"]):
+                        await self.enter_emergency(local["symbol"], "startup fill size mismatch")
+                        return
+                    if filled > 0:
+                        await self.order_manager.transition(
+                            local["clOrdId"],
+                            OrderState.PARTIALLY_FILLED,
+                            filled=str(filled),
+                            order_id=str(order.get("ordId") or ""),
+                        )
+                        partial_entries.append(local)
+                    startup_entries.append(local)
+            unprotected = self._unprotected_startup_partials(
+                partial_entries, remote_positions, algos
+            )
+            if unprotected:
+                await asyncio.gather(
+                    *(
+                        self.enter_emergency(symbol, "startup partial fill unprotected")
+                        for symbol in unprotected
+                    )
+                )
+                return
+            cancellation_unconfirmed = False
+            for entry in startup_entries:
+                try:
+                    confirmed = await self.entry_controller.cancel(entry, force=True)
+                except Exception:
+                    confirmed = False
+                    self.entry_controller.blocked.add(entry["symbol"])
+                if (
+                    not confirmed
+                    and entry in partial_entries
+                    and entry["state"] == OrderState.CANCELLED.value
+                    and Decimal(entry["filled"]) > 0
+                ):
+                    self.entry_controller.blocked.discard(entry["symbol"])
+                    confirmed = True
+                if not confirmed:
+                    cancellation_unconfirmed = True
+            if partial_entries:
+                try:
+                    positions, algos = await asyncio.gather(
+                        self.client.positions(), self.client.pending_algos()
+                    )
+                except Exception:
+                    await asyncio.gather(
+                        *(
+                            self.enter_emergency(entry["symbol"], "startup coverage uncertain")
+                            for entry in partial_entries
+                        )
+                    )
+                    return
+                remote_positions = {
+                    p["instId"]: Decimal(p["pos"]) for p in positions if Decimal(p["pos"]) != 0
+                }
+                for algo in algos:
+                    await self.algo_manager.ingest(algo)
+                unprotected = self._unprotected_startup_partials(
+                    partial_entries, remote_positions, algos
+                )
+                if unprotected:
+                    await asyncio.gather(
+                        *(
+                            self.enter_emergency(symbol, "startup partial fill unprotected")
+                            for symbol in unprotected
+                        )
+                    )
+                    return
+            if foreign_order is not None:
+                await self.enter_halt("foreign risk-increasing pending order")
+                await self.alert(
+                    "ERROR", "Foreign pending order", str(foreign_order.get("ordId", ""))
+                )
+                return
+            if cancellation_unconfirmed:
+                await self.enter_halt("startup entry cancellation unconfirmed")
+                return
             for symbol, quantity in remote_positions.items():
                 if not await self._verify_protection(symbol, quantity, algos):
                     return
@@ -211,11 +316,6 @@ class TradingRuntime:
                     await self.enter_emergency(symbol, "margin ratio danger")
                 return
             if not self.portfolio.synchronized:
-                if any(
-                    order.get("clOrdId", "") not in self.order_manager.orders for order in orders
-                ):
-                    await self.enter_halt("startup foreign pending orders")
-                    return
                 if any(
                     Decimal(p.get("lever") or "999") > self.settings.max_leverage
                     for p in positions
@@ -269,9 +369,9 @@ class TradingRuntime:
             daily_rows = await self.store.since(
                 "portfolio_snapshots", now.replace(hour=0, minute=0, second=0, microsecond=0)
             )
-            weekly_rows = await self.store.since("portfolio_snapshots", now - timedelta(days=7))
             daily_baseline = Decimal(daily_rows[0]["equity"]) if daily_rows else equity
-            weekly_peak = max([equity] + [Decimal(row["equity"]) for row in weekly_rows])
+            stored_peak = await self.store.max_equity_since(now - timedelta(days=7))
+            weekly_peak = max(equity, stored_peak or equity)
             open_risk = Decimal(0)
             for symbol, quantity in remote_positions.items():
                 instrument = self.instruments.get(symbol)
@@ -350,6 +450,43 @@ class TradingRuntime:
         except Exception as exc:
             await self.enter_halt("reconciliation failed")
             logger.error("reconciliation failed: %s", type(exc).__name__)
+
+    def _unprotected_startup_partials(
+        self,
+        entries: list[dict[str, Any]],
+        positions: dict[str, Decimal],
+        algos: list[dict[str, Any]],
+    ) -> set[str]:
+        unprotected: set[str] = set()
+        for entry in entries:
+            symbol = entry["symbol"]
+            quantity = positions.get(symbol, Decimal(0))
+            direction = Decimal(1) if entry["direction"] == "LONG" else Decimal(-1)
+            instrument = self.instruments.get(symbol)
+            stop = entry.get("stop_price")
+            protective = next(
+                (
+                    algo
+                    for algo in algos
+                    if algo.get("algoClOrdId") == entry.get("protective_algo_id")
+                ),
+                None,
+            )
+            if not (
+                quantity * direction > 0
+                and abs(quantity) >= Decimal(entry["filled"])
+                and instrument is not None
+                and stop
+                and self.algo_manager.valid(
+                    protective,
+                    symbol=symbol,
+                    position=quantity,
+                    stop_price=Decimal(stop),
+                    tolerance=instrument.tick_size,
+                )
+            ):
+                unprotected.add(symbol)
+        return unprotected
 
     async def _verify_protection(
         self, symbol: str, quantity: Decimal, algos: list[dict[str, Any]]
@@ -524,6 +661,20 @@ class TradingRuntime:
                     "ERROR", "Unsafe shutdown", "Cancellation or protection unconfirmed"
                 )
                 raise RuntimeError("shutdown cancellation or protection unconfirmed")
+            pending = await self.client.pending_orders()
+            if self.order_manager.pending_entries() or any(
+                str(order.get("reduceOnly", "false")).lower() not in {"true", "1"}
+                for order in pending
+            ):
+                raise RuntimeError("shutdown risk-increasing entry remains pending")
+            if pending:
+                self._caa_shutting_down = True
+                try:
+                    async with self._caa_lock:
+                        await self.client.cancel_all_after(0)
+                except Exception:
+                    self._caa_shutting_down = False
+                    raise RuntimeError("shutdown could not disable Cancel All After") from None
         elif (
             self.order_manager.pending_entries()
             or self.entry_controller.blocked
@@ -591,7 +742,9 @@ class TradingRuntime:
         state = compute_features(
             self.market.candles[(symbol, "15m")],
             self.market.latest_books.get(symbol),
-            {key: float(value) for key, value in self.market.latest_derivatives[symbol].items()},
+            self.market.derivative_context(
+                symbol, self.market.candles[(symbol, "15m")][-1].timestamp + timedelta(minutes=15)
+            ),
             self.market.latest_trades[symbol],
         )
         if state is None:
@@ -806,7 +959,10 @@ class TradingRuntime:
     async def _dead_man_loop(self) -> None:
         while self.running:
             try:
-                await self.client.cancel_all_after(self.settings.cancel_all_after_seconds)
+                async with self._caa_lock:
+                    if self._caa_shutting_down:
+                        return
+                    await self.client.cancel_all_after(self.settings.cancel_all_after_seconds)
                 self.dead_man_healthy = True
             except Exception:
                 self.dead_man_healthy = False

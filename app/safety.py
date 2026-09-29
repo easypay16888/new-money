@@ -195,7 +195,7 @@ class EmergencyController:
         self._locks: dict[str, asyncio.Lock] = {}
 
     async def restore(self) -> None:
-        for row in reversed(await self.store.latest("emergency_targets", limit=10000)):
+        for row in await self.store.latest_per_symbol("emergency_targets"):
             self.targets[row["symbol"]] = Decimal(row["target"])
             if row.get("completed"):
                 self.targets.pop(row["symbol"], None)

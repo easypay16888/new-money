@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import timedelta
 from decimal import ROUND_DOWN, Decimal
@@ -9,9 +9,10 @@ from typing import Any
 
 from app.config import Settings
 from app.decision import DecisionPipeline
+from app.derivatives import DerivativeHistory
 from app.features import compute_features
 from app.meta import fuse
-from app.models import Candle, Instrument, PortfolioState, Side, Signal
+from app.models import Candle, DerivativeObservation, Instrument, PortfolioState, Side, Signal
 from app.risk import RiskEngine, RiskGovernor
 from app.strategies import build_strategies
 
@@ -120,6 +121,7 @@ class EventDrivenBacktester:
         *,
         warmup_bars: int = 0,
         context: Mapping[str, list[Candle]] | None = None,
+        derivatives: Sequence[DerivativeObservation] = (),
     ) -> BacktestResult:
         if initial_equity <= 0:
             raise ValueError("initial equity must be positive")
@@ -136,6 +138,7 @@ class EventDrivenBacktester:
                 "spread_bps": self.settings.backtest_spread_bps,
                 "funding_rate": self.settings.backtest_funding_rate,
                 "fill_ratio": self.settings.backtest_fill_ratio,
+                "derivative_events": len(derivatives),
             }
         )
         equity = initial_equity
@@ -145,6 +148,9 @@ class EventDrivenBacktester:
         governor = RiskGovernor()
         governor.resume(synchronized=True, healthy=True)
         risk = RiskEngine(self.settings, governor)
+        derivative_history = DerivativeHistory(
+            [item for item in derivatives if item.symbol == self.instrument.symbol]
+        )
         for index, candle in enumerate(candles):
             # Process orders and exits before the just-closed bar enters the feature history.
             if pending and not position:
@@ -276,7 +282,10 @@ class EventDrivenBacktester:
                     )
                     position = None
             history.append(candle)
-            state = compute_features(history)
+            state = compute_features(
+                history,
+                derivatives=derivative_history.at(candle.timestamp + timedelta(minutes=15)),
+            )
             if state and index >= warmup_bars and position is None and pending is None:
                 portfolio = PortfolioState(
                     equity=equity, available_balance=equity, synchronized=True
@@ -364,6 +373,7 @@ async def run_walk_forward(
     validation: int,
     out_of_sample: int,
     context: Mapping[str, list[Candle]] | None = None,
+    derivatives: Sequence[DerivativeObservation] = (),
 ) -> list[dict[str, Any]]:
     folds = []
     for train_slice, validation_slice, oos_slice in walk_forward_indices(
@@ -371,7 +381,11 @@ async def run_walk_forward(
     ):
         engine = EventDrivenBacktester(settings, instrument)
         train_result = await engine.run(
-            candles[train_slice], initial_equity, warmup_bars=min(200, train), context=context
+            candles[train_slice],
+            initial_equity,
+            warmup_bars=min(200, train),
+            context=context,
+            derivatives=derivatives,
         )
         validation_start = max(train_slice.start, validation_slice.start - 200)
         validation_result = await engine.run(
@@ -379,6 +393,7 @@ async def run_walk_forward(
             initial_equity,
             warmup_bars=validation_slice.start - validation_start,
             context=context,
+            derivatives=derivatives,
         )
         oos_start = max(train_slice.start, oos_slice.start - 200)
         oos_result = await engine.run(
@@ -386,6 +401,7 @@ async def run_walk_forward(
             initial_equity,
             warmup_bars=oos_slice.start - oos_start,
             context=context,
+            derivatives=derivatives,
         )
         folds.append(
             {

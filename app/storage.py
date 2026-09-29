@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import JSON, DateTime, Integer, String, select
+from sqlalchemy import JSON, DateTime, Integer, Numeric, String, cast, func, select
 from sqlalchemy.engine.url import make_url
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -28,6 +29,7 @@ class EventRow(Base):
 TABLES = (
     "market_candles",
     "market_trades",
+    "market_derivatives",
     "market_orderbook_snapshots",
     "features",
     "market_regimes",
@@ -125,6 +127,38 @@ class Store:
                     .order_by(row_type.id)
                     .limit(limit)
                 )
+            ).all()
+        return [row.payload for row in rows]
+
+    async def max_equity_since(self, timestamp: datetime) -> Decimal | None:
+        row_type = ROW_TYPES["portfolio_snapshots"]
+        equity = cast(row_type.payload["equity"].as_string(), Numeric(38, 18))
+        async with self.sessions() as session:
+            peak = await session.scalar(
+                select(func.max(equity)).where(row_type.timestamp >= timestamp)
+            )
+        return Decimal(peak) if peak is not None else None
+
+    async def all_for_symbol(self, table: str, symbol: str) -> list[dict[str, Any]]:
+        if table not in ROW_TYPES:
+            raise ValueError(f"unknown table: {table}")
+        row_type = ROW_TYPES[table]
+        async with self.sessions() as session:
+            rows = (
+                await session.scalars(
+                    select(row_type).where(row_type.symbol == symbol).order_by(row_type.id)
+                )
+            ).all()
+        return [row.payload for row in rows]
+
+    async def latest_per_symbol(self, table: str) -> list[dict[str, Any]]:
+        if table not in ROW_TYPES:
+            raise ValueError(f"unknown table: {table}")
+        row_type = ROW_TYPES[table]
+        latest_ids = select(func.max(row_type.id)).group_by(row_type.symbol)
+        async with self.sessions() as session:
+            rows = (
+                await session.scalars(select(row_type).where(row_type.id.in_(latest_ids)))
             ).all()
         return [row.payload for row in rows]
 

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import math
 from collections import defaultdict, deque
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -9,7 +8,8 @@ from typing import Any
 
 from redis.asyncio import Redis
 
-from app.models import Candle, MarketTick, OrderBook, Trade
+from app.derivatives import DerivativeHistory
+from app.models import Candle, DerivativeObservation, MarketTick, OrderBook, Trade
 from app.storage import Store
 
 
@@ -37,7 +37,16 @@ class MarketDataEngine:
         self.latest_derivatives: dict[str, dict[str, Decimal]] = defaultdict(dict)
         self.last_book_snapshot: dict[str, datetime] = {}
         self.orderbook_snapshot_interval_seconds = orderbook_snapshot_interval_seconds
-        self.funding_history: dict[str, deque[Decimal]] = defaultdict(lambda: deque(maxlen=100))
+        self.derivative_observations: dict[str, dict[str, deque[DerivativeObservation]]] = (
+            defaultdict(
+                lambda: {
+                    "mark": deque(maxlen=512),
+                    "index": deque(maxlen=512),
+                    "funding": deque(maxlen=100),
+                    "oi": deque(maxlen=512),
+                }
+            )
+        )
         self.latest_trades: dict[str, deque[Trade]] = defaultdict(lambda: deque(maxlen=100))
 
     async def handle(self, message: dict[str, Any], *, historical: bool = False) -> None:
@@ -116,8 +125,7 @@ class MarketDataEngine:
                     )
                     self.last_book_snapshot[symbol] = book.timestamp
             elif channel in {"mark-price", "funding-rate", "open-interest", "index-tickers"}:
-                if row.get("ts"):
-                    okx_time(row["ts"])
+                timestamp = okx_time(row["ts"])
                 if channel == "index-tickers":
                     symbol += "-SWAP"
                 field = {
@@ -131,32 +139,29 @@ class MarketDataEngine:
                 ]
                 if row.get(source):
                     value = Decimal(row[source])
-                    previous = self.latest_derivatives[symbol].get(field)
-                    self.latest_derivatives[symbol][field] = value
-                    if field == "oi" and previous and previous > 0:
-                        self.latest_derivatives[symbol]["oi_change"] = (value - previous) / previous
-                    if field == "funding":
-                        history = self.funding_history[symbol]
-                        if not history or history[-1] != value:
-                            history.append(value)
-                        if len(history) >= 10:
-                            mean = sum(history, Decimal(0)) / Decimal(len(history))
-                            variance = sum((float(x - mean) ** 2 for x in history), 0.0) / len(
-                                history
-                            )
-                            self.latest_derivatives[symbol]["funding_zscore"] = Decimal(
-                                str(float(value - mean) / math.sqrt(variance) if variance else 0)
-                            )
-                    derivatives = self.latest_derivatives[symbol]
-                    if derivatives.get("index"):
-                        if derivatives.get("mark"):
-                            derivatives["premium"] = (
-                                derivatives["mark"] - derivatives["index"]
-                            ) / derivatives["index"]
+                    observation = DerivativeObservation(
+                        symbol=symbol, timestamp=timestamp, kind=field, value=value
+                    )
+                    self.derivative_observations[symbol][field].append(observation)
+                    await self.store.append(
+                        "market_derivatives", observation.model_dump(mode="json"), symbol=symbol
+                    )
+                    self.latest_derivatives[symbol] = {
+                        key: Decimal(str(item))
+                        for key, item in self.derivative_context(symbol, datetime.now(UTC)).items()
+                    }
                     await self._cache(
                         f"derivatives:{symbol}",
                         {k: str(v) for k, v in self.latest_derivatives[symbol].items()},
                     )
+
+    def derivative_context(self, symbol: str, as_of: datetime) -> dict[str, float]:
+        observations = [
+            observation
+            for series in self.derivative_observations[symbol].values()
+            for observation in series
+        ]
+        return DerivativeHistory(observations).at(as_of)
 
     async def _cache(self, key: str, value: dict[str, Any]) -> None:
         if self.redis is not None:

@@ -34,6 +34,7 @@ class Exchange:
         self.place_error = False
         self.query_error = False
         self.algo_error = False
+        self.caa_calls: list[int] = []
 
     async def pending_orders(self):
         return list(self.pending)
@@ -43,8 +44,16 @@ class Exchange:
 
     async def cancel_order(self, symbol, *, client_order_id="", order_id=""):
         self.cancelled.append(client_order_id or order_id)
+        filled = next(
+            (
+                row.get("accFillSz", "0")
+                for row in self.pending
+                if row.get("clOrdId") == client_order_id
+            ),
+            "0",
+        )
         self.pending = [row for row in self.pending if row.get("clOrdId") != client_order_id]
-        self.order_state[client_order_id] = {"state": "canceled", "accFillSz": "0"}
+        self.order_state[client_order_id] = {"state": "canceled", "accFillSz": filled}
         return [{"sCode": "0"}]
 
     async def order(self, symbol, client_order_id):
@@ -78,6 +87,9 @@ class Exchange:
 
     async def set_leverage(self, symbol, leverage):
         return None
+
+    async def cancel_all_after(self, seconds):
+        self.caa_calls.append(seconds)
 
     async def place_order(self, body):
         self.placed.append(body)
@@ -130,7 +142,7 @@ async def runtime_with_entry(tmp_path):
     request = ExecutionEngine.from_risk(evaluate(ready_risk()), instrument())
     await runtime.order_manager.create(request)
     await runtime.order_manager.transition(request.client_order_id, OrderState.ACKNOWLEDGED)
-    exchange.pending = [{"instId": SYMBOL, "clOrdId": request.client_order_id}]
+    exchange.pending = [{"instId": SYMBOL, "clOrdId": request.client_order_id, "accFillSz": "0"}]
     return runtime, exchange, request
 
 
@@ -285,6 +297,83 @@ async def test_shutdown_preserves_open_position_stop(tmp_path):
     runtime.running = True
     await runtime.stop()
     assert exchange.algos and not exchange.cancelled
+    await runtime.store.close()
+
+
+@pytest.mark.asyncio
+async def test_graceful_shutdown_disables_caa_for_retained_reduce_only_exit(tmp_path):
+    runtime, exchange, request = await runtime_with_entry(tmp_path)
+    await runtime.order_manager.transition(request.client_order_id, OrderState.FILLED, filled="1")
+    exchange.position = Decimal(1)
+    exchange.pending = [
+        {"instId": SYMBOL, "clOrdId": "exit-1", "reduceOnly": "true", "accFillSz": "0"}
+    ]
+    exchange.algos = [
+        {
+            "algoClOrdId": runtime.order_manager.orders[request.client_order_id][
+                "protective_algo_id"
+            ],
+            "instId": SYMBOL,
+            "side": "sell",
+            "sz": "1",
+            "slTriggerPx": "49500",
+            "state": "live",
+            "failCode": "",
+            "reduceOnly": "true",
+        }
+    ]
+    runtime.running = True
+    await runtime.stop()
+    assert exchange.caa_calls == [0]
+    assert exchange.pending[0]["clOrdId"] == "exit-1"
+    assert exchange.algos
+    runtime.running = True
+    await runtime._dead_man_loop()
+    assert exchange.caa_calls == [0]
+    runtime.running = False
+    await runtime.store.close()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_keeps_heartbeat_when_caa_disable_fails(tmp_path):
+    runtime, exchange, request = await runtime_with_entry(tmp_path)
+    await runtime.order_manager.transition(request.client_order_id, OrderState.FILLED, filled="1")
+    exchange.position = Decimal(1)
+    exchange.pending = [
+        {"instId": SYMBOL, "clOrdId": "exit-1", "reduceOnly": "true", "accFillSz": "0"}
+    ]
+    exchange.algos = [
+        {
+            "algoClOrdId": runtime.order_manager.orders[request.client_order_id][
+                "protective_algo_id"
+            ],
+            "instId": SYMBOL,
+            "side": "sell",
+            "sz": "1",
+            "slTriggerPx": "49500",
+            "state": "live",
+            "failCode": "",
+            "reduceOnly": "true",
+        }
+    ]
+
+    async def reject_disable(seconds):
+        exchange.caa_calls.append(seconds)
+        if seconds == 0:
+            raise OkxError("CAA unavailable")
+
+    exchange.cancel_all_after = reject_disable
+    runtime.running = True
+    with pytest.raises(RuntimeError, match="Cancel All After"):
+        await runtime.stop()
+    assert runtime.running
+    assert not runtime._caa_shutting_down
+    heartbeat = asyncio.create_task(runtime._dead_man_loop())
+    await asyncio.sleep(0)
+    heartbeat.cancel()
+    await asyncio.gather(heartbeat, return_exceptions=True)
+    assert exchange.caa_calls == [0, runtime.settings.cancel_all_after_seconds]
+    runtime.running = False
     await runtime.store.close()
 
 

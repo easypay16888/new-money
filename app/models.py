@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from decimal import Decimal
 from enum import StrEnum
-from typing import Any
+from typing import Any, Literal
 from uuid import uuid4
 
 from pydantic import BaseModel, Field
@@ -96,6 +96,13 @@ class OpenInterest(BaseModel):
     symbol: str
     timestamp: datetime
     contracts: Decimal
+
+
+class DerivativeObservation(BaseModel):
+    symbol: str
+    timestamp: datetime
+    kind: Literal["mark", "index", "funding", "oi"]
+    value: Decimal
 
 
 class Instrument(BaseModel):
