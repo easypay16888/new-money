@@ -24,6 +24,13 @@ logger = logging.getLogger("okx")
 
 
 class OkxError(RuntimeError):
+    def __init__(self, message: str, *, code: str = "", data: list[Any] | None = None) -> None:
+        super().__init__(message)
+        self.code = code
+        self.data = data or []
+
+
+class OkxOrderRejected(OkxError):
     pass
 
 
@@ -51,7 +58,7 @@ class OkxRestClient:
         path: str,
         *,
         params: dict[str, str] | None = None,
-        body: dict[str, Any] | None = None,
+        body: Any | None = None,
         private: bool = False,
     ) -> list[Any]:
         method = method.upper()
@@ -88,7 +95,11 @@ class OkxRestClient:
             if self.latency_observer is not None:
                 self.latency_observer(path, time.monotonic() - started)
         if result.get("code") != "0":
-            raise OkxError(f"OKX {method} {path}: {result.get('code')} {result.get('msg')}")
+            raise OkxError(
+                f"OKX {method} {path}: {result.get('code')} {result.get('msg')}",
+                code=str(result.get("code")),
+                data=result.get("data", []),
+            )
         return result.get("data", [])
 
     async def instruments(self) -> dict[str, Instrument]:
@@ -154,21 +165,54 @@ class OkxRestClient:
         return conditional + oco
 
     async def order(self, symbol: str, client_order_id: str) -> list[dict[str, Any]]:
-        return await self.request(
-            "GET",
-            "/api/v5/trade/order",
-            params={"instId": symbol, "clOrdId": client_order_id},
-            private=True,
-        )
+        try:
+            return await self.request(
+                "GET",
+                "/api/v5/trade/order",
+                params={"instId": symbol, "clOrdId": client_order_id},
+                private=True,
+            )
+        except OkxError as exc:
+            if exc.code == "51603":
+                return []
+            raise
 
     async def place_order(self, body: dict[str, Any]) -> list[dict[str, Any]]:
         if self.settings.mode == Mode.BACKTEST:
             raise OkxError("backtest mode cannot submit orders")
         if self.settings.mode == Mode.LIVE and not self.settings.live_trading_enabled:
             raise OkxError("live trading disabled")
-        data = await self.request("POST", "/api/v5/trade/order", body=body, private=True)
+        try:
+            data = await self.request("POST", "/api/v5/trade/order", body=body, private=True)
+        except OkxError as exc:
+            if exc.data and any(item.get("sCode") not in {None, "0"} for item in exc.data):
+                raise OkxOrderRejected(str(exc), code=exc.code, data=exc.data) from exc
+            raise
         if any(item.get("sCode") != "0" for item in data):
-            raise OkxError(f"OKX order rejected: {[item.get('sCode') for item in data]}")
+            raise OkxOrderRejected(f"OKX order rejected: {[item.get('sCode') for item in data]}")
+        return data
+
+    async def place_algo(self, body: dict[str, Any]) -> list[dict[str, Any]]:
+        if self.settings.mode == Mode.BACKTEST:
+            raise OkxError("backtest mode cannot submit algo orders")
+        if self.settings.mode == Mode.LIVE and not self.settings.live_trading_enabled:
+            raise OkxError("live trading disabled")
+        data = await self.request("POST", "/api/v5/trade/order-algo", body=body, private=True)
+        if any(item.get("sCode") != "0" for item in data):
+            raise OkxError("OKX protective algo rejected")
+        return data
+
+    async def cancel_algo(
+        self, symbol: str, *, algo_id: str = "", client_algo_id: str = ""
+    ) -> list[dict[str, Any]]:
+        if not algo_id and not client_algo_id:
+            raise ValueError("algo ID required")
+        body = [
+            {"instId": symbol, "algoId" if algo_id else "algoClOrdId": algo_id or client_algo_id}
+        ]
+        data = await self.request("POST", "/api/v5/trade/cancel-algos", body=body, private=True)
+        if any(item.get("sCode") != "0" for item in data):
+            raise OkxError("OKX algo cancel rejected")
         return data
 
     async def cancel_order(
@@ -178,12 +222,15 @@ class OkxRestClient:
             raise ValueError("order ID required")
         body = {"instId": symbol}
         body["clOrdId" if client_order_id else "ordId"] = client_order_id or order_id
-        return await self.request(
+        data = await self.request(
             "POST",
             "/api/v5/trade/cancel-order",
             body=body,
             private=True,
         )
+        if any(item.get("sCode") != "0" for item in data):
+            raise OkxError("OKX order cancel rejected")
+        return data
 
     async def cancel_all_after(self, seconds: int) -> None:
         await self.request(

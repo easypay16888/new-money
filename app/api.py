@@ -60,6 +60,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "risk_state": runtime.governor.state,
             "reason": runtime.governor.reason,
             "synchronized": runtime.portfolio.synchronized,
+            "blocked_symbols": sorted(runtime.entry_controller.blocked),
+            "emergency_targets": {
+                symbol: str(target) for symbol, target in runtime.emergency.targets.items()
+            },
+            "protective_algos": list(runtime.algo_manager.algos.values()),
             "websockets": [
                 {
                     "url": ws.url,
@@ -122,8 +127,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.post("/system/halt", dependencies=[Depends(authorize)])
     async def halt() -> dict:
-        runtime.governor.halt("manual kill switch")
-        await runtime.store.append("risk_events", {"event": "manual halt"})
+        await runtime.enter_halt("manual kill switch")
         return {"state": runtime.governor.state}
 
     @app.post("/system/resume", dependencies=[Depends(authorize)])
@@ -134,6 +138,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             and runtime.dead_man_healthy
             and runtime.store.healthy
             and runtime.redis is not None
+            and not runtime.entry_controller.blocked
+            and not runtime.emergency.targets
+            and not runtime.portfolio_monitor.breached(runtime.portfolio, [])[0]
             and all(ws.is_fresh() for ws in runtime.sockets)
         )
         if not runtime.governor.resume(
@@ -146,15 +153,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.post("/orders/cancel-all", dependencies=[Depends(authorize)])
     async def cancel_all() -> dict:
-        runtime.governor.halt("manual cancel all")
-        remote = await runtime.client.pending_orders()
-        for order in remote:
-            await runtime.client.cancel_order(
-                order["instId"],
-                client_order_id=order.get("clOrdId", ""),
-                order_id=order.get("ordId", ""),
-            )
-        return {"requested": len(remote), "risk_state": GovernorState.HALT}
+        await runtime.enter_halt("manual cancel all")
+        return {"confirmed": not runtime.entry_controller.blocked, "risk_state": GovernorState.HALT}
 
     return app
 

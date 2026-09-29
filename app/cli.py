@@ -29,10 +29,23 @@ async def run_backtest(symbol: str, equity: Decimal) -> None:
         )
         if len(candles) < 201:
             raise ValueError("backtest requires at least 201 confirmed 15m candles")
+        context = {
+            timeframe: sorted(
+                (
+                    Candle.model_validate(row)
+                    for row in rows
+                    if row.get("symbol") == symbol and row.get("timeframe") == timeframe
+                ),
+                key=lambda item: item.timestamp,
+            )
+            for timeframe in ("1H", "4H", "5m")
+        }
         instruments = await client.instruments()
         if symbol not in instruments:
             raise ValueError("instrument not available")
-        result = await EventDrivenBacktester(settings, instruments[symbol]).run(candles, equity)
+        result = await EventDrivenBacktester(settings, instruments[symbol]).run(
+            candles, equity, context=context
+        )
         metrics = result.metrics()
         await store.append(
             "backtest_runs",
@@ -62,8 +75,26 @@ async def run_walk_forward_command(
             key=lambda item: item.timestamp,
         )
         instruments = await client.instruments()
+        context = {
+            timeframe: sorted(
+                (
+                    Candle.model_validate(row)
+                    for row in rows
+                    if row.get("symbol") == symbol and row.get("timeframe") == timeframe
+                ),
+                key=lambda item: item.timestamp,
+            )
+            for timeframe in ("1H", "4H", "5m")
+        }
         folds = await run_walk_forward(
-            candles, settings, instruments[symbol], equity, train, validation, out_of_sample
+            candles,
+            settings,
+            instruments[symbol],
+            equity,
+            train,
+            validation,
+            out_of_sample,
+            context=context,
         )
         if not folds:
             raise ValueError("not enough candles for one walk-forward fold")

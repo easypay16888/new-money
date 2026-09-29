@@ -37,6 +37,27 @@ def candles(count: int) -> list[Candle]:
     return rows
 
 
+def confirmation_context() -> dict[str, list[Candle]]:
+    start = datetime(2024, 1, 1, tzinfo=UTC)
+    return {
+        timeframe: [
+            Candle(
+                symbol="BTC-USDT-SWAP",
+                timeframe=timeframe,
+                timestamp=start + timedelta(minutes=duration * index),
+                open=Decimal("100"),
+                high=Decimal("100.1"),
+                low=Decimal("99.9"),
+                close=Decimal("100"),
+                volume=Decimal("10"),
+                confirmed=True,
+            )
+            for index in range(200)
+        ]
+        for timeframe, duration in (("1H", 60), ("4H", 240), ("5m", 5))
+    }
+
+
 @pytest.mark.asyncio
 async def test_backtest_executes_after_signal_and_charges_costs(monkeypatch):
     class ForcedStrategy:
@@ -59,8 +80,8 @@ async def test_backtest_executes_after_signal_and_charges_costs(monkeypatch):
 
     monkeypatch.setattr(backtest_module, "build_strategies", lambda settings: (ForcedStrategy(),))
     engine = EventDrivenBacktester(Settings(_env_file=None), instrument())
-    before = await engine.run(candles(200), Decimal("10000"))
-    after = await engine.run(candles(201), Decimal("10000"))
+    before = await engine.run(candles(200), Decimal("10000"), context=confirmation_context())
+    after = await engine.run(candles(201), Decimal("10000"), context=confirmation_context())
     assert before.trades == []
     assert len(after.trades) == 1
     trade = after.trades[0]
@@ -101,7 +122,7 @@ async def test_backtest_gap_through_stop_fills_at_worse_open(monkeypatch):
         }
     )
     result = await EventDrivenBacktester(Settings(_env_file=None), instrument()).run(
-        rows, Decimal("10000")
+        rows, Decimal("10000"), context=confirmation_context()
     )
     assert result.trades[0].exit < Decimal("95")
 
@@ -152,8 +173,8 @@ async def test_reconciliation_halts_on_unexpected_position(tmp_path):
 
     runtime.client = FakeClient()
     await runtime.reconcile()
-    assert runtime.governor.state == GovernorState.HALT
-    assert runtime.governor.reason == "position mismatch"
+    assert runtime.governor.state == GovernorState.EMERGENCY
+    assert runtime.governor.reason == "protective stop cannot be verified"
     await runtime.store.close()
 
 
@@ -227,7 +248,18 @@ async def test_restart_recovers_owned_position_with_protective_algo(tmp_path):
             return []
 
         async def pending_algos(self):
-            return [{"algoClOrdId": protective_id}]
+            return [
+                {
+                    "algoClOrdId": protective_id,
+                    "instId": "BTC-USDT-SWAP",
+                    "side": "sell",
+                    "sz": "1",
+                    "slTriggerPx": "49500",
+                    "state": "live",
+                    "failCode": "",
+                    "reduceOnly": "true",
+                }
+            ]
 
         async def account_config(self):
             return [{"posMode": "net_mode"}]

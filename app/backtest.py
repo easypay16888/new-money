@@ -1,15 +1,17 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping
 from dataclasses import dataclass, field
+from datetime import timedelta
 from decimal import ROUND_DOWN, Decimal
 from typing import Any
 
 from app.config import Settings
+from app.decision import DecisionPipeline
 from app.features import compute_features
 from app.meta import fuse
 from app.models import Candle, Instrument, PortfolioState, Side, Signal
-from app.regime import classify
 from app.risk import RiskEngine, RiskGovernor
 from app.strategies import build_strategies
 
@@ -109,9 +111,15 @@ class EventDrivenBacktester:
         self.settings = settings
         self.instrument = instrument
         self.strategies = build_strategies(settings)
+        self.decision_pipeline = DecisionPipeline(settings, self.strategies)
 
     async def run(
-        self, candles: list[Candle], initial_equity: Decimal, *, warmup_bars: int = 0
+        self,
+        candles: list[Candle],
+        initial_equity: Decimal,
+        *,
+        warmup_bars: int = 0,
+        context: Mapping[str, list[Candle]] | None = None,
     ) -> BacktestResult:
         if initial_equity <= 0:
             raise ValueError("initial equity must be positive")
@@ -270,21 +278,20 @@ class EventDrivenBacktester:
             history.append(candle)
             state = compute_features(history)
             if state and index >= warmup_bars and position is None and pending is None:
-                regime = classify(state, self.settings)
                 portfolio = PortfolioState(
                     equity=equity, available_balance=equity, synchronized=True
                 )
-                signals = [
-                    s
-                    for strategy in self.strategies
-                    if (s := await strategy.generate_signal(state, portfolio, regime))
-                ]
-                intent = fuse(
-                    signals,
-                    portfolio,
-                    self.settings.min_signal_confidence,
-                    as_of=candle.timestamp,
-                    weights=self.settings.strategy_weights,
+                bars = {"15m": history}
+                for timeframe in ("1H", "4H", "5m"):
+                    duration = {"1H": 60, "4H": 240, "5m": 5}[timeframe]
+                    bars[timeframe] = [
+                        bar
+                        for bar in (context or {}).get(timeframe, [])
+                        if bar.timestamp + timedelta(minutes=duration)
+                        <= candle.timestamp + timedelta(minutes=15)
+                    ]
+                signals, intent = await self.decision_pipeline.decide(
+                    bars, portfolio, main_state=state
                 )
                 if intent:
                     pending = max(
@@ -356,6 +363,7 @@ async def run_walk_forward(
     train: int,
     validation: int,
     out_of_sample: int,
+    context: Mapping[str, list[Candle]] | None = None,
 ) -> list[dict[str, Any]]:
     folds = []
     for train_slice, validation_slice, oos_slice in walk_forward_indices(
@@ -363,19 +371,21 @@ async def run_walk_forward(
     ):
         engine = EventDrivenBacktester(settings, instrument)
         train_result = await engine.run(
-            candles[train_slice], initial_equity, warmup_bars=min(200, train)
+            candles[train_slice], initial_equity, warmup_bars=min(200, train), context=context
         )
         validation_start = max(train_slice.start, validation_slice.start - 200)
         validation_result = await engine.run(
             candles[validation_start : validation_slice.stop],
             initial_equity,
             warmup_bars=validation_slice.start - validation_start,
+            context=context,
         )
         oos_start = max(train_slice.start, oos_slice.start - 200)
         oos_result = await engine.run(
             candles[oos_start : oos_slice.stop],
             initial_equity,
             warmup_bars=oos_slice.start - oos_start,
+            context=context,
         )
         folds.append(
             {

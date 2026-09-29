@@ -43,10 +43,11 @@ class Settings(BaseSettings):
     orderbook_snapshot_interval_seconds: float = Field(default=5, gt=0)
     request_timeout_seconds: float = Field(default=8, gt=0)
     reconcile_interval_seconds: float = Field(default=30, gt=0)
+    entry_cancel_confirm_seconds: float = Field(default=15, gt=0)
+    protection_confirm_seconds: float = Field(default=10, gt=0)
     ws_backoff_max_seconds: float = Field(default=30, gt=0)
     cancel_all_after_seconds: int = Field(default=60, ge=10, le=120)
     cancel_all_after_refresh_seconds: int = Field(default=20, ge=1)
-    emergency_reduce_on_partial_fill: bool = True
     min_signal_confidence: float = Field(default=0.65, ge=0, le=1)
     maker_fee: float = 0.0002
     taker_fee: float = 0.0005

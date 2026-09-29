@@ -184,6 +184,7 @@ class TradeIntent(BaseModel):
     stop_price: Decimal
     take_profit_reference: Decimal | None
     timestamp: datetime = Field(default_factory=utcnow)
+    expires_at: datetime | None = None
 
 
 class PortfolioState(BaseModel):
@@ -217,6 +218,7 @@ class RiskDecision(BaseModel):
     stop_price: Decimal | None = None
     entry_reference: Decimal | None = None
     take_profit_reference: Decimal | None = None
+    signal_expires_at: datetime | None = None
 
 
 class ExecutionRequest(BaseModel):
@@ -225,6 +227,7 @@ class ExecutionRequest(BaseModel):
     order_type: str = "limit"
     price: Decimal | None = None
     reduce_only: bool = False
+    signal_expires_at: datetime | None = None
 
     @property
     def symbol(self) -> str:

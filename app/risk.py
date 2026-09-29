@@ -12,7 +12,11 @@ class RiskGovernor:
         self.reason = "startup reconciliation pending"
 
     def halt(self, reason: str, emergency: bool = False) -> None:
-        self.state = GovernorState.EMERGENCY if emergency else GovernorState.HALT
+        self.state = (
+            GovernorState.EMERGENCY
+            if emergency or self.state == GovernorState.EMERGENCY
+            else GovernorState.HALT
+        )
         self.reason = reason
 
     def resume(self, *, synchronized: bool, healthy: bool) -> bool:
@@ -66,7 +70,8 @@ class RiskEngine:
         if portfolio.positions.get(intent.symbol):
             return reject("position already open")
         if portfolio.margin_used / portfolio.equity >= Decimal(str(self.settings.max_margin_usage)):
-            return reject("margin usage limit")
+            self.governor.halt("margin usage limit")
+            return reject(self.governor.reason, "HALT")
         if spread > Decimal(str(self.settings.max_spread_ratio)):
             self.governor.halt("spread explosion")
             return reject(self.governor.reason, "HALT")
@@ -133,6 +138,7 @@ class RiskEngine:
             stop_price=stop,
             entry_reference=entry,
             take_profit_reference=target,
+            signal_expires_at=intent.expires_at,
         )
 
     def emergency_reduce(

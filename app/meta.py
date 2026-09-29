@@ -54,4 +54,5 @@ def fuse(
         entry_reference=strongest.entry_reference,
         stop_price=strongest.stop_price,
         take_profit_reference=strongest.take_profit_reference,
+        expires_at=min(s.expires_at for s in winners),
     )

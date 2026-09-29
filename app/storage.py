@@ -35,6 +35,8 @@ TABLES = (
     "trade_intents",
     "orders",
     "order_events",
+    "algo_events",
+    "emergency_targets",
     "fills",
     "positions",
     "portfolio_snapshots",

@@ -148,6 +148,9 @@ async def test_partial_fill_triggers_reduce_only_emergency(tmp_path):
         async def pending_algos(self):
             return []
 
+        async def positions(self):
+            return [{"instId": entry.symbol, "pos": "0.5"}]
+
         async def cancel_order(self, symbol, **identifiers):
             self.cancelled.append((symbol, identifiers))
 

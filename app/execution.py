@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import asyncio
 import logging
+from collections.abc import Callable
+from datetime import UTC, datetime, timedelta
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 from typing import Any
 from uuid import uuid4
 
 from app.models import ExecutionRequest, Instrument, OrderState, RiskDecision, Side
-from app.okx import OkxError, OkxRestClient
+from app.okx import OkxError, OkxOrderRejected, OkxRestClient
 from app.storage import Store
 
 logger = logging.getLogger("execution")
@@ -21,6 +24,11 @@ class OrderManager:
     async def create(self, request: ExecutionRequest) -> None:
         if request.client_order_id in self.orders:
             raise ValueError("duplicate client order ID")
+        if not request.reduce_only and request.signal_expires_at is None:
+            raise ValueError("entry order requires signal expiry")
+        expires = request.signal_expires_at
+        if expires is not None and expires.tzinfo is None:
+            expires = expires.replace(tzinfo=UTC)
         row = {
             "clOrdId": request.client_order_id,
             "symbol": request.symbol,
@@ -41,6 +49,8 @@ class OrderManager:
                 else ""
             ),
             "reduce_only": request.reduce_only,
+            "created_at": datetime.now(UTC).isoformat(),
+            "signal_expires_at": (expires.isoformat() if expires else ""),
             "protective_algo_id": (
                 "a" + request.client_order_id[1:] if not request.reduce_only else ""
             ),
@@ -132,6 +142,7 @@ class OrderManager:
         await self.transition(
             client_id, state, filled=event.get("accFillSz", "0"), order_id=event.get("ordId", "")
         )
+
         if event.get("fillSz") and Decimal(event["fillSz"]) > 0:
             trade_id = str(event.get("tradeId", ""))
             if trade_id and trade_id not in self.seen_trade_ids:
@@ -148,15 +159,30 @@ class OrderManager:
             deltas[row["symbol"]] = deltas.get(row["symbol"], Decimal(0)) + signed
         return deltas
 
+    def pending_entries(self) -> list[dict]:
+        return [
+            row
+            for row in self.orders.values()
+            if not row["reduce_only"] and row["state"] not in {"FILLED", "CANCELLED", "REJECTED"}
+        ]
+
     def mark_reconciled(self) -> None:
         for row in self.orders.values():
             row["reconciled_filled"] = row["filled"]
 
 
 class ExecutionEngine:
-    def __init__(self, client: OkxRestClient, manager: OrderManager) -> None:
+    def __init__(
+        self,
+        client: OkxRestClient,
+        manager: OrderManager,
+        entry_allowed: Callable[[], bool] | None = None,
+        entry_lock: asyncio.Lock | None = None,
+    ) -> None:
         self.client = client
         self.manager = manager
+        self.entry_allowed = entry_allowed
+        self.entry_lock = entry_lock
 
     @staticmethod
     def from_risk(
@@ -165,6 +191,7 @@ class ExecutionEngine:
         *,
         order_type: str = "limit",
         reduce_only: bool = False,
+        signal_expires_at: datetime | None = None,
     ) -> ExecutionRequest:
         if (
             not decision.approved
@@ -188,9 +215,29 @@ class ExecutionEngine:
             order_type=order_type,
             price=price,
             reduce_only=reduce_only,
+            signal_expires_at=(
+                signal_expires_at
+                or decision.signal_expires_at
+                or (datetime.now(UTC) + timedelta(minutes=15) if not reduce_only else None)
+            ),
         )
 
     async def submit(self, request: ExecutionRequest) -> None:
+        if not request.reduce_only and self.entry_lock is not None:
+            async with self.entry_lock:
+                await self._submit_unlocked(request)
+            return
+        await self._submit_unlocked(request)
+
+    async def _submit_unlocked(self, request: ExecutionRequest) -> None:
+        if not request.reduce_only and self.entry_allowed and not self.entry_allowed():
+            raise OkxError("risk-increasing order blocked")
+        if not request.reduce_only and request.signal_expires_at:
+            expires = request.signal_expires_at
+            if expires.tzinfo is None:
+                expires = expires.replace(tzinfo=UTC)
+            if expires <= datetime.now(UTC):
+                raise OkxError("expired signal cannot submit entry")
         await self.manager.create(request)
         decision = request.risk_decision
         body: dict[str, Any] = {
@@ -225,8 +272,21 @@ class ExecutionEngine:
                     }
                 )
         await self.manager.transition(request.client_order_id, OrderState.SUBMITTED)
+        if not request.reduce_only and request.signal_expires_at:
+            expiry = request.signal_expires_at
+            if expiry.tzinfo is None:
+                expiry = expiry.replace(tzinfo=UTC)
+            if expiry <= datetime.now(UTC):
+                await self.manager.transition(request.client_order_id, OrderState.CANCELLED)
+                raise OkxError("expired signal cannot submit entry")
+        if not request.reduce_only and self.entry_allowed and not self.entry_allowed():
+            await self.manager.transition(request.client_order_id, OrderState.CANCELLED)
+            raise OkxError("risk-increasing order blocked")
         try:
             result = await self.client.place_order(body)
+        except OkxOrderRejected:
+            await self.manager.transition(request.client_order_id, OrderState.REJECTED)
+            raise
         except OkxError:
             # An HTTP timeout does not prove rejection. Query by the same clOrdId, never retry placement.
             try:
@@ -237,6 +297,19 @@ class ExecutionEngine:
         if not result:
             await self.manager.transition(request.client_order_id, OrderState.UNKNOWN)
             raise OkxError("order state unconfirmed")
+        remote_state = result[0].get("state")
+        if remote_state in {"rejected", "canceled"}:
+            await self.manager.transition(
+                request.client_order_id,
+                OrderState.REJECTED if remote_state == "rejected" else OrderState.CANCELLED,
+            )
+            raise OkxError("order rejected or canceled by exchange")
+        state = {"filled": OrderState.FILLED, "partially_filled": OrderState.PARTIALLY_FILLED}.get(
+            str(remote_state), OrderState.ACKNOWLEDGED
+        )
         await self.manager.transition(
-            request.client_order_id, OrderState.ACKNOWLEDGED, order_id=result[0].get("ordId", "")
+            request.client_order_id,
+            state,
+            order_id=result[0].get("ordId", ""),
+            filled=result[0].get("accFillSz", "0"),
         )
