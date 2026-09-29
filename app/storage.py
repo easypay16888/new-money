@@ -47,6 +47,7 @@ TABLES = (
     "strategy_metrics",
     "backtest_runs",
     "daily_reports",
+    "notification_events",
 )
 ROW_TYPES: dict[str, type[EventRow]] = {}
 for table in TABLES:

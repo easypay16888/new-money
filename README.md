@@ -62,6 +62,26 @@ Live 与回测共用 `DecisionPipeline`。回测只使用决策时已收盘的 1
 
 `http://127.0.0.1:3300` 是 Grafana 本地仪表板，Prometheus 在 `:9090` 抓取 `/metrics`。面板显示权益、当日盈亏、持仓数、风控状态和连接重试。默认 Grafana 管理员账号及密码均为 `admin`，仅绑定本机。日报每日按 UTC 日期生成到 `daily_reports`，包含权益变化、日内最大回撤、手续费；仅当全部成交提供 `fillPnl` 时汇总已实现盈亏，胜率和盈亏比因缺少可靠的完整交易配对仍显示 `null`。`/performance` 当前只显示权益与当日权益变化。
 
+### Bark 主动通知
+
+Bark 默认关闭。需要推送时，先在本机 `.env` 设置以下值，然后正常重启 Demo 服务：
+
+```dotenv
+BARK_ENABLED=true
+BARK_SERVER=https://api.day.app
+BARK_DEVICE_KEY=...
+BARK_GROUP=OKX Quant
+BARK_TIMEOUT_SECONDS=5
+BARK_HEARTBEAT_HOURS=6
+BARK_DEDUP_SECONDS=60
+```
+
+`BARK_DEVICE_KEY` 是 secret，只能放在本机环境变量或未跟踪的 `.env` 中；不要写入代码、日志或提交 GitHub。缺少密钥或 Bark 配置无效时，运行时跳过 Bark 通道并记录不含密钥的错误，交易系统继续运行。推送使用 Bark 的 HTTP POST JSON API。可选 `BARK_SOUND`、`BARK_CRITICAL_SOUND`（默认 `alarm`）和 `BARK_CRITICAL_VOLUME`（默认 `5`）。
+
+交易运行时只把事件放入有界队列，由独立 worker 发送到 Console、Bark 或现有 Webhook。队列满时先丢弃低优先级事件，优先保留 CRITICAL；同一 `dedup_key` 的重复事件默认 60 秒内抑制，恢复和明确的风控状态转换仍会发送。Bark 超时、服务错误、DNS 故障及通知审计数据库故障不会触发 HALT，也不会阻塞下单、对账、EMERGENCY 或安全停机。发送失败最多重试 3 次，间隔 1、2、5 秒；安全停机完成后最多等待通知队列 3 秒。`notification_events` 只记录状态、次数和错误类型，不记录设备密钥或完整 Bark URL。
+
+推送涵盖启动完成、正常停机、HALT/EMERGENCY、关键基础设施异常与恢复、entry 提交及成交、保护单确认、仓位平仓、每日 UTC 报告。默认每 6 小时发送 PASSIVE 心跳，风险状态非 NORMAL 时显示警告和原因。日报复用现有 `daily_reports`，缺少可靠成交配对的胜率、单笔净盈亏和 R 不会被编造。Prometheus 暴露发送、失败、丢弃、队列长度和延迟指标；Grafana 继续负责历史监控。
+
 ## 切换到 LIVE
 
 **真实资金交易存在损失风险。当前版本尚未完成全部验收，不得启用 LIVE。** 配置层要求 `MODE=LIVE`、`LIVE_TRADING_ENABLED=true` 和 `CONFIRM_LIVE_ACCOUNT_ID` 三项同时存在；启动时还核对账户 UID。LIVE 控制 API 需要额外配置 `API_TOKEN` 并以 Bearer token 调用。Compose 的 `MODE` 从 `.env` 读取，默认始终为 PAPER。上线前必须完成账户模式、止损单、故障注入和全链路人工验收。

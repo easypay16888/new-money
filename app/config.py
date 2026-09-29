@@ -3,7 +3,7 @@ from __future__ import annotations
 from enum import StrEnum
 from functools import lru_cache
 
-from pydantic import Field, model_validator
+from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -71,6 +71,16 @@ class Settings(BaseSettings):
     strategy_weights: dict[str, float] = {"trend": 1.0, "breakout": 1.0, "mean_reversion": 0.8}
     api_token: str = ""
     alert_webhook_url: str = ""
+    bark_enabled: bool = False
+    bark_server: str = "https://api.day.app"
+    bark_device_key: SecretStr = SecretStr("")
+    bark_group: str = "OKX Quant"
+    bark_timeout_seconds: float = Field(default=5, gt=0, le=30)
+    bark_heartbeat_hours: float = Field(default=6, gt=0)
+    bark_dedup_seconds: float = Field(default=60, ge=0)
+    bark_sound: str = ""
+    bark_critical_sound: str = "alarm"
+    bark_critical_volume: int = Field(default=5, ge=0, le=10)
 
     @model_validator(mode="after")
     def validate_live(self) -> Settings:

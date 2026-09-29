@@ -149,6 +149,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(
                 status_code=409, detail="cannot resume until all dependencies and state are healthy"
             )
+        await runtime._send_observation(runtime._notify_risk_state())
+        await runtime._send_observation(runtime._publish_started_if_ready())
         return {"state": runtime.governor.state}
 
     @app.post("/orders/cancel-all", dependencies=[Depends(authorize)])

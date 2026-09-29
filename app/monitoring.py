@@ -6,12 +6,15 @@ from abc import ABC, abstractmethod
 import httpx
 from prometheus_client import CollectorRegistry, Counter, Gauge, Histogram, generate_latest
 
-from app.models import GovernorState, PortfolioState
+from app.models import GovernorState, NotificationEvent, PortfolioState
 
 logger = logging.getLogger("monitoring")
 
 
 class Notification(ABC):
+    async def send(self, event: NotificationEvent) -> None:
+        await self.send_alert(event.level.value, event.title, event.message)
+
     @abstractmethod
     async def send_alert(self, level: str, title: str, message: str) -> None: ...
 
@@ -72,6 +75,26 @@ class Metrics:
         self.signals = Counter("quant_signals_total", "Strategy signals", registry=self.registry)
         self.api_latency = Histogram(
             "quant_api_latency_seconds", "OKX REST latency", ["path"], registry=self.registry
+        )
+        notification_labels = ["channel", "priority", "category"]
+        self.notification_sent = Counter(
+            "quant_notifications_sent_total", "Notifications delivered", notification_labels,
+            registry=self.registry,
+        )
+        self.notification_failed = Counter(
+            "quant_notifications_failed_total", "Notifications that exhausted retries",
+            notification_labels, registry=self.registry,
+        )
+        self.notification_dropped = Counter(
+            "quant_notifications_dropped_total", "Notifications discarded before delivery",
+            ["priority", "category"], registry=self.registry,
+        )
+        self.notification_queue_size = Gauge(
+            "quant_notification_queue_size", "Queued notifications", registry=self.registry
+        )
+        self.notification_latency = Histogram(
+            "quant_notification_latency_seconds", "Notification delivery latency",
+            notification_labels, registry=self.registry,
         )
 
     def observe_latency(self, path: str, seconds: float) -> None:

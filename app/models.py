@@ -37,6 +37,43 @@ class GovernorState(StrEnum):
     EMERGENCY = "EMERGENCY"
 
 
+class NotificationLevel(StrEnum):
+    INFO = "INFO"
+    TRADE = "TRADE"
+    WARNING = "WARNING"
+    ERROR = "ERROR"
+    CRITICAL = "CRITICAL"
+
+
+class NotificationCategory(StrEnum):
+    SYSTEM = "SYSTEM"
+    TRADE = "TRADE"
+    RISK = "RISK"
+    INFRASTRUCTURE = "INFRASTRUCTURE"
+    DAILY_REPORT = "DAILY_REPORT"
+    HEARTBEAT = "HEARTBEAT"
+
+
+class NotificationPriority(StrEnum):
+    PASSIVE = "PASSIVE"
+    ACTIVE = "ACTIVE"
+    TIME_SENSITIVE = "TIME_SENSITIVE"
+    CRITICAL = "CRITICAL"
+
+
+class NotificationEvent(BaseModel):
+    id: str = Field(default_factory=lambda: uuid4().hex)
+    timestamp: datetime = Field(default_factory=utcnow)
+    level: NotificationLevel
+    category: NotificationCategory
+    title: str
+    message: str
+    symbol: str | None = None
+    dedup_key: str | None = None
+    priority: NotificationPriority = NotificationPriority.ACTIVE
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
 class OrderState(StrEnum):
     CREATED = "CREATED"
     SUBMITTED = "SUBMITTED"

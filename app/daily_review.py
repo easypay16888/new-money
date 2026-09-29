@@ -44,6 +44,15 @@ async def build_daily_review(store: Store, day: date) -> dict[str, Any]:
         "fees": str(fees),
         "max_drawdown": str(max_drawdown) if snapshots else None,
         "risk_events": len(risk_events),
+        "halt_count": sum(
+            row.get("event") == "enter_halt" and not row.get("emergency")
+            for row in risk_events
+        ),
+        "emergency_count": sum(
+            row.get("event") == "enter_emergency"
+            or (row.get("event") == "enter_halt" and row.get("emergency"))
+            for row in risk_events
+        ),
         "anomalies": [
             row.get("reason", row.get("event"))
             for row in risk_events
