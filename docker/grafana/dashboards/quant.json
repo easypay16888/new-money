@@ -1,0 +1,20 @@
+{
+  "title": "OKX Quant Demo",
+  "uid": "okx-quant-demo",
+  "schemaVersion": 39,
+  "version": 1,
+  "panels": [
+    {"id": 1, "type": "stat", "title": "Equity (USDT)", "gridPos": {"h": 7, "w": 6, "x": 0, "y": 0}, "targets": [{"expr": "quant_equity_usdt"}]},
+    {"id": 2, "type": "stat", "title": "Daily PnL", "gridPos": {"h": 7, "w": 6, "x": 6, "y": 0}, "targets": [{"expr": "quant_daily_pnl_usdt"}]},
+    {"id": 3, "type": "stat", "title": "Open positions", "gridPos": {"h": 7, "w": 6, "x": 12, "y": 0}, "targets": [{"expr": "quant_open_positions"}]},
+    {"id": 4, "type": "stat", "title": "Risk state", "gridPos": {"h": 7, "w": 6, "x": 18, "y": 0}, "targets": [{"expr": "quant_risk_state"}]},
+    {"id": 5, "type": "timeseries", "title": "Equity history", "gridPos": {"h": 8, "w": 12, "x": 0, "y": 7}, "targets": [{"expr": "quant_equity_usdt"}]},
+    {"id": 6, "type": "timeseries", "title": "WebSocket reconnects", "gridPos": {"h": 8, "w": 12, "x": 12, "y": 7}, "targets": [{"expr": "quant_ws_reconnects"}]},
+    {"id": 7, "type": "stat", "title": "Weekly drawdown", "gridPos": {"h": 7, "w": 6, "x": 0, "y": 15}, "targets": [{"expr": "quant_weekly_drawdown_ratio"}]},
+    {"id": 8, "type": "stat", "title": "Directional exposure", "gridPos": {"h": 7, "w": 6, "x": 6, "y": 15}, "targets": [{"expr": "quant_directional_exposure_ratio"}]},
+    {"id": 9, "type": "stat", "title": "Data stale", "gridPos": {"h": 7, "w": 6, "x": 12, "y": 15}, "targets": [{"expr": "quant_data_stale"}]},
+    {"id": 10, "type": "stat", "title": "Trade fills", "gridPos": {"h": 7, "w": 6, "x": 18, "y": 15}, "targets": [{"expr": "quant_trade_count"}]},
+    {"id": 11, "type": "timeseries", "title": "REST latency", "gridPos": {"h": 8, "w": 12, "x": 0, "y": 22}, "targets": [{"expr": "histogram_quantile(0.95, sum(rate(quant_api_latency_seconds_bucket[5m])) by (le, path))"}]},
+    {"id": 12, "type": "timeseries", "title": "Order errors", "gridPos": {"h": 8, "w": 12, "x": 12, "y": 22}, "targets": [{"expr": "rate(quant_order_errors_total[5m])"}]}
+  ]
+}
