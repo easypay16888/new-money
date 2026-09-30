@@ -78,6 +78,16 @@ class Settings(BaseSettings):
     bark_timeout_seconds: float = Field(default=5, gt=0, le=30)
     bark_heartbeat_hours: float = Field(default=6, gt=0)
     bark_dedup_seconds: float = Field(default=60, ge=0)
+    bark_heartbeat_enabled: bool = False
+    bark_notify_entry_submitted: bool = False
+    bark_notify_system_stopping: bool = False
+    bark_notify_fast_recovery: bool = False
+    bark_infra_alert_delay_seconds: float = Field(default=60, ge=0)
+    bark_incident_merge_window_seconds: float = Field(default=300, ge=0)
+    bark_trade_notifications: bool = True
+    bark_risk_notifications: bool = True
+    bark_daily_report: bool = True
+    webhook_notifications_verbose: bool = True
     bark_sound: str = ""
     bark_critical_sound: str = "alarm"
     bark_critical_volume: int = Field(default=5, ge=0, le=10)

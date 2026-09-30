@@ -18,6 +18,7 @@ from app.models import (
     NotificationPriority,
 )
 from app.monitoring import ConsoleNotification, Metrics, Notification
+from app.notification_policy import NotificationPolicy
 from app.notifications import BarkNotification, NotificationManager
 
 logger = logging.getLogger("watchdog")
@@ -33,6 +34,7 @@ class WatchdogSettings(BaseSettings):
     watchdog_failure_threshold: int = Field(default=3, ge=1)
     watchdog_recovery_threshold: int = Field(default=2, ge=1)
     watchdog_startup_grace_seconds: float = Field(default=120, ge=0)
+    watchdog_unhealthy_alert_seconds: float = Field(default=60, ge=0)
     watchdog_bark_group: str = ""
     bark_server: str = "https://api.day.app"
     bark_device_key: SecretStr = SecretStr("")
@@ -73,6 +75,8 @@ class WatchdogMonitor:
         self.successes = 0
         self.failure_kind: str | None = None
         self.alerted_kind: str | None = None
+        self.unhealthy_since: float | None = None
+        self.unhealthy_bark_eligible = False
 
     async def check(self) -> None:
         kind, error, status = await self._probe()
@@ -92,16 +96,30 @@ class WatchdogMonitor:
                     dedup_key="watchdog:app-state",
                     metadata={"recovery": True},
                 ))
+            if self.successes >= self.settings.watchdog_recovery_threshold:
+                self.unhealthy_since = None
+                self.unhealthy_bark_eligible = False
             return
         self.successes = 0
         if self.clock() - self.started_at < self.settings.watchdog_startup_grace_seconds:
             self.failures = 0
             self.failure_kind = None
             return
+        if kind == "APP_ALIVE_BUT_UNHEALTHY" and self.failure_kind != kind:
+            self.unhealthy_since = self.clock()
         self.failures = self.failures + 1 if self.failure_kind == kind else 1
         self.failure_kind = kind
-        if self.failures < self.settings.watchdog_failure_threshold or self.alerted_kind == kind:
+        if self.failures < self.settings.watchdog_failure_threshold:
             return
+        bark_eligible = (
+            kind == "APP_ALIVE_BUT_UNHEALTHY"
+            and self.unhealthy_since is not None
+            and self.clock() - self.unhealthy_since
+            >= self.settings.watchdog_unhealthy_alert_seconds
+        )
+        if self.alerted_kind == kind and (not bark_eligible or self.unhealthy_bark_eligible):
+            return
+        self.unhealthy_bark_eligible |= bark_eligible
         self.alerted_kind = kind
         if kind == "APP_DOWN":
             title = "🚨 Trading App Offline"
@@ -122,7 +140,7 @@ class WatchdogMonitor:
             message=message,
             priority=priority,
             dedup_key="watchdog:app-state",
-            metadata={"transition": True},
+            metadata={"transition": True, "bark_eligible": bark_eligible},
         ))
 
     async def _probe(self) -> tuple[str | None, str, dict[str, Any] | None]:
@@ -169,7 +187,7 @@ async def run_watchdog() -> None:
             logger.error("watchdog Bark disabled: %s", type(exc).__name__)
     else:
         logger.error("watchdog Bark disabled: device key is missing")
-    notifications = NotificationManager(channels, Metrics())
+    notifications = NotificationManager(channels, Metrics(), policy=NotificationPolicy())
     notifications.start()
     try:
         async with httpx.AsyncClient(timeout=5) as client:

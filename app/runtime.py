@@ -17,6 +17,7 @@ from app.daily_review import save_daily_review
 from app.decision import DecisionPipeline
 from app.execution import ExecutionEngine, OrderManager
 from app.features import compute_features
+from app.incidents import IncidentManager
 from app.market import MarketDataEngine
 from app.models import (
     GovernorState,
@@ -30,6 +31,7 @@ from app.models import (
     utcnow,
 )
 from app.monitoring import ConsoleNotification, Metrics, Notification, WebhookNotification
+from app.notification_policy import NotificationPolicy
 from app.notifications import BarkNotification, NotificationManager
 from app.okx import (
     OkxError,
@@ -86,6 +88,7 @@ class TradingRuntime:
             self.client, self.execution, self.order_manager, self.store, self.instruments, self.risk
         )
         self.portfolio = PortfolioState(equity=Decimal(0), available_balance=Decimal(0))
+        self._notification_remote_exposure = False
         self.sockets: list[OkxWebSocket] = []
         self.tasks: list[asyncio.Task[Any]] = []
         self.running = False
@@ -115,6 +118,20 @@ class TradingRuntime:
         self.notifications = NotificationManager(
             channels, self.metrics, store=self.store,
             dedup_seconds=settings.bark_dedup_seconds,
+            policy=NotificationPolicy(
+                heartbeat_enabled=settings.bark_heartbeat_enabled,
+                entry_submitted=settings.bark_notify_entry_submitted,
+                system_stopping=settings.bark_notify_system_stopping,
+                trade_enabled=settings.bark_trade_notifications,
+                risk_enabled=settings.bark_risk_notifications,
+                daily_enabled=settings.bark_daily_report,
+                webhook_verbose=settings.webhook_notifications_verbose,
+            ),
+            incidents=IncidentManager(
+                delay_seconds=settings.bark_infra_alert_delay_seconds,
+                merge_window_seconds=settings.bark_incident_merge_window_seconds,
+                notify_fast_recovery=settings.bark_notify_fast_recovery,
+            ),
         )
         self.started_at = utcnow()
         self._started_notified = False
@@ -234,7 +251,15 @@ class TradingRuntime:
                 NotificationEvent(
                     level=NotificationLevel(level), category=category, title=title,
                     message=message, symbol=symbol, dedup_key=dedup_key,
-                    priority=priority, metadata=metadata or {},
+                    priority=priority,
+                    metadata={
+                        "risk_state": self.governor.state.value,
+                        "has_exposure": (
+                            self._notification_remote_exposure
+                            or any(size != 0 for size in self.portfolio.positions.values())
+                        ),
+                        **(metadata or {}),
+                    },
                 )
             )
         except Exception as exc:
@@ -366,6 +391,7 @@ class TradingRuntime:
             remote_positions = {
                 p["instId"]: Decimal(p["pos"]) for p in positions if Decimal(p["pos"]) != 0
             }
+            self._notification_remote_exposure = bool(remote_positions)
             for algo in algos:
                 await self.algo_manager.ingest(algo)
             startup_entries: list[dict[str, Any]] = []
@@ -450,6 +476,7 @@ class TradingRuntime:
                 remote_positions = {
                     p["instId"]: Decimal(p["pos"]) for p in positions if Decimal(p["pos"]) != 0
                 }
+                self._notification_remote_exposure = bool(remote_positions)
                 for algo in algos:
                     await self.algo_manager.ingest(algo)
                 unprotected = self._unprotected_startup_partials(

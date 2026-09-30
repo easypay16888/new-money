@@ -96,6 +96,27 @@ class Metrics:
             "quant_notification_latency_seconds", "Notification delivery latency",
             notification_labels, registry=self.registry,
         )
+        self.notification_policy_suppressed = Counter(
+            "quant_notification_policy_suppressed_total", "Notifications filtered by channel policy",
+            ["channel", "category"], registry=self.registry,
+        )
+        incident_labels = ["category", "severity", "component"]
+        self.incidents_open = Gauge(
+            "quant_incidents_open", "Open notification incidents", incident_labels,
+            registry=self.registry,
+        )
+        self.incidents_total = Counter(
+            "quant_incidents_total", "Notification incidents opened", incident_labels,
+            registry=self.registry,
+        )
+        self.incidents_resolved = Counter(
+            "quant_incidents_resolved_total", "Notification incidents resolved",
+            incident_labels, registry=self.registry,
+        )
+        self.incident_duration = Histogram(
+            "quant_incident_duration_seconds", "Resolved notification incident duration",
+            incident_labels, registry=self.registry,
+        )
         self.auto_recovery_attempts = Counter(
             "quant_auto_recovery_attempts_total", "Auto recovery health checks",
             ["reason_class"], registry=self.registry,

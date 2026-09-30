@@ -74,13 +74,25 @@ BARK_GROUP=OKX Quant
 BARK_TIMEOUT_SECONDS=5
 BARK_HEARTBEAT_HOURS=6
 BARK_DEDUP_SECONDS=60
+BARK_HEARTBEAT_ENABLED=false
+BARK_NOTIFY_ENTRY_SUBMITTED=false
+BARK_NOTIFY_SYSTEM_STOPPING=false
+BARK_NOTIFY_FAST_RECOVERY=false
+BARK_INFRA_ALERT_DELAY_SECONDS=60
+BARK_INCIDENT_MERGE_WINDOW_SECONDS=300
+BARK_TRADE_NOTIFICATIONS=true
+BARK_RISK_NOTIFICATIONS=true
+BARK_DAILY_REPORT=true
+WEBHOOK_NOTIFICATIONS_VERBOSE=true
 ```
 
 `BARK_DEVICE_KEY` 是 secret，只能放在本机环境变量或未跟踪的 `.env` 中；不要写入代码、日志或提交 GitHub。缺少密钥或 Bark 配置无效时，运行时跳过 Bark 通道并记录不含密钥的错误，交易系统继续运行。推送使用 Bark 的 HTTP POST JSON API。可选 `BARK_SOUND`、`BARK_CRITICAL_SOUND`（默认 `alarm`）和 `BARK_CRITICAL_VOLUME`（默认 `5`）。
 
 交易运行时只把事件放入有界队列，由 dispatcher 分发给 Console、Bark 和 Webhook 各自独立的优先级队列与 worker。单个渠道超时或重试不会阻塞其他渠道；失败重试延时放在待发送队列中，不占用发送 worker，后来的 CRITICAL 会优先发送。队列满时先丢弃低优先级事件，优先保留 CRITICAL；同一 `dedup_key` 的重复事件默认 60 秒内抑制，恢复和明确的风控状态转换仍会发送。Bark 只有 HTTP 2xx 且 JSON 明确返回 `code=200` 或 `code=0` 才算成功；HTML、空响应及缺少成功码都会重试。Bark 超时、服务错误、DNS 故障及通知审计数据库故障不会触发 HALT，也不会阻塞下单、对账、EMERGENCY 或安全停机。发送失败最多重试 3 次，间隔 1、2、5 秒；安全停机完成后最多等待通知队列 3 秒。`notification_events` 按渠道分别记录状态、次数和错误类型，不记录设备密钥或完整 Bark URL。
 
-推送涵盖启动完成、计划停机的 Stopping/Stopped、非计划 HALT/EMERGENCY、关键基础设施异常与恢复、entry 提交及成交、保护单确认、仓位平仓、每日 UTC 报告。默认每 6 小时发送 PASSIVE 心跳，风险状态非 NORMAL 时显示警告和原因。日报复用现有 `daily_reports`，缺少可靠成交配对的胜率、单笔净盈亏和 R 不会被编造。Prometheus 暴露发送、失败、丢弃、队列长度和延迟指标；Grafana 继续负责历史监控。
+`NotificationPolicy` 按渠道筛选事件：Console 保留详细事件，Webhook 默认保留详细事件（设 `WEBHOOK_NOTIFICATIONS_VERBOSE=false` 可使用同样的低噪音规则），Bark 只接收重要事件。Bark 默认接收真实成交、保护单确认、平仓、系统启动及停机、日报和严重风控事件；心跳、entry 提交、计划停机的 Stopping、普通信号和单次基础设施抖动默认静默。可按需单独开启上述配置。成交与保护单各推一次，按对应订单或保护单 ID 去重；不会伪造缺失的单笔净盈亏或 R。
+
+`IncidentManager` 把 WebSocket、Redis、CAA 与对账异常合并为运行事故。持续不足 60 秒且恢复的异常只写入内部事故记录；持续超过阈值才推一次告警，并在风控真正恢复 NORMAL 后推一次合并恢复通知。组件自己的恢复事件不逐条推 Bark。严重 HALT、EMERGENCY、未保护持仓、暴露下的异常订单、Watchdog App Offline 等立即旁路延迟和策略异常；Bark 或事故审计失败不参与任何交易及风控决策。事故生命周期写入 `system_events`，包括实际 Bark 发送确认状态；Prometheus 额外暴露策略抑制次数、事故数、未解决事故数和持续时间。日报复用现有 `daily_reports`，Grafana 继续负责完整历史监控。
 
 ### External Watchdog
 
@@ -93,10 +105,11 @@ WATCHDOG_INTERVAL_SECONDS=60
 WATCHDOG_FAILURE_THRESHOLD=3
 WATCHDOG_RECOVERY_THRESHOLD=2
 WATCHDOG_STARTUP_GRACE_SECONDS=120
+WATCHDOG_UNHEALTHY_ALERT_SECONDS=60
 WATCHDOG_BARK_GROUP=OKX Quant Watchdog
 ```
 
-本机独立运行时，把 `WATCHDOG_STATUS_URL` 改为 `http://127.0.0.1:8000/status`，然后在另一个受监督的进程中执行 `uv run python -m app.watchdog`。启动前 120 秒只检查不告警；之后连续 3 次不可达或返回错误状态才通知，连续 2 次健康才通知恢复。HTTP 可达但 `running=false`、未同步或 WebSocket 不新鲜会报告 App Unhealthy；风险状态 HALT/EMERGENCY 本身不代表进程离线。Watchdog 不发送常规心跳，不参与交易安全决策。
+本机独立运行时，把 `WATCHDOG_STATUS_URL` 改为 `http://127.0.0.1:8000/status`，然后在另一个受监督的进程中执行 `uv run python -m app.watchdog`。启动前 120 秒只检查不告警；之后连续 3 次不可达或返回错误状态才通知 App Offline。HTTP 可达但 `running=false`、未同步或 WebSocket 不新鲜属于 App Unhealthy，Bark 要在异常持续达到 `WATCHDOG_UNHEALTHY_ALERT_SECONDS` 后才推送。连续 2 次健康后，仅当先前的告警真正送达 Bark 才推送恢复。风险状态 HALT/EMERGENCY 本身不代表进程离线。Watchdog 不发送常规心跳，不参与交易安全决策。
 
 ## 切换到 LIVE
 

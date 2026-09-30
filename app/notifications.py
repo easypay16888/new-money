@@ -14,6 +14,7 @@ from urllib.parse import urlsplit
 import httpx
 from pydantic import SecretStr
 
+from app.incidents import IncidentManager
 from app.models import (
     NotificationCategory,
     NotificationEvent,
@@ -21,6 +22,7 @@ from app.models import (
     NotificationPriority,
 )
 from app.monitoring import Metrics, Notification
+from app.notification_policy import NotificationPolicy
 from app.storage import Store
 
 logger = logging.getLogger("notifications")
@@ -150,6 +152,8 @@ class NotificationManager:
         dedup_seconds: float = 60,
         retry_delays: tuple[float, ...] = (1, 2, 5),
         channel_timeout_seconds: float = 5,
+        policy: NotificationPolicy | None = None,
+        incidents: IncidentManager | None = None,
     ) -> None:
         if max_queue < 1:
             raise ValueError("notification queue must have capacity")
@@ -160,6 +164,10 @@ class NotificationManager:
         self.dedup_seconds = dedup_seconds
         self.retry_delays = retry_delays
         self.channel_timeout_seconds = channel_timeout_seconds
+        self.policy = policy
+        self.incidents = incidents
+        self._incident_task: asyncio.Task[None] | None = None
+        self._incident_audits: set[asyncio.Task[None]] = set()
         self._channels = [
             _ChannelState(channel, type(channel).__name__.removesuffix("Notification").lower())
             for channel in channels
@@ -200,11 +208,60 @@ class NotificationManager:
                 state.worker.add_done_callback(partial(self._channel_worker_done, state))
         self._worker = asyncio.create_task(self._run(), name="notification-worker")
         self._worker.add_done_callback(self._worker_done)
+        if self.incidents is not None:
+            self._incident_task = asyncio.create_task(
+                self._run_incidents(), name="notification-incident-worker"
+            )
+
+    async def _run_incidents(self) -> None:
+        assert self.incidents is not None
+        while not self._stopping:
+            await asyncio.sleep(0.25)
+            try:
+                generated = self.incidents.due()
+                self._record_incident_changes()
+                for event in generated:
+                    await self.publish(event)
+            except Exception as exc:
+                logger.error("notification incident worker error_type=%s", type(exc).__name__)
+
+    def _record_incident_changes(self) -> None:
+        if self.incidents is None:
+            return
+        for incident, transition in self.incidents.take_changes():
+            labels = {"category": "infrastructure", "severity": incident.severity,
+                      "component": "trading"}
+            if transition == "opened":
+                self.metrics.incidents_total.labels(**labels).inc()
+                self.metrics.incidents_open.labels(**labels).set(1)
+            elif transition == "resolved":
+                self.metrics.incidents_resolved.labels(**labels).inc()
+                self.metrics.incidents_open.labels(**labels).set(0)
+                self.metrics.incident_duration.labels(**labels).observe(
+                    incident.duration_seconds or 0
+                )
+            if self.store is not None:
+                task = asyncio.create_task(
+                    self._audit_incident(incident.record(transition), incident.id)
+                )
+                self._incident_audits.add(task)
+                task.add_done_callback(self._incident_audits.discard)
+
+    async def _audit_incident(self, payload: dict[str, object], incident_id: str) -> None:
+        assert self.store is not None
+        try:
+            async with asyncio.timeout(0.5):
+                await self.store.append("system_events", payload, reference_id=incident_id)
+        except Exception as exc:
+            logger.error("incident audit unavailable: %s", type(exc).__name__)
 
     async def publish(self, event: NotificationEvent) -> None:
         """Enqueue without awaiting network, persistence, or queue capacity."""
         try:
-            if event.level == NotificationLevel.CRITICAL and event.priority != NotificationPriority.CRITICAL:
+            if (
+                NotificationPolicy.is_critical(event)
+                and event.priority != NotificationPriority.CRITICAL
+            ):
                 event = event.model_copy(update={"priority": NotificationPriority.CRITICAL})
             elif event.level == NotificationLevel.ERROR and event.priority in {
                 NotificationPriority.PASSIVE, NotificationPriority.ACTIVE,
@@ -213,6 +270,17 @@ class NotificationManager:
             if not self._accepting:
                 self._drop(event)
                 return
+            generated: list[NotificationEvent] = []
+            if self.incidents is not None:
+                try:
+                    generated = self.incidents.observe(event)
+                    self._record_incident_changes()
+                except Exception as exc:
+                    logger.error(
+                        "notification incident observation error_type=%s", type(exc).__name__
+                    )
+            for derived in generated:
+                await self.publish(derived)
             now = monotonic()
             fingerprint = (
                 event.dedup_key or "",
@@ -294,7 +362,36 @@ class NotificationManager:
     async def _deliver(self, event: NotificationEvent) -> None:
         for state in self._channels:
             try:
-                self._enqueue_channel(state, _Delivery(event))
+                routed = event
+                if self.policy is not None:
+                    try:
+                        decision = self.policy.evaluate(event, state.name)
+                    except Exception as exc:
+                        logger.error(
+                            "notification policy error_type=%s channel=%s",
+                            type(exc).__name__, state.name,
+                        )
+                        decision = None
+                    if decision is None:
+                        if state.name == "bark" and not NotificationPolicy.is_critical(event):
+                            self.metrics.notification_policy_suppressed.labels(
+                                channel=state.name, category=event.category.value
+                            ).inc()
+                            continue
+                        if state.name == "bark" and NotificationPolicy.is_critical(event):
+                            routed = event.model_copy(update={
+                                "priority": NotificationPriority.CRITICAL
+                            })
+                    elif not decision.send and not (
+                        state.name == "bark" and NotificationPolicy.is_critical(event)
+                    ):
+                        self.metrics.notification_policy_suppressed.labels(
+                            channel=state.name, category=event.category.value
+                        ).inc()
+                        continue
+                    elif decision.priority is not None and decision.priority != event.priority:
+                        routed = event.model_copy(update={"priority": decision.priority})
+                self._enqueue_channel(state, _Delivery(routed))
             except Exception as exc:
                 logger.error("notification channel enqueue failed: channel=%s error_type=%s",
                              state.name, type(exc).__name__)
@@ -408,6 +505,14 @@ class NotificationManager:
                     return
                 self._drop(event)
             self.metrics.notification_failed.labels(**labels).inc()
+            if self.policy is not None:
+                try:
+                    self.policy.failed(event, state.name)
+                except Exception as policy_exc:
+                    logger.error(
+                        "notification policy failure receipt error_type=%s",
+                        type(policy_exc).__name__,
+                    )
             logger.error(
                 "notification delivery failed: channel=%s priority=%s error_type=%s status=%s",
                 state.name, event.priority.value, delivery.error_type, delivery.status_code,
@@ -415,6 +520,21 @@ class NotificationManager:
             sent = False
         else:
             self.metrics.notification_sent.labels(**labels).inc()
+            if self.policy is not None:
+                try:
+                    pending_recovery = self.policy.delivered(event, state.name)
+                    if pending_recovery is not None:
+                        self._enqueue_channel(state, _Delivery(pending_recovery))
+                except Exception as exc:
+                    logger.error("notification policy receipt error_type=%s", type(exc).__name__)
+            if state.name == "bark" and self.incidents is not None:
+                try:
+                    generated = self.incidents.delivery_confirmed(event)
+                    self._record_incident_changes()
+                    for derived in generated:
+                        await self.publish(derived)
+                except Exception as exc:
+                    logger.error("incident receipt error_type=%s", type(exc).__name__)
             sent = True
         self.metrics.notification_latency.labels(**labels).observe(monotonic() - delivery.started)
         await self._audit(event, state.name, sent, delivery.attempts, delivery.error_type)
@@ -476,6 +596,10 @@ class NotificationManager:
     async def stop(self, *, drain_seconds: float = 3) -> None:
         self._accepting = False
         self._stopping = True
+        if self._incident_task is not None:
+            self._incident_task.cancel()
+            await asyncio.gather(self._incident_task, return_exceptions=True)
+            self._incident_task = None
         self._wakeup.set()
         for state in self._channels:
             state.wakeup.set()
@@ -483,6 +607,7 @@ class NotificationManager:
             self._worker, *(state.worker for state in self._channels)
         ) if task is not None]
         if not tasks:
+            await self._drain_incident_audits(drain_seconds)
             return
         try:
             await asyncio.wait_for(
@@ -494,6 +619,23 @@ class NotificationManager:
             await asyncio.gather(*tasks, return_exceptions=True)
             logger.warning("notification drain timed out")
             self._discard_pending()
+        await self._drain_incident_audits(drain_seconds)
+
+    async def _drain_incident_audits(self, drain_seconds: float) -> None:
+        if not self._incident_audits:
+            return
+        pending = tuple(self._incident_audits)
+        done, unfinished = await asyncio.wait(pending, timeout=min(drain_seconds, 0.5))
+        for task in done:
+            try:
+                task.result()
+            except Exception as exc:
+                logger.error("incident audit task error_type=%s", type(exc).__name__)
+        for task in unfinished:
+            task.cancel()
+        if unfinished:
+            await asyncio.gather(*unfinished, return_exceptions=True)
+            logger.warning("incident audit drain timed out")
 
     def _discard_pending(self) -> None:
         for ingress in self._pending.values():
