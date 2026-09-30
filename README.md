@@ -121,6 +121,31 @@ Watchdog 将“告警已生成”“发送中”“Bark 已确认”分别记录
 
 通知及 Watchdog 重试状态保存在内存中，重启不会恢复待送达历史；Bark 服务确认成功也不代表 iPhone 已展示消息。Watchdog 的重投时刻还受 `WATCHDOG_INTERVAL_SECONDS` 检查间隔影响。它始终只读取状态并发送通知，没有交易控制权限。
 
+## 独立服务器 Demo 部署
+
+`docker-compose.server.yml` 用独立的 `new-money-demo` Compose 项目运行 app、watchdog、Redis、Prometheus 和 Grafana。它固定 `MODE=PAPER`、`LIVE_TRADING_ENABLED=false`，保留 SQLite 状态数据库；不会连接服务器上其他应用的 Redis 或数据库。app、Prometheus、Grafana 默认只绑定服务器回环地址的 `18000`、`18090`、`13300` 端口，启动前确认这些端口空闲。Watchdog 仅获配通知与状态检查变量，不接收 OKX 凭据。Docker 构建通过 `.dockerignore` 排除 `.env`、数据库和本机虚拟环境。
+
+迁移前先构建镜像、测试服务器的 OKX Demo REST/WS 连通性，并确认其他机器人不会操作同一 Demo 账户。然后在旧实例调用 `POST /system/stop`，必须得到 HTTP 200 和 `running=false` 才停止其进程监督器。若安全停机失败，保留原实例处理仓位，不启动第二个交易引擎。使用 SQLite backup API 导出 `data/demo-trading-usdt.db`，验证完整性，通过 SSH 传输数据库和未跟踪的 `.env`；数据库与 `.env` 权限设为 `600`，数据目录设为 `700`。保留旧实例停机后的数据库备份，避免遗漏订单、止损、Emergency 目标和审计历史。
+
+在服务器部署目录的 `.env` 填入 Demo 凭据、Bark 配置和独立的 `GRAFANA_ADMIN_PASSWORD`，不要提交任何真实密钥或密码。设置 `DEPLOY_REVISION` 为实际部署的 Git commit，然后运行：
+
+```bash
+docker compose -f docker-compose.server.yml config --quiet
+docker compose -f docker-compose.server.yml build app
+docker compose -f docker-compose.server.yml up -d
+curl http://127.0.0.1:18000/status
+```
+
+确认 `running=true`、`synchronized=true`、四路 WS fresh、CAA 持续成功，且无未确认订单或 Emergency 目标。启动时所有既有恢复门禁仍适用；只有通过健康检查才进入 NORMAL。Redis 行情缓存由启动 preload 和 WS 重新建立；Prometheus 与 Grafana 使用各自持久卷。迁移 SQLite 不会导入另一个监控部署的历史时序数据。
+
+本机可通过 SSH 隧道查看服务器状态和 Grafana；远端 SSH host 使用自己的配置别名：
+
+```bash
+ssh -N -L 18000:127.0.0.1:18000 -L 13300:127.0.0.1:13300 your-server
+```
+
+隧道开启后访问 `http://127.0.0.1:18000/status`、`http://127.0.0.1:18000/positions` 和 `http://127.0.0.1:13300`。更新或回滚也必须先通过 `POST /system/stop` 安全停机，再停止容器；不得在两个主机同时运行同一账户的 app。通知和监控服务故障不参与交易恢复决策。
+
 ## 切换到 LIVE
 
 **真实资金交易存在损失风险。当前版本尚未完成全部验收，不得启用 LIVE。** 配置层要求 `MODE=LIVE`、`LIVE_TRADING_ENABLED=true` 和 `CONFIRM_LIVE_ACCOUNT_ID` 三项同时存在；启动时还核对账户 UID。LIVE 控制 API 需要额外配置 `API_TOKEN` 并以 Bearer token 调用。Compose 的 `MODE` 从 `.env` 读取，默认始终为 PAPER。上线前必须完成账户模式、止损单、故障注入和全链路人工验收。
