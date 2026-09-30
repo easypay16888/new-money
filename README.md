@@ -108,4 +108,14 @@ WATCHDOG_BARK_GROUP=OKX Quant Watchdog
 
 `HALT` 时先查看 `/status` 的原因，确认 Demo 凭据、账户模式、区域 API 地址、Redis 与 PostgreSQL 连通性以及行情时效。订单超时会查询同一个 `clOrdId`，未确认状态不会自动重试。
 
+### PAPER 模式受控自动恢复
+
+PAPER 模式默认开启自动恢复。只有 `reconciliation failed`、`WebSocket disconnected or stale`、`Redis unavailable`、`dead man switch unavailable` 属于自动恢复白名单。进入 HALT 后至少等待 30 秒，每隔 30 秒重新完整对账并检查数据库、Redis 读写、CAA、全部 WebSocket、组合风险、未确认 entry 及 Emergency 目标；连续 3 次通过后再次完整对账和检查，才允许恢复 NORMAL。任一次失败会清零计数。`/status.auto_recovery` 显示启用状态、是否符合资格、当前连续通过次数和熔断状态。
+
+仓位或订单不一致、外部风险订单、意外条件单、保护单异常、保证金风险、人工 HALT、未知原因及认证/权限错误均须人工处理；安全性 HALT 不会被后续瞬态故障覆盖。EMERGENCY 永不自动恢复。`MODE=LIVE` 时自动恢复始终关闭，即使设置了 `AUTO_RECOVERY_ENABLED=true`。人工 `POST /system/resume` 保留完整对账与同一套健康检查，不会强制跳过安全门。
+
+一小时内最多自动恢复 3 次；观察期内同类故障复发也计入熔断预算。达到预算后保持 HALT，触发熔断并发送一次高优先级通知。自动恢复后观察 60 秒，稳定期未再次 HALT 才推送 `Auto Recovery Completed`。可通过 `.env.example` 中的 `AUTO_RECOVERY_*` 项调整 PAPER 模式的检查间隔、连续次数、最短 HALT 时间、观察期及熔断阈值。Prometheus 提供尝试、成功、失败检查和熔断计数。独立 Watchdog 仍只读取 `/status`，不参与恢复。
+
+OKX 对账故障日志记录失败的接口操作、无查询参数的路径、数字错误码、HTTP 状态和是否可重试；不记录交易所返回的原始消息、请求头、凭据或完整 URL。仅网络故障、HTTP 429/指定临时服务错误及明确的 OKX 限流/超时代码可进入瞬态恢复。交易写请求不会因本功能自动重试。OKX 限流码 `50011` 与超时码 `50004` 的含义见 [OKX V5 文档](https://www.okx.com/docs-v5/en/)和 [OKX API FAQ](https://www.okx.com/en-us/help/api-faq)。
+
 接口依据：[OKX V5 官方文档](https://www.okx.com/docs-v5/en/)。Demo REST 请求使用 `x-simulated-trading: 1`；K 线通过 business WS；Cancel All After 为 `POST /api/v5/trade/cancel-all-after`。

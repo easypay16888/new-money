@@ -44,7 +44,7 @@ async def test_resume_rejects_failed_reconciliation_even_with_old_synced_state(m
     async def failed_reconcile():
         runtime.reconciliation_healthy = False
 
-    monkeypatch.setattr(runtime, "reconcile", failed_reconcile)
+    monkeypatch.setattr(runtime, "_reconcile_impl", failed_reconcile)
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://local"
     ) as client:

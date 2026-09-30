@@ -36,3 +36,5 @@ def configure_logging() -> None:
     handler = logging.StreamHandler()
     handler.setFormatter(JsonFormatter())
     logging.basicConfig(level=logging.INFO, handlers=[handler], force=True)
+    # HTTPX's INFO line contains the full URL, including query parameters.
+    logging.getLogger("httpx").setLevel(logging.WARNING)

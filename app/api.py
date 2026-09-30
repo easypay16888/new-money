@@ -64,6 +64,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "emergency_targets": {
                 symbol: str(target) for symbol, target in runtime.emergency.targets.items()
             },
+            "auto_recovery": runtime.auto_recovery_status(),
             "protective_algos": list(runtime.algo_manager.algos.values()),
             "websockets": [
                 {
@@ -132,25 +133,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.post("/system/resume", dependencies=[Depends(authorize)])
     async def resume() -> dict:
-        await runtime.reconcile()
-        healthy = (
-            runtime.reconciliation_healthy
-            and runtime.dead_man_healthy
-            and runtime.store.healthy
-            and runtime.redis is not None
-            and not runtime.entry_controller.blocked
-            and not runtime.emergency.targets
-            and not runtime.portfolio_monitor.breached(runtime.portfolio, [])[0]
-            and all(ws.is_fresh() for ws in runtime.sockets)
-        )
-        if not runtime.governor.resume(
-            synchronized=runtime.portfolio.synchronized, healthy=healthy
-        ):
+        if not await runtime.resume():
             raise HTTPException(
                 status_code=409, detail="cannot resume until all dependencies and state are healthy"
             )
-        await runtime._send_observation(runtime._notify_risk_state())
-        await runtime._send_observation(runtime._publish_started_if_ready())
         return {"state": runtime.governor.state}
 
     @app.post("/orders/cancel-all", dependencies=[Depends(authorize)])

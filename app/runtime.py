@@ -31,8 +31,17 @@ from app.models import (
 )
 from app.monitoring import ConsoleNotification, Metrics, Notification, WebhookNotification
 from app.notifications import BarkNotification, NotificationManager
-from app.okx import OkxRestClient, OkxWebSocket, candle_subscriptions, public_subscriptions
+from app.okx import (
+    OkxError,
+    OkxRestClient,
+    OkxWebSocket,
+    candle_subscriptions,
+    is_retryable_okx_error,
+    public_subscriptions,
+    safe_reconciliation_diagnostics,
+)
 from app.portfolio import summarize_positions
+from app.recovery import HaltClass, classify_halt_reason
 from app.regime import classify
 from app.risk import RiskEngine, RiskGovernor
 from app.safety import (
@@ -82,9 +91,12 @@ class TradingRuntime:
         self.running = False
         self.evaluated_candles: dict[str, int] = {}
         self.dead_man_healthy = False
+        self._last_caa_success_at: float | None = None
         self._caa_lock = asyncio.Lock()
         self._caa_shutting_down = False
         self.reconciliation_healthy = False
+        self._last_reconcile_safe = False
+        self._reconcile_lock = asyncio.Lock()
         self.strategies = build_strategies(settings)
         self.decision_pipeline = DecisionPipeline(settings, self.strategies)
         self.metrics = Metrics()
@@ -117,10 +129,48 @@ class TradingRuntime:
         self._protection_announced: set[str] = set()
         self._intent_strategies: dict[str, str] = {}
         self._last_exit_fill: dict[str, dict[str, Any]] = {}
+        self._clock = monotonic
+        self._auto_recovery_reason: str | None = None
+        self._auto_recovery_started_at = 0.0
+        self._auto_recovery_last_check = 0.0
+        self._auto_recovery_successes = 0
+        self._auto_recovery_forbidden = False
+        self._auto_recovery_circuit_breaker = False
+        self._auto_resume_times: deque[float] = deque()
+        self._auto_recovery_flaps: deque[float] = deque()
+        self._auto_recovery_notice: tuple[str, float] | None = None
 
     async def enter_halt(self, reason: str, *, emergency: bool = False) -> None:
         self.entry_controller.client = self.client
         emergency = emergency or self.governor.state == GovernorState.EMERGENCY
+        if (
+            self._auto_recovery_notice is not None
+            and reason == self._auto_recovery_notice[0]
+            and self._clock() < self._auto_recovery_notice[1]
+        ):
+            self._auto_recovery_flaps.append(self._clock())
+        if (
+            self.governor.state == GovernorState.HALT
+            and self.governor.reason != "startup reconciliation pending"
+            and classify_halt_reason(self.governor.reason) != HaltClass.TRANSIENT_INFRA
+        ):
+            self._auto_recovery_forbidden = True
+        transient = classify_halt_reason(reason) == HaltClass.TRANSIENT_INFRA
+        if self._auto_recovery_forbidden and transient and not emergency:
+            reason = self.governor.reason
+            transient = False
+        changed = self.governor.state != GovernorState.HALT or self.governor.reason != reason
+        if emergency or not transient or self._planned_shutdown:
+            self._auto_recovery_forbidden = True
+            self._auto_recovery_reason = None
+            self._auto_recovery_successes = 0
+        elif changed or self._auto_recovery_reason is None:
+            self._auto_recovery_reason = reason
+            self._auto_recovery_started_at = self._clock()
+            self._auto_recovery_last_check = self._auto_recovery_started_at
+            self._auto_recovery_successes = 0
+        if changed:
+            self._auto_recovery_notice = None
         repeated = (
             self.governor.reason == reason
             and self.governor.state in {GovernorState.HALT, GovernorState.EMERGENCY}
@@ -143,6 +193,10 @@ class TradingRuntime:
         self.emergency.client = self.client
         self.entry_controller.client = self.client
         self.governor.halt(reason, emergency=True)
+        self._auto_recovery_forbidden = True
+        self._auto_recovery_reason = None
+        self._auto_recovery_successes = 0
+        self._auto_recovery_notice = None
         await self._send_observation(self._notify_risk_state(symbol=symbol))
         await self.emergency.target(symbol)
         try:
@@ -271,10 +325,21 @@ class TradingRuntime:
             await self.emergency.step_all()
 
     async def reconcile(self) -> None:
+        async with self._reconcile_lock:
+            await self._reconcile_impl()
+
+    async def _reconcile_and_assess(self) -> tuple[bool, list[str]]:
+        async with self._reconcile_lock:
+            await self._reconcile_impl()
+            return await self._resume_health()
+
+    async def _reconcile_impl(self) -> None:
         self.entry_controller.client = self.client
         self.emergency.client = self.client
         self.reconciliation_healthy = False
+        self._last_reconcile_safe = False
         prior_positions = dict(self.portfolio.positions) if self.portfolio.synchronized else {}
+        read_phase = True
         try:
             account, positions, orders, algos = await asyncio.gather(
                 self.client.account(),
@@ -283,6 +348,7 @@ class TradingRuntime:
                 self.client.pending_algos(),
             )
             config = await self.client.account_config()
+            read_phase = False
             if not config or config[0].get("posMode") != "net_mode":
                 raise RuntimeError("net position mode required")
             derivatives_mode_eligible = config[0].get("acctLv") in {"2", "3", "4"}
@@ -563,17 +629,41 @@ class TradingRuntime:
             for symbol, quantity in prior_positions.items():
                 if quantity != 0 and remote_positions.get(symbol, Decimal(0)) == 0:
                     await self._send_observation(self._notify_position_closed(symbol))
-            await self._check_portfolio_limits(positions)
+            if await self._check_portfolio_limits(positions):
+                return
             if not derivatives_mode_eligible:
                 await self.enter_halt("derivatives account mode required")
+                return
             if equity <= 0 or available <= 0:
                 await self.enter_halt("USDT margin unavailable")
+                return
             await self.entry_controller.expire()
             if self.emergency.targets:
                 await self.emergency.step_all()
+            self._last_reconcile_safe = True
+        except OkxError as exc:
+            operation, endpoint, code, status, error_type = safe_reconciliation_diagnostics(exc)
+            reason = (
+                "reconciliation failed" if read_phase and is_retryable_okx_error(exc)
+                else "reconciliation permanent failure"
+            )
+            await self.enter_halt(reason)
+            logger.error(
+                "reconciliation OKX failure operation=%s endpoint=%s code=%s "
+                "http_status=%s retryable=%s error_type=%s",
+                operation, endpoint, code, status, exc.retryable, error_type,
+            )
+        except (TimeoutError, ConnectionError, OSError) as exc:
+            await self.enter_halt(
+                "reconciliation failed" if read_phase else "reconciliation permanent failure"
+            )
+            logger.error(
+                "reconciliation transport failure error_type=%s read_phase=%s",
+                type(exc).__name__, read_phase,
+            )
         except Exception as exc:
-            await self.enter_halt("reconciliation failed")
-            logger.error("reconciliation failed: %s", type(exc).__name__)
+            await self.enter_halt("reconciliation permanent failure")
+            logger.error("reconciliation failure error_type=%s", type(exc).__name__)
 
     def _unprotected_startup_partials(
         self,
@@ -705,12 +795,13 @@ class TradingRuntime:
         await self.emergency.step(symbol)
         return False
 
-    async def _check_portfolio_limits(self, positions: list[dict[str, Any]]) -> None:
+    async def _check_portfolio_limits(self, positions: list[dict[str, Any]]) -> bool:
         reason, symbol = self.portfolio_monitor.breached(self.portfolio, positions)
         if symbol:
             await self.enter_emergency(symbol, reason)
         elif reason:
             await self.enter_halt(reason)
+        return bool(reason)
 
     async def start(self) -> None:
         if self.running:
@@ -766,6 +857,7 @@ class TradingRuntime:
         self.tasks = [asyncio.create_task(ws.run()) for ws in self.sockets]
         self.tasks += [
             asyncio.create_task(self._watchdog()),
+            asyncio.create_task(self._auto_recovery_loop()),
             asyncio.create_task(self._reconcile_loop()),
             asyncio.create_task(self._daily_review_loop()),
             asyncio.create_task(self._heartbeat_loop()),
@@ -1303,6 +1395,173 @@ class TradingRuntime:
             if self.running:
                 await self._send_observation(self._publish_heartbeat())
 
+    async def _resume_health(self) -> tuple[bool, list[str]]:
+        issues: list[str] = []
+        if not self.reconciliation_healthy:
+            issues.append("reconciliation")
+        if not self._last_reconcile_safe:
+            issues.append("reconciliation_safety")
+        if not self.portfolio.synchronized:
+            issues.append("portfolio_sync")
+        if not self.store.healthy:
+            issues.append("database")
+        if self.redis is None:
+            issues.append("redis")
+        else:
+            try:
+                async def probe_redis() -> bool:
+                    assert self.redis is not None
+                    await self.redis.ping()
+                    await self.redis.set("auto_recovery_probe", "1", ex=60)
+                    return await self.redis.get("auto_recovery_probe") == "1"
+
+                if not await asyncio.wait_for(probe_redis(), timeout=2):
+                    issues.append("redis_read_write")
+            except Exception:
+                issues.append("redis_read_write")
+        caa_max_age = min(
+            self.settings.cancel_all_after_seconds,
+            self.settings.cancel_all_after_refresh_seconds * 2,
+        )
+        if (
+            not self.dead_man_healthy or self._caa_shutting_down
+            or (self.running and (
+                self._last_caa_success_at is None
+                or self._clock() - self._last_caa_success_at > caa_max_age
+            ))
+        ):
+            issues.append("cancel_all_after")
+        if self.entry_controller.blocked:
+            issues.append("entry_cancellation")
+        if self.emergency.targets:
+            issues.append("emergency_targets")
+        if self.settings.mode != Mode.BACKTEST and (
+            not self.sockets
+            or not all(ws.connected and ws.is_fresh() for ws in self.sockets)
+        ):
+            issues.append("websockets")
+        if self.portfolio_monitor.breached(self.portfolio, [])[0]:
+            issues.append("portfolio_limits")
+        return not issues, issues
+
+    async def resume(self) -> bool:
+        healthy, _ = await self._reconcile_and_assess()
+        if not self.governor.resume(
+            synchronized=self.portfolio.synchronized, healthy=healthy
+        ):
+            return False
+        self._auto_recovery_forbidden = False
+        self._auto_recovery_circuit_breaker = False
+        self._auto_recovery_reason = None
+        self._auto_recovery_successes = 0
+        self._auto_resume_times.clear()
+        self._auto_recovery_flaps.clear()
+        self._auto_recovery_notice = None
+        await self._send_observation(self._notify_risk_state())
+        await self._send_observation(self._publish_started_if_ready())
+        return True
+
+    def auto_recovery_status(self) -> dict[str, bool | int]:
+        enabled = self.settings.auto_recovery_enabled and self.settings.mode == Mode.PAPER
+        eligible = (
+            enabled and not self._planned_shutdown and not self._auto_recovery_forbidden
+            and not self._auto_recovery_circuit_breaker
+            and self.governor.state == GovernorState.HALT
+            and self._auto_recovery_reason == self.governor.reason
+            and classify_halt_reason(self.governor.reason) == HaltClass.TRANSIENT_INFRA
+        )
+        return {
+            "enabled": enabled, "eligible": eligible,
+            "successes": self._auto_recovery_successes if eligible else 0,
+            "required": self.settings.auto_recovery_success_threshold,
+            "circuit_breaker": self._auto_recovery_circuit_breaker,
+        }
+
+    async def _auto_recovery_check(self) -> None:
+        now = self._clock()
+        if self._auto_recovery_notice is not None:
+            reason, due = self._auto_recovery_notice
+            if now >= due and self.governor.state == GovernorState.NORMAL:
+                self._auto_recovery_notice = None
+                await self.alert(
+                    "INFO", "✅ Auto Recovery Completed",
+                    f"Previous state: HALT\nReason: {reason}\n"
+                    f"Healthy checks: {self.settings.auto_recovery_success_threshold}/"
+                    f"{self.settings.auto_recovery_success_threshold}\n"
+                    f"Reconciliation: healthy\nWS: {sum(ws.is_fresh() for ws in self.sockets)}/"
+                    f"{len(self.sockets)}\nPositions: {len(self.portfolio.positions)}\n"
+                    f"Orders: {len(self.order_manager.pending_entries())}\nRisk: NORMAL",
+                    category=NotificationCategory.RISK, priority=NotificationPriority.ACTIVE,
+                    dedup_key="auto-recovery-completed", metadata={"recovery": True},
+                )
+        if not self.auto_recovery_status()["eligible"]:
+            return
+        if now - self._auto_recovery_started_at < self.settings.auto_recovery_min_halt_seconds:
+            return
+        if now - self._auto_recovery_last_check < self.settings.auto_recovery_check_seconds:
+            return
+        self._auto_recovery_last_check = now
+        candidate_reason = self._auto_recovery_reason
+        assert candidate_reason is not None
+        label = HaltClass.TRANSIENT_INFRA.value
+        self.metrics.auto_recovery_attempts.labels(reason_class=label).inc()
+        healthy, issues = await self._reconcile_and_assess()
+        if (not healthy or not self.auto_recovery_status()["eligible"]
+                or candidate_reason != self.governor.reason):
+            self._auto_recovery_successes = 0
+            self.metrics.auto_recovery_failed_checks.labels(reason_class=label).inc()
+            logger.warning("auto_recovery check failed reason_class=%s issues=%s", label, issues)
+            return
+        self._auto_recovery_successes += 1
+        if self._auto_recovery_successes < self.settings.auto_recovery_success_threshold:
+            return
+        while self._auto_resume_times and now - self._auto_resume_times[0] >= 3600:
+            self._auto_resume_times.popleft()
+        while self._auto_recovery_flaps and now - self._auto_recovery_flaps[0] >= 3600:
+            self._auto_recovery_flaps.popleft()
+        if (
+            len(self._auto_resume_times) + len(self._auto_recovery_flaps)
+            >= self.settings.auto_recovery_max_resumes_per_hour
+        ):
+            self._auto_recovery_circuit_breaker = True
+            self.metrics.auto_recovery_circuit_breaker.labels(reason_class=label).inc()
+            await self.enter_halt("auto recovery circuit breaker")
+            await self.alert(
+                "CRITICAL", "🚨 Auto Recovery Disabled",
+                "Repeated transient failures\nManual resume required",
+                category=NotificationCategory.RISK, priority=NotificationPriority.CRITICAL,
+                dedup_key="auto-recovery-circuit-breaker", metadata={"transition": True},
+            )
+            return
+        healthy, issues = await self._reconcile_and_assess()
+        if (not healthy or not self.auto_recovery_status()["eligible"]
+                or candidate_reason != self.governor.reason):
+            self._auto_recovery_successes = 0
+            self.metrics.auto_recovery_failed_checks.labels(reason_class=label).inc()
+            logger.warning("auto_recovery final gate failed reason_class=%s issues=%s", label, issues)
+            return
+        if self.governor.resume(synchronized=self.portfolio.synchronized, healthy=healthy):
+            self._auto_resume_times.append(now)
+            self._auto_recovery_reason = None
+            self._auto_recovery_successes = 0
+            self._last_risk_notice = (GovernorState.NORMAL, self.governor.reason)
+            self._auto_recovery_notice = (
+                candidate_reason, now + self.settings.auto_recovery_stability_seconds,
+            )
+            self.metrics.auto_recovery_success.labels(reason_class=label).inc()
+
+    async def _auto_recovery_loop(self) -> None:
+        while self.running:
+            await asyncio.sleep(self.settings.auto_recovery_check_seconds)
+            try:
+                await self._auto_recovery_check()
+            except Exception as exc:
+                self._auto_recovery_successes = 0
+                self.metrics.auto_recovery_failed_checks.labels(
+                    reason_class=HaltClass.TRANSIENT_INFRA.value
+                ).inc()
+                logger.error("auto_recovery check error_type=%s", type(exc).__name__)
+
     async def _watchdog(self) -> None:
         while self.running:
             await asyncio.sleep(5)
@@ -1317,37 +1576,15 @@ class TradingRuntime:
             if any(not ws.is_fresh() for ws in self.sockets):
                 await self.enter_halt("WebSocket disconnected or stale")
             elif (
-                self.governor.reason == "WebSocket disconnected or stale"
-                and self.portfolio.synchronized
-                and self.governor.state != GovernorState.EMERGENCY
-            ):
-                await self.reconcile()
-                self.governor.resume(
-                    synchronized=self.portfolio.synchronized,
-                    healthy=self.reconciliation_healthy
-                    and self.store.healthy
-                    and self.redis is not None
-                    and self.dead_man_healthy
-                    and not self.entry_controller.blocked
-                    and not self.emergency.targets
-                    and not self.portfolio_monitor.breached(self.portfolio, [])[0]
-                    and all(ws.is_fresh() for ws in self.sockets),
-                )
-            elif (
                 self.governor.reason == "startup reconciliation pending"
                 and self.governor.state != GovernorState.EMERGENCY
             ):
-                self.governor.resume(
-                    synchronized=self.portfolio.synchronized,
-                    healthy=self.reconciliation_healthy
-                    and self.store.healthy
-                    and self.redis is not None
-                    and self.dead_man_healthy
-                    and not self.entry_controller.blocked
-                    and not self.emergency.targets
-                    and not self.portfolio_monitor.breached(self.portfolio, [])[0]
-                    and all(ws.is_fresh() for ws in self.sockets),
-                )
+                async with self._reconcile_lock:
+                    healthy, _ = await self._resume_health()
+                    self.governor.resume(
+                        synchronized=self.portfolio.synchronized,
+                        healthy=healthy,
+                    )
             await self._send_observation(self._notify_risk_state())
             await self._send_observation(self._observe_infrastructure())
             await self._send_observation(self._publish_started_if_ready())
@@ -1366,8 +1603,10 @@ class TradingRuntime:
                         return
                     await self.client.cancel_all_after(self.settings.cancel_all_after_seconds)
                 self.dead_man_healthy = True
+                self._last_caa_success_at = self._clock()
             except Exception:
                 self.dead_man_healthy = False
+                self._last_caa_success_at = None
                 await self.enter_halt("dead man switch unavailable")
             await asyncio.sleep(self.settings.cancel_all_after_refresh_seconds)
 

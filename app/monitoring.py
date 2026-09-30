@@ -96,6 +96,22 @@ class Metrics:
             "quant_notification_latency_seconds", "Notification delivery latency",
             notification_labels, registry=self.registry,
         )
+        self.auto_recovery_attempts = Counter(
+            "quant_auto_recovery_attempts_total", "Auto recovery health checks",
+            ["reason_class"], registry=self.registry,
+        )
+        self.auto_recovery_success = Counter(
+            "quant_auto_recovery_success_total", "Successful auto resumes",
+            ["reason_class"], registry=self.registry,
+        )
+        self.auto_recovery_failed_checks = Counter(
+            "quant_auto_recovery_failed_checks_total", "Failed auto recovery checks",
+            ["reason_class"], registry=self.registry,
+        )
+        self.auto_recovery_circuit_breaker = Counter(
+            "quant_auto_recovery_circuit_breaker_total", "Auto recovery circuit trips",
+            ["reason_class"], registry=self.registry,
+        )
 
     def observe_latency(self, path: str, seconds: float) -> None:
         self.api_latency.labels(path=path).observe(seconds)

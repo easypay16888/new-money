@@ -7,6 +7,7 @@ import hmac
 import json
 import logging
 import random
+import re
 import time
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
@@ -24,14 +25,65 @@ logger = logging.getLogger("okx")
 
 
 class OkxError(RuntimeError):
-    def __init__(self, message: str, *, code: str = "", data: list[Any] | None = None) -> None:
+    def __init__(
+        self, message: str, *, code: str = "", data: list[Any] | None = None,
+        operation: str = "", endpoint: str = "", http_status: int | None = None,
+        retryable: bool = False, error_type: str = "",
+    ) -> None:
         super().__init__(message)
+        self.message = message
         self.code = code
         self.data = data or []
+        self.operation = operation
+        self.endpoint = endpoint
+        self.http_status = http_status
+        self.retryable = retryable
+        self.error_type = error_type
 
 
 class OkxOrderRejected(OkxError):
     pass
+
+
+RETRYABLE_OKX_CODES = frozenset({"50004", "50011", "50026", "50061"})
+PERMANENT_OKX_CODES = frozenset({
+    "50102", "50103", "50104", "50105", "50106", "50107",
+    "50111", "50112", "50113", "50119",
+})
+SAFE_ERROR_TYPES = frozenset({
+    "ConnectError", "ConnectTimeout", "ReadError", "ReadTimeout", "WriteError",
+    "WriteTimeout", "RemoteProtocolError", "PoolTimeout", "InvalidJSON",
+    "InvalidResponse", "APIError",
+})
+RECONCILIATION_OPERATIONS = {
+    "/api/v5/account/balance": "account",
+    "/api/v5/account/positions": "positions",
+    "/api/v5/trade/orders-pending": "pending_orders",
+    "/api/v5/trade/orders-algo-pending": "pending_algos",
+    "/api/v5/account/config": "account_config",
+}
+
+
+def is_retryable_okx_error(exc: Exception) -> bool:
+    return isinstance(exc, OkxError) and exc.retryable
+
+
+def _safe_okx_code(value: Any) -> str:
+    code = str(value) if value is not None else ""
+    return code if re.fullmatch(r"[0-9]{1,6}", code) else ""
+
+
+def safe_reconciliation_diagnostics(
+    exc: OkxError,
+) -> tuple[str, str, str, int | None, str]:
+    endpoint = exc.endpoint if exc.endpoint in RECONCILIATION_OPERATIONS else "unknown"
+    operation = RECONCILIATION_OPERATIONS.get(endpoint, "unknown")
+    status = exc.http_status
+    return (
+        operation, endpoint, _safe_okx_code(exc.code) or "unknown",
+        status if isinstance(status, int) and 100 <= status <= 599 else None,
+        exc.error_type if exc.error_type in SAFE_ERROR_TYPES else "OkxError",
+    )
 
 
 def signature(secret: str, prehash: str) -> str:
@@ -82,23 +134,47 @@ class OkxRestClient:
                     "OK-ACCESS-PASSPHRASE": self.settings.okx_passphrase,
                 }
             )
+        operation = RECONCILIATION_OPERATIONS.get(path, method.lower())
         started = time.monotonic()
         try:
             response = await self.client.request(
                 method, request_path, content=body_text or None, headers=headers
             )
-            response.raise_for_status()
-            result = response.json()
-        except (httpx.HTTPError, ValueError) as exc:
-            raise OkxError(f"OKX {method} {path} transport error") from exc
+        except httpx.HTTPError as exc:
+            raise OkxError(
+                "OKX transport error", operation=operation, endpoint=path, retryable=True,
+                error_type=type(exc).__name__,
+            ) from exc
         finally:
             if self.latency_observer is not None:
                 self.latency_observer(path, time.monotonic() - started)
-        if result.get("code") != "0":
+        try:
+            result = response.json()
+        except ValueError as exc:
             raise OkxError(
-                f"OKX {method} {path}: {result.get('code')} {result.get('msg')}",
-                code=str(result.get("code")),
-                data=result.get("data", []),
+                "OKX invalid response", operation=operation, endpoint=path,
+                http_status=response.status_code,
+                retryable=response.status_code in {429, 500, 502, 503, 504},
+                error_type="InvalidJSON",
+            ) from exc
+        if not isinstance(result, dict):
+            raise OkxError(
+                "OKX invalid response", operation=operation, endpoint=path,
+                http_status=response.status_code,
+                error_type="InvalidResponse",
+            )
+        code = _safe_okx_code(result.get("code"))
+        if not 200 <= response.status_code < 300 or code != "0":
+            data = result.get("data")
+            raise OkxError(
+                "OKX request rejected", code=code,
+                data=data if 200 <= response.status_code < 300 and isinstance(data, list) else None,
+                operation=operation, endpoint=path, http_status=response.status_code,
+                error_type="APIError",
+                retryable=code not in PERMANENT_OKX_CODES and (
+                    code in RETRYABLE_OKX_CODES
+                    or response.status_code in {429, 500, 502, 503, 504}
+                ) and response.status_code not in {401, 403},
             )
         return result.get("data", [])
 
@@ -173,7 +249,7 @@ class OkxRestClient:
                 private=True,
             )
         except OkxError as exc:
-            if exc.code == "51603":
+            if exc.code == "51603" and (exc.http_status is None or exc.http_status < 400):
                 return []
             raise
 
@@ -186,7 +262,11 @@ class OkxRestClient:
             data = await self.request("POST", "/api/v5/trade/order", body=body, private=True)
         except OkxError as exc:
             if exc.data and any(item.get("sCode") not in {None, "0"} for item in exc.data):
-                raise OkxOrderRejected(str(exc), code=exc.code, data=exc.data) from exc
+                raise OkxOrderRejected(
+                    str(exc), code=exc.code, data=exc.data, operation=exc.operation,
+                    endpoint=exc.endpoint, http_status=exc.http_status,
+                    retryable=exc.retryable, error_type=exc.error_type,
+                ) from exc
             raise
         if any(item.get("sCode") != "0" for item in data):
             raise OkxOrderRejected(f"OKX order rejected: {[item.get('sCode') for item in data]}")

@@ -81,6 +81,12 @@ class Settings(BaseSettings):
     bark_sound: str = ""
     bark_critical_sound: str = "alarm"
     bark_critical_volume: int = Field(default=5, ge=0, le=10)
+    auto_recovery_enabled: bool = True
+    auto_recovery_success_threshold: int = Field(default=3, ge=1)
+    auto_recovery_check_seconds: float = Field(default=30, gt=0)
+    auto_recovery_min_halt_seconds: float = Field(default=30, ge=0)
+    auto_recovery_stability_seconds: float = Field(default=60, ge=0)
+    auto_recovery_max_resumes_per_hour: int = Field(default=3, ge=1)
 
     @model_validator(mode="after")
     def validate_live(self) -> Settings:
