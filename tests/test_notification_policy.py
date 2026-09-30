@@ -67,6 +67,14 @@ def recovered() -> NotificationEvent:
     )
 
 
+def risk_recovered() -> NotificationEvent:
+    return notice(
+        "✅ Risk State Recovered", category=NotificationCategory.RISK,
+        level=NotificationLevel.INFO,
+        metadata={"recovery": True, "risk_state": "NORMAL"},
+    )
+
+
 async def route(*events: NotificationEvent, policy: NotificationPolicy | None = None
                 ) -> tuple[list[NotificationEvent], list[NotificationEvent], Metrics]:
     bark, console, metrics = BarkNotification(), ConsoleNotification(), Metrics()
@@ -238,7 +246,7 @@ def test_fast_transient_recovery_is_recorded_without_bark() -> None:
     incidents.observe(halt("Redis unavailable"))
     now[0] = 20
     assert incidents.observe(recovered()) == []
-    assert incidents.active is None
+    assert incidents.active == {}
     assert incidents.history[0].duration_seconds == 20
     assert incidents.history[0].resolved_at is not None
     assert not incidents.history[0].notified_open
@@ -297,12 +305,12 @@ def test_emergency_incident_is_immediate_and_resolves_once() -> None:
     assert incidents.observe(emergency) == []
     assert incidents.due() == []
     incidents.delivery_confirmed(emergency)
-    recovery = incidents.observe(recovered())
+    recovery = incidents.observe(risk_recovered())
     assert [item.title for item in recovery] == ["✅ Trading Recovered"]
-    assert incidents.observe(recovered()) == []
+    assert incidents.observe(risk_recovered()) == []
 
 
-def test_merge_window_suppresses_repeated_short_incidents() -> None:
+def test_merge_window_does_not_delay_persistent_recurrence() -> None:
     now = [0.0]
     incidents = IncidentManager(
         clock=lambda: now[0], delay_seconds=60, merge_window_seconds=300,
@@ -316,9 +324,10 @@ def test_merge_window_suppresses_repeated_short_incidents() -> None:
     now[0] = 70
     incidents.observe(halt("Redis unavailable"))
     now[0] = 140
-    assert incidents.due() == []
-    now[0] = 362
-    assert len(incidents.due()) == 1
+    second = incidents.due()
+    assert len(second) == 1
+    assert second[0].metadata["incident_id"] != opened[0].metadata["incident_id"]
+    assert incidents.history[-1].recurrence_of == incidents.history[-2].id
 
 
 @pytest.mark.asyncio
@@ -335,6 +344,11 @@ async def test_auto_recovery_produces_single_trading_recovered_bark() -> None:
     now[0] = 61
     for event in incidents.due():
         await notifier.publish(event)
+    async def wait_for_open() -> None:
+        while not incidents.active["infra:trading"].notified_open:
+            await asyncio.sleep(0)
+
+    await asyncio.wait_for(wait_for_open(), 1)
     await notifier.publish(notice(
         "✅ Reconciliation Recovered", level=NotificationLevel.INFO,
         metadata={"recovery": True, "risk_state": "HALT"},
@@ -469,5 +483,53 @@ async def test_watchdog_recovery_waits_for_actual_bark_delivery() -> None:
         release.set()
     await notifier.stop(drain_seconds=1)
     assert [event.title for event in bark.events] == [
+        "🚨 Trading App Offline", "✅ Trading App Recovered",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_watchdog_failed_offline_does_not_send_false_recovery() -> None:
+    responses = [503, 503, 503, 200, 200]
+
+    def respond(_: httpx.Request) -> httpx.Response:
+        status = responses.pop(0)
+        if status == 503:
+            return httpx.Response(status)
+        return httpx.Response(200, json={
+            "running": True, "synchronized": True, "risk_state": "NORMAL",
+            "websockets": [{"fresh": True}],
+        })
+
+    bark, console, metrics = BarkNotification(), ConsoleNotification(), Metrics()
+    attempts: list[NotificationEvent] = []
+
+    async def failed_send(event: NotificationEvent) -> None:
+        attempts.append(event)
+        raise ConnectionError("Bark unavailable")
+
+    bark.send = failed_send  # type: ignore[method-assign]
+    notifier = NotificationManager(
+        [console, bark], metrics, policy=NotificationPolicy(), retry_delays=(),
+    )
+    notifier.start()
+    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+        monitor = WatchdogMonitor(
+            WatchdogSettings(_env_file=None, watchdog_startup_grace_seconds=0),
+            client, notifier,
+        )
+        for _ in range(3):
+            await monitor.check()
+        async def wait_for_failure() -> None:
+            while metrics.notification_failed.labels(
+                channel="bark", priority="CRITICAL", category="INFRASTRUCTURE"
+            )._value.get() != 1:
+                await asyncio.sleep(0)
+
+        await asyncio.wait_for(wait_for_failure(), 1)
+        await monitor.check()
+        await monitor.check()
+    await notifier.stop(drain_seconds=1)
+    assert [event.title for event in attempts] == ["🚨 Trading App Offline"]
+    assert [event.title for event in console.events] == [
         "🚨 Trading App Offline", "✅ Trading App Recovered",
     ]

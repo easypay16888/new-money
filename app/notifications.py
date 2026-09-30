@@ -229,17 +229,38 @@ class NotificationManager:
         if self.incidents is None:
             return
         for incident, transition in self.incidents.take_changes():
-            labels = {"category": "infrastructure", "severity": incident.severity,
-                      "component": "trading"}
+            risk_incident = incident.key.startswith(("risk:", "auto-recovery:"))
+            labels = {
+                "category": "risk" if risk_incident else "infrastructure",
+                "severity": incident.severity,
+                "component": (
+                    "emergency" if incident.key == "risk:emergency" else
+                    "safety" if risk_incident else "trading"
+                ),
+            }
             if transition == "opened":
                 self.metrics.incidents_total.labels(**labels).inc()
-                self.metrics.incidents_open.labels(**labels).set(1)
+                self.metrics.incidents_open.labels(**labels).inc()
             elif transition == "resolved":
                 self.metrics.incidents_resolved.labels(**labels).inc()
-                self.metrics.incidents_open.labels(**labels).set(0)
+                self.metrics.incidents_open.labels(**labels).dec()
                 self.metrics.incident_duration.labels(**labels).observe(
                     incident.duration_seconds or 0
                 )
+            if transition in {"alert_failed", "recovery_failed"}:
+                self.metrics.incident_delivery_failure.labels(
+                    severity=incident.severity,
+                    phase="open" if transition == "alert_failed" else "resolved",
+                ).inc()
+            elif transition in {"alert_retry_queued", "recovery_retry_queued"}:
+                self.metrics.incident_delivery_retry.labels(
+                    severity=incident.severity,
+                    phase="open" if transition == "alert_retry_queued" else "resolved",
+                ).inc()
+            elif transition == "retrospective_sent":
+                self.metrics.incident_retrospective.labels(
+                    severity=incident.severity, phase="resolved"
+                ).inc()
             if self.store is not None:
                 task = asyncio.create_task(
                     self._audit_incident(incident.record(transition), incident.id)
@@ -289,7 +310,8 @@ class NotificationManager:
                 event.message,
             )
             stateful = bool(event.metadata.get("recovery") or event.metadata.get("transition"))
-            if event.dedup_key:
+            incident_retry = bool(event.metadata.get("incident_retry"))
+            if event.dedup_key and not incident_retry:
                 if stateful and self._last_stateful.get(event.dedup_key) == fingerprint:
                     return
                 if not stateful:
@@ -303,7 +325,7 @@ class NotificationManager:
             self._size += 1
             self._update_queue_metric()
             self._wakeup.set()
-            if event.dedup_key:
+            if event.dedup_key and not incident_retry:
                 self._recent[fingerprint] = now
                 if stateful:
                     self._last_stateful[event.dedup_key] = fingerprint
@@ -314,12 +336,22 @@ class NotificationManager:
         except Exception as exc:
             logger.error("notification enqueue failed: %s", type(exc).__name__)
 
-    def _drop(self, event: NotificationEvent) -> None:
+    def _drop(self, event: NotificationEvent, channel: str | None = None) -> None:
         self.metrics.notification_dropped.labels(
             priority=event.priority.value, category=event.category.value
         ).inc()
         if event.priority == NotificationPriority.CRITICAL:
             logger.error("critical notification dropped: category=%s", event.category.value)
+        if (
+            self.incidents is not None
+            and (channel is None or channel == "bark")
+            and any(state.name == "bark" for state in self._channels)
+        ):
+            try:
+                self.incidents.delivery_failed(event)
+                self._record_incident_changes()
+            except Exception as exc:
+                logger.error("incident drop receipt error_type=%s", type(exc).__name__)
 
     def _make_room(self, incoming: NotificationEvent) -> bool:
         incoming_rank = PRIORITIES.index(incoming.priority)
@@ -384,6 +416,7 @@ class NotificationManager:
                             })
                     elif not decision.send and not (
                         state.name == "bark" and NotificationPolicy.is_critical(event)
+                        and not event.metadata.get("incident_duplicate")
                     ):
                         self.metrics.notification_policy_suppressed.labels(
                             channel=state.name, category=event.category.value
@@ -398,7 +431,7 @@ class NotificationManager:
 
     def _enqueue_channel(self, state: _ChannelState, delivery: _Delivery) -> None:
         if state.size >= self.max_queue and not self._make_channel_room(state, delivery.event):
-            self._drop(delivery.event)
+            self._drop(delivery.event, state.name)
             return
         state.pending[delivery.event.priority].append(delivery)
         state.size += 1
@@ -436,7 +469,7 @@ class NotificationManager:
             assert delayed_oldest is not None
             removed = state.delayed.pop(delayed_oldest[0])[2]
             heapq.heapify(state.delayed)
-        self._drop(removed.event)
+        self._drop(removed.event, state.name)
         state.size -= 1
         self._update_queue_metric()
         return True
@@ -477,8 +510,19 @@ class NotificationManager:
                 pass
 
     async def _send_once(self, state: _ChannelState, delivery: _Delivery) -> None:
-        delivery.attempts += 1
         event = delivery.event
+        if (
+            state.name == "bark" and self.incidents is not None
+            and self.incidents.should_supersede_open(event)
+        ):
+            self.incidents.supersede_open(event, delivery.attempts)
+            self._record_incident_changes()
+            generated = self.incidents.due()
+            self._record_incident_changes()
+            for derived in generated:
+                await self.publish(derived)
+            return
+        delivery.attempts += 1
         labels = {
             "channel": state.name,
             "priority": event.priority.value,
@@ -503,8 +547,17 @@ class NotificationManager:
                     self._update_queue_metric()
                     state.wakeup.set()
                     return
-                self._drop(event)
+                # The final failure receipt below handles this delivery once.
+                self._drop(event, "retry-capacity")
             self.metrics.notification_failed.labels(**labels).inc()
+            if state.name == "bark" and self.incidents is not None:
+                try:
+                    self.incidents.delivery_failed(event)
+                    self._record_incident_changes()
+                except Exception as incident_exc:
+                    logger.error(
+                        "incident failure receipt error_type=%s", type(incident_exc).__name__
+                    )
             if self.policy is not None:
                 try:
                     self.policy.failed(event, state.name)
@@ -645,9 +698,9 @@ class NotificationManager:
         for state in self._channels:
             for channel_pending in state.pending.values():
                 while channel_pending:
-                    self._drop(channel_pending.popleft().event)
+                    self._drop(channel_pending.popleft().event, state.name)
             while state.delayed:
-                self._drop(heapq.heappop(state.delayed)[2].event)
+                self._drop(heapq.heappop(state.delayed)[2].event, state.name)
             state.size = 0
         self._update_queue_metric()
 

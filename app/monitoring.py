@@ -117,6 +117,19 @@ class Metrics:
             "quant_incident_duration_seconds", "Resolved notification incident duration",
             incident_labels, registry=self.registry,
         )
+        delivery_labels = ["severity", "phase"]
+        self.incident_delivery_retry = Counter(
+            "quant_incident_delivery_retry_total", "Incident Bark delivery retries",
+            delivery_labels, registry=self.registry,
+        )
+        self.incident_delivery_failure = Counter(
+            "quant_incident_delivery_failure_total", "Final incident Bark delivery failures",
+            delivery_labels, registry=self.registry,
+        )
+        self.incident_retrospective = Counter(
+            "quant_incident_retrospective_total", "Retrospective incident alerts delivered",
+            delivery_labels, registry=self.registry,
+        )
         self.auto_recovery_attempts = Counter(
             "quant_auto_recovery_attempts_total", "Auto recovery health checks",
             ["reason_class"], registry=self.registry,

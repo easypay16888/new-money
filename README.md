@@ -80,6 +80,8 @@ BARK_NOTIFY_SYSTEM_STOPPING=false
 BARK_NOTIFY_FAST_RECOVERY=false
 BARK_INFRA_ALERT_DELAY_SECONDS=60
 BARK_INCIDENT_MERGE_WINDOW_SECONDS=300
+BARK_INCIDENT_RETRY_INITIAL_SECONDS=30
+BARK_INCIDENT_RETRY_MAX_SECONDS=300
 BARK_TRADE_NOTIFICATIONS=true
 BARK_RISK_NOTIFICATIONS=true
 BARK_DAILY_REPORT=true
@@ -92,7 +94,9 @@ WEBHOOK_NOTIFICATIONS_VERBOSE=true
 
 `NotificationPolicy` 按渠道筛选事件：Console 保留详细事件，Webhook 默认保留详细事件（设 `WEBHOOK_NOTIFICATIONS_VERBOSE=false` 可使用同样的低噪音规则），Bark 只接收重要事件。Bark 默认接收真实成交、保护单确认、平仓、系统启动及停机、日报和严重风控事件；心跳、entry 提交、计划停机的 Stopping、普通信号和单次基础设施抖动默认静默。可按需单独开启上述配置。成交与保护单各推一次，按对应订单或保护单 ID 去重；不会伪造缺失的单笔净盈亏或 R。
 
-`IncidentManager` 把 WebSocket、Redis、CAA 与对账异常合并为运行事故。持续不足 60 秒且恢复的异常只写入内部事故记录；持续超过阈值才推一次告警，并在风控真正恢复 NORMAL 后推一次合并恢复通知。组件自己的恢复事件不逐条推 Bark。严重 HALT、EMERGENCY、未保护持仓、暴露下的异常订单、Watchdog App Offline 等立即旁路延迟和策略异常；Bark 或事故审计失败不参与任何交易及风控决策。事故生命周期写入 `system_events`，包括实际 Bark 发送确认状态；Prometheus 额外暴露策略抑制次数、事故数、未解决事故数和持续时间。日报复用现有 `daily_reports`，Grafana 继续负责完整历史监控。
+`IncidentManager` 按 key 独立跟踪基础设施、安全 HALT、EMERGENCY 和自动恢复熔断事故。WebSocket、Redis、CAA 与对账异常合并为一个基础设施事故；持续不足 60 秒且恢复的异常只写入内部记录，持续超过阈值才推告警。安全事故独立且立即通知。`BARK_INCIDENT_MERGE_WINDOW_SECONDS` 只把再次发生的事故关联到同一历史系列，不延长新事故的 60 秒告警阈值。
+
+Bark 的渠道内重试耗尽后，事故仍标记为未送达，由独立通知 worker 按 30、60、120、240、300 秒的封顶退避重投同一 `incident_id`；成功回执才将 `notified_open` 或 `notified_resolved` 置为 true。若事故结束前始终未成功发送开场告警，通知恢复后只发送一条注明延迟及持续时间的 retrospective 摘要；曾发生的 EMERGENCY 保留 CRITICAL 级别。组件自己的恢复事件不逐条推 Bark，事故恢复须等到风险状态真正 NORMAL。`system_events` 保留开场、失败、重试、恢复和 retrospective 生命周期；Prometheus 增加送达失败、事故重试与 retrospective 指标。通知重试只重发 `NotificationEvent`，不调用交易、风控或恢复操作。日报复用现有 `daily_reports`，Grafana 继续负责完整历史监控。
 
 ### External Watchdog
 

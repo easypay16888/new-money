@@ -131,6 +131,8 @@ class TradingRuntime:
                 delay_seconds=settings.bark_infra_alert_delay_seconds,
                 merge_window_seconds=settings.bark_incident_merge_window_seconds,
                 notify_fast_recovery=settings.bark_notify_fast_recovery,
+                retry_initial_seconds=settings.bark_incident_retry_initial_seconds,
+                retry_max_seconds=settings.bark_incident_retry_max_seconds,
             ),
         )
         self.started_at = utcnow()

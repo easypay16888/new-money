@@ -79,6 +79,8 @@ class NotificationPolicy:
             return NotificationDecision(True)
         if channel not in {"bark", "webhook"}:
             return NotificationDecision(True)
+        if event.metadata.get("incident_duplicate"):
+            return NotificationDecision(False)
         if self.is_critical(event):
             if event.title == "🚨 Trading App Offline":
                 self._watchdog_alert_pending[channel] = True
