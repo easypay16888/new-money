@@ -122,6 +122,15 @@ class EntryOrderController:
 class AlgoOrderManager:
     ACTIVE = {"live"}
 
+    @staticmethod
+    def has_failure(algo: dict[str, Any]) -> bool:
+        # OKX uses both an empty code and "0" for a non-failed live algo.
+        code = algo.get("failCode")
+        return not (
+            code is None or (type(code) is int and code == 0)
+            or (isinstance(code, str) and code in {"", "0"})
+        )
+
     def __init__(self, store: Store) -> None:
         self.store = store
         self.algos: dict[str, dict[str, Any]] = {}
@@ -171,7 +180,7 @@ class AlgoOrderManager:
             size >= abs(position)
             and abs(trigger - stop_price) <= tolerance
             and algo.get("state") in self.ACTIVE
-            and not algo.get("failCode")
+            and not self.has_failure(algo)
             and str(algo.get("reduceOnly", "false")).lower() in {"true", "1"}
         )
 

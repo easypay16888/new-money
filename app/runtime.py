@@ -360,6 +360,72 @@ class TradingRuntime:
             await self._reconcile_impl()
             return await self._resume_health()
 
+    def _pending_order_ids(self) -> set[str]:
+        return {
+            cid for cid, row in self.order_manager.orders.items()
+            if row["state"] in {"SUBMITTED", "ACKNOWLEDGED", "PARTIALLY_FILLED"}
+        }
+
+    @staticmethod
+    def _verified_terminal_order(local: dict[str, Any], remote: dict[str, Any]) -> bool:
+        """Only exchange-confirmed owned terminal orders can resolve a snapshot race."""
+        if (
+            remote.get("clOrdId") != local["clOrdId"]
+            or remote.get("instId") != local["symbol"]
+            or remote.get("side") != ("buy" if local["direction"] == "LONG" else "sell")
+            or str(remote.get("reduceOnly", "")).lower()
+            != ("true" if local["reduce_only"] else "false")
+            or not remote.get("ordId")
+            or (local.get("order_id") and remote["ordId"] != local["order_id"])
+            or remote.get("state") not in {"filled", "canceled", "mmp_canceled"}
+        ):
+            return False
+        try:
+            size = Decimal(str(remote["sz"]))
+            filled = Decimal(str(remote["accFillSz"]))
+            previous = Decimal(local["filled"])
+            approved = Decimal(local["approved_contracts"])
+            return (
+                all(value.is_finite() for value in (size, filled, previous, approved))
+                and size == approved and size > 0 and 0 <= previous <= filled <= size
+                and (remote["state"] != "filled" or filled == size)
+            )
+        except (KeyError, ArithmeticError, ValueError):
+            return False
+
+    async def _refresh_terminal_order_snapshot(
+        self, account: list[dict[str, Any]], positions: list[dict[str, Any]],
+        orders: list[dict[str, Any]], algos: list[dict[str, Any]],
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+        snapshot = (account, positions, orders, algos)
+        if not self.portfolio.synchronized:
+            return snapshot
+        difference = self._pending_order_ids() ^ {row.get("clOrdId", "") for row in orders}
+        if not difference:
+            return snapshot
+        # Never turn foreign orders or unconfirmed active orders into an authorized delta.
+        verified: list[dict[str, Any]] = []
+        for client_id in sorted(difference):
+            local = self.order_manager.orders.get(client_id)
+            if local is None:
+                return snapshot
+            details = await self.client.order(local["symbol"], client_id)
+            if len(details) != 1 or not self._verified_terminal_order(local, details[0]):
+                return snapshot
+            verified.append(details[0])
+        for detail in verified:
+            local = self.order_manager.orders[detail["clOrdId"]]
+            if not self._verified_terminal_order(local, detail):
+                return snapshot
+            await self.order_manager.ingest(detail)
+        # Fills may have changed positions and protection since the initial parallel reads.
+        # One bounded refresh; the usual identity, position and protection gates still run.
+        refreshed = await asyncio.gather(
+            self.client.account(), self.client.positions(),
+            self.client.pending_orders(), self.client.pending_algos(),
+        )
+        return refreshed[0], refreshed[1], refreshed[2], refreshed[3]
+
     async def _reconcile_impl(self) -> None:
         self.entry_controller.client = self.client
         self.emergency.client = self.client
@@ -375,6 +441,9 @@ class TradingRuntime:
                 self.client.pending_algos(),
             )
             config = await self.client.account_config()
+            account, positions, orders, algos = await self._refresh_terminal_order_snapshot(
+                account, positions, orders, algos
+            )
             read_phase = False
             if not config or config[0].get("posMode") != "net_mode":
                 raise RuntimeError("net position mode required")
@@ -570,11 +639,7 @@ class TradingRuntime:
             if any(not algo_id or algo_id not in known_algos for algo_id in remote_algo_ids):
                 await self.enter_halt("unexpected algo order")
                 return
-            if self.portfolio.synchronized and {o.get("clOrdId") for o in orders} != {
-                cid
-                for cid, row in self.order_manager.orders.items()
-                if row["state"] in {"SUBMITTED", "ACKNOWLEDGED", "PARTIALLY_FILLED"}
-            }:
+            if self.portfolio.synchronized and {o.get("clOrdId") for o in orders} != self._pending_order_ids():
                 await self.enter_halt("order mismatch")
                 return
             now = utcnow()
@@ -1226,7 +1291,7 @@ class TradingRuntime:
                 if not row.get("algoClOrdId"):
                     await self.enter_halt("unowned algo order")
                     continue
-                if row.get("state") != "live" or row.get("failCode"):
+                if row.get("state") != "live" or self.algo_manager.has_failure(row):
                     symbol = row.get("instId", "")
                     if self.portfolio.positions.get(symbol):
                         await self.reconcile()

@@ -28,6 +28,7 @@ class Incident:
     severity: str = "IMPORTANT"
     components: set[str] = field(default_factory=set)
     recovered_components: set[str] = field(default_factory=set)
+    components_recovered_tick: float | None = None
     reasons: set[str] = field(default_factory=set)
     open_queued: bool = False
     notified_open: bool = False
@@ -117,6 +118,7 @@ class IncidentManager:
         incident.last_updated_at = now
         incident.components.add(component)
         incident.recovered_components.discard(component)
+        incident.components_recovered_tick = None
         incident.reasons.add(reason)
         incident.had_halt |= halt
         incident.risk_state = risk_state
@@ -185,6 +187,11 @@ class IncidentManager:
                     if active_infra is not None:
                         active_infra.last_updated_at = datetime.now(UTC)
                         active_infra.recovered_components.add(component)
+                        if (
+                            active_infra.components <= active_infra.recovered_components
+                            and active_infra.components_recovered_tick is None
+                        ):
+                            active_infra.components_recovered_tick = self.clock()
                         self.changes.append((active_infra, "updated"))
                         if (
                             not active_infra.had_halt
@@ -203,7 +210,10 @@ class IncidentManager:
         if event_code(event) == "RISK_RECOVERED" and event.metadata.get("recovery"):
             generated: list[NotificationEvent] = []
             for key in tuple(self.active):
-                if self.active[key].had_halt:
+                incident = self.active[key]
+                if incident.had_halt or (
+                    key == "infra:trading" and incident.components_recovered_tick is not None
+                ):
                     generated.extend(self._resolve(key))
             return generated
         return []
@@ -260,7 +270,12 @@ class IncidentManager:
             return []
         incident.resolved_at = datetime.now(UTC)
         incident.last_updated_at = incident.resolved_at
-        incident.duration_seconds = max(0, self.clock() - incident.opened_tick)
+        end_tick = (
+            incident.components_recovered_tick
+            if not incident.had_halt and incident.components_recovered_tick is not None
+            else self.clock()
+        )
+        incident.duration_seconds = max(0, end_tick - incident.opened_tick)
         if incident.duration_seconds >= self.delay_seconds:
             incident.alert_threshold_met = True
         self._last_resolved_by_key[key] = (incident.id, incident.series_id, self.clock())
@@ -342,6 +357,8 @@ class IncidentManager:
         for incident in tuple(self.active.values()):
             if incident.open_queued or incident.notified_open:
                 continue
+            if not incident.had_halt and incident.components_recovered_tick is not None:
+                continue
             if incident.had_halt and incident.risk_state == "NORMAL":
                 continue
             if now - incident.opened_tick < self.delay_seconds and not incident.alert_threshold_met:
@@ -397,7 +414,12 @@ class IncidentManager:
             return False
         incident_id = event.metadata.get("incident_id")
         incident = self._find(incident_id) if isinstance(incident_id, str) else None
-        return bool(incident and incident.resolved_at is not None and not incident.notified_open)
+        return bool(incident and not incident.notified_open and (
+            incident.resolved_at is not None or (
+                incident.key == "infra:trading" and not incident.had_halt
+                and incident.components_recovered_tick is not None
+            )
+        ))
 
     def supersede_open(self, event: NotificationEvent, attempts: int) -> None:
         incident_id = event.metadata.get("incident_id")
