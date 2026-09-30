@@ -106,6 +106,7 @@ class TradingRuntime:
         )
         self.started_at = utcnow()
         self._started_notified = False
+        self._planned_shutdown = False
         self._last_risk_notice: tuple[GovernorState, str] | None = None
         self._component_health: dict[str, bool] = {}
         self._component_pending: dict[str, tuple[bool, int]] = {}
@@ -193,6 +194,9 @@ class TradingRuntime:
 
     async def _notify_risk_state(self, *, symbol: str | None = None) -> None:
         current = (self.governor.state, self.governor.reason)
+        if self._planned_shutdown and current == (GovernorState.HALT, "manual stop"):
+            self._last_risk_notice = current
+            return
         if current == self._last_risk_notice:
             return
         previous = self._last_risk_notice
@@ -774,6 +778,32 @@ class TradingRuntime:
         )
 
     async def stop(self) -> None:
+        self._planned_shutdown = True
+        await self.alert(
+            "INFO", "🟡 Quant System Stopping",
+            f"Mode: {self.settings.mode.value}\nReason: manual stop",
+            category=NotificationCategory.SYSTEM,
+            dedup_key="system-stopping",
+        )
+        try:
+            await self._safe_stop()
+        except BaseException:
+            self._planned_shutdown = False
+            self._last_risk_notice = None
+            await self._send_observation(self._notify_risk_state())
+            raise
+        self._planned_shutdown = False
+        await self.alert(
+            "INFO", "⚪ Quant System Stopped", f"Mode: {self.settings.mode.value}",
+            category=NotificationCategory.SYSTEM,
+            dedup_key="system-stopped",
+        )
+        try:
+            await self.notifications.stop(drain_seconds=3)
+        except Exception as exc:
+            logger.error("notification shutdown failed: %s", type(exc).__name__)
+
+    async def _safe_stop(self) -> None:
         await self.enter_halt("manual stop")
         if self.settings.has_credentials:
             deadline = (
@@ -821,15 +851,6 @@ class TradingRuntime:
             task.cancel()
         await asyncio.gather(*self.tasks, return_exceptions=True)
         await self.store.append("system_events", {"event": "stop"})
-        await self.alert(
-            "INFO", "⚪ Quant System Stopped", f"Mode: {self.settings.mode.value}",
-            category=NotificationCategory.SYSTEM,
-            dedup_key="system-stopped",
-        )
-        try:
-            await self.notifications.stop(drain_seconds=3)
-        except Exception as exc:
-            logger.error("notification shutdown failed: %s", type(exc).__name__)
 
     async def close(self) -> None:
         if not self.running:

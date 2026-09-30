@@ -16,6 +16,26 @@ services:
       redis:
         condition: service_healthy
     restart: unless-stopped
+  watchdog:
+    build: .
+    command: [".venv/bin/python", "-m", "app.watchdog"]
+    environment:
+      WATCHDOG_ENABLED: ${WATCHDOG_ENABLED:-true}
+      WATCHDOG_STATUS_URL: ${WATCHDOG_STATUS_URL:-http://app:8000/status}
+      WATCHDOG_INTERVAL_SECONDS: ${WATCHDOG_INTERVAL_SECONDS:-60}
+      WATCHDOG_FAILURE_THRESHOLD: ${WATCHDOG_FAILURE_THRESHOLD:-3}
+      WATCHDOG_RECOVERY_THRESHOLD: ${WATCHDOG_RECOVERY_THRESHOLD:-2}
+      WATCHDOG_STARTUP_GRACE_SECONDS: ${WATCHDOG_STARTUP_GRACE_SECONDS:-120}
+      WATCHDOG_BARK_GROUP: ${WATCHDOG_BARK_GROUP:-OKX Quant Watchdog}
+      BARK_SERVER: ${BARK_SERVER:-https://api.day.app}
+      BARK_DEVICE_KEY: ${BARK_DEVICE_KEY:-}
+      BARK_GROUP: ${BARK_GROUP:-OKX Quant}
+      BARK_TIMEOUT_SECONDS: ${BARK_TIMEOUT_SECONDS:-5}
+      BARK_CRITICAL_SOUND: ${BARK_CRITICAL_SOUND:-alarm}
+      BARK_CRITICAL_VOLUME: ${BARK_CRITICAL_VOLUME:-5}
+    depends_on:
+      - app
+    restart: unless-stopped
   postgres:
     image: postgres:16-alpine
     environment:

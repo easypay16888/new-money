@@ -78,9 +78,25 @@ BARK_DEDUP_SECONDS=60
 
 `BARK_DEVICE_KEY` 是 secret，只能放在本机环境变量或未跟踪的 `.env` 中；不要写入代码、日志或提交 GitHub。缺少密钥或 Bark 配置无效时，运行时跳过 Bark 通道并记录不含密钥的错误，交易系统继续运行。推送使用 Bark 的 HTTP POST JSON API。可选 `BARK_SOUND`、`BARK_CRITICAL_SOUND`（默认 `alarm`）和 `BARK_CRITICAL_VOLUME`（默认 `5`）。
 
-交易运行时只把事件放入有界队列，由独立 worker 发送到 Console、Bark 或现有 Webhook。队列满时先丢弃低优先级事件，优先保留 CRITICAL；同一 `dedup_key` 的重复事件默认 60 秒内抑制，恢复和明确的风控状态转换仍会发送。Bark 超时、服务错误、DNS 故障及通知审计数据库故障不会触发 HALT，也不会阻塞下单、对账、EMERGENCY 或安全停机。发送失败最多重试 3 次，间隔 1、2、5 秒；安全停机完成后最多等待通知队列 3 秒。`notification_events` 只记录状态、次数和错误类型，不记录设备密钥或完整 Bark URL。
+交易运行时只把事件放入有界队列，由 dispatcher 分发给 Console、Bark 和 Webhook 各自独立的优先级队列与 worker。单个渠道超时或重试不会阻塞其他渠道；失败重试延时放在待发送队列中，不占用发送 worker，后来的 CRITICAL 会优先发送。队列满时先丢弃低优先级事件，优先保留 CRITICAL；同一 `dedup_key` 的重复事件默认 60 秒内抑制，恢复和明确的风控状态转换仍会发送。Bark 只有 HTTP 2xx 且 JSON 明确返回 `code=200` 或 `code=0` 才算成功；HTML、空响应及缺少成功码都会重试。Bark 超时、服务错误、DNS 故障及通知审计数据库故障不会触发 HALT，也不会阻塞下单、对账、EMERGENCY 或安全停机。发送失败最多重试 3 次，间隔 1、2、5 秒；安全停机完成后最多等待通知队列 3 秒。`notification_events` 按渠道分别记录状态、次数和错误类型，不记录设备密钥或完整 Bark URL。
 
-推送涵盖启动完成、正常停机、HALT/EMERGENCY、关键基础设施异常与恢复、entry 提交及成交、保护单确认、仓位平仓、每日 UTC 报告。默认每 6 小时发送 PASSIVE 心跳，风险状态非 NORMAL 时显示警告和原因。日报复用现有 `daily_reports`，缺少可靠成交配对的胜率、单笔净盈亏和 R 不会被编造。Prometheus 暴露发送、失败、丢弃、队列长度和延迟指标；Grafana 继续负责历史监控。
+推送涵盖启动完成、计划停机的 Stopping/Stopped、非计划 HALT/EMERGENCY、关键基础设施异常与恢复、entry 提交及成交、保护单确认、仓位平仓、每日 UTC 报告。默认每 6 小时发送 PASSIVE 心跳，风险状态非 NORMAL 时显示警告和原因。日报复用现有 `daily_reports`，缺少可靠成交配对的胜率、单笔净盈亏和 R 不会被编造。Prometheus 暴露发送、失败、丢弃、队列长度和延迟指标；Grafana 继续负责历史监控。
+
+### External Watchdog
+
+`app.watchdog` 是独立于交易应用的进程。Docker Compose 的 `watchdog` 服务只获配 Bark 与 WATCHDOG 环境变量，不接收 OKX API 密钥，不暴露端口；它只对 `WATCHDOG_STATUS_URL` 执行 `GET /status`，不会调用交易控制接口。`depends_on: app` 只控制启动顺序，app 停止后 watchdog 仍继续运行。Watchdog 的 Bark 分组使用 `WATCHDOG_BARK_GROUP`，未设置时回退到 `BARK_GROUP`。Watchdog 不要求交易应用开启 `BARK_ENABLED`，但需要本机或 Compose 环境提供同一 `BARK_DEVICE_KEY` 才能推送到手机。
+
+```dotenv
+WATCHDOG_ENABLED=true
+WATCHDOG_STATUS_URL=http://app:8000/status
+WATCHDOG_INTERVAL_SECONDS=60
+WATCHDOG_FAILURE_THRESHOLD=3
+WATCHDOG_RECOVERY_THRESHOLD=2
+WATCHDOG_STARTUP_GRACE_SECONDS=120
+WATCHDOG_BARK_GROUP=OKX Quant Watchdog
+```
+
+本机独立运行时，把 `WATCHDOG_STATUS_URL` 改为 `http://127.0.0.1:8000/status`，然后在另一个受监督的进程中执行 `uv run python -m app.watchdog`。启动前 120 秒只检查不告警；之后连续 3 次不可达或返回错误状态才通知，连续 2 次健康才通知恢复。HTTP 可达但 `running=false`、未同步或 WebSocket 不新鲜会报告 App Unhealthy；风险状态 HALT/EMERGENCY 本身不代表进程离线。Watchdog 不发送常规心跳，不参与交易安全决策。
 
 ## 切换到 LIVE
 
