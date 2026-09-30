@@ -63,6 +63,7 @@ class NotificationPriority(StrEnum):
 
 class NotificationEvent(BaseModel):
     id: str = Field(default_factory=lambda: uuid4().hex)
+    event_code: str = ""
     timestamp: datetime = Field(default_factory=utcnow)
     level: NotificationLevel
     category: NotificationCategory

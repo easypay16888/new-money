@@ -78,7 +78,8 @@ async def test_bark_post_payload():
     assert str(requests[0].url) == "https://api.day.app/push"
     payload = json.loads(requests[0].content)
     assert payload == {
-        "device_key": "test-device-secret", "title": "Urgent", "body": "status",
+        "device_key": "test-device-secret", "title": "🚨 系统严重异常",
+        "body": "系统异常（reason_code: status）",
         "group": "OKX Quant", "level": "critical", "sound": "alarm", "volume": "5",
     }
 

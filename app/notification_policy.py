@@ -10,6 +10,7 @@ from app.models import (
     NotificationLevel,
     NotificationPriority,
 )
+from app.notification_events import event_code, reason_code
 from app.recovery import AUTO_RECOVERABLE_REASONS
 
 
@@ -44,14 +45,11 @@ class NotificationPolicy:
 
     @staticmethod
     def halt_reason(event: NotificationEvent) -> str:
-        return next(
-            (line.removeprefix("Reason: ") for line in event.message.splitlines()
-             if line.startswith("Reason: ")), "",
-        )
+        return reason_code(event)
 
     @staticmethod
     def is_critical(event: NotificationEvent) -> bool:
-        reason = NotificationPolicy.halt_reason(event) if event.title == "🚨 HALT" else ""
+        reason = NotificationPolicy.halt_reason(event) if event_code(event) == "RISK_HALT" else ""
         safety_halt = (
             reason in {
                 "position mismatch", "startup position mismatch", "startup fill size mismatch",
@@ -70,7 +68,7 @@ class NotificationPolicy:
         return (
             event.level == NotificationLevel.CRITICAL
             or event.priority == NotificationPriority.CRITICAL
-            or event.title in {"🚨 EMERGENCY", "🚨 Trading App Offline"}
+            or event_code(event) in {"RISK_EMERGENCY", "WATCHDOG_OFFLINE"}
             or safety_halt
         )
 
@@ -82,29 +80,31 @@ class NotificationPolicy:
         if event.metadata.get("incident_duplicate"):
             return NotificationDecision(False)
         if self.is_critical(event):
-            if event.title == "🚨 Trading App Offline":
+            if event_code(event) == "WATCHDOG_OFFLINE":
                 self._watchdog_alert_pending[channel] = True
             return NotificationDecision(True, NotificationPriority.CRITICAL)
         if event.metadata.get("incident_notification"):
             return NotificationDecision(True)
-        title = event.title
-        if title == "🚨 HALT":
+        code = event_code(event)
+        if code == "RISK_HALT":
             reason = self.halt_reason(event)
             if reason in AUTO_RECOVERABLE_REASONS or reason in {
                 "startup reconciliation pending", "manual stop", "auto recovery circuit breaker",
             }:
                 return NotificationDecision(False)
             return NotificationDecision(self.risk_enabled)
-        if title in {"✅ Risk State Recovered", "✅ Auto Recovery Completed"}:
+        if code in {"RISK_RECOVERED", "AUTO_RECOVERY_COMPLETED"}:
             return NotificationDecision(False)
-        if title == "🚨 Trading App Offline":
+        if code == "WATCHDOG_OFFLINE":
             return NotificationDecision(True, NotificationPriority.CRITICAL)
-        if title == "⚠️ Trading App Unhealthy":
+        if code == "WATCHDOG_UNHEALTHY":
             eligible = bool(event.metadata.get("bark_eligible"))
             if eligible:
                 self._watchdog_alert_pending[channel] = True
             return NotificationDecision(eligible)
-        if title == "✅ Trading App Recovered":
+        if code == "WATCHDOG_RECOVERED":
+            if "watchdog_delivery_confirmed" in event.metadata:
+                return NotificationDecision(bool(event.metadata["watchdog_delivery_confirmed"]))
             if not self._watchdog_delivered.get(channel) and self._watchdog_alert_pending.get(channel):
                 self._watchdog_recovery_pending[channel] = event
             return NotificationDecision(self._watchdog_delivered.get(channel, False))
@@ -118,16 +118,16 @@ class NotificationPolicy:
                     return NotificationDecision(False)
                 self._daily_seen.add(event.dedup_key)
             return NotificationDecision(self.daily_enabled)
-        if title == "🟡 Quant System Stopping":
+        if code == "SYSTEM_STOPPING":
             return NotificationDecision(self.system_stopping)
-        if title in {"🟢 Quant System Started", "⚪ Quant System Stopped"}:
+        if code in {"SYSTEM_STARTED", "SYSTEM_STOPPED"}:
             return NotificationDecision(True)
         if event.category == NotificationCategory.TRADE:
             if not self.trade_enabled:
                 return NotificationDecision(False)
-            if "Entry Submitted" in title:
+            if code == "ENTRY_SUBMITTED":
                 return NotificationDecision(self.entry_submitted)
-            if any(word in title for word in (" Filled", "Protection Active", "Position Closed")):
+            if code in {"TRADE_FILLED", "PROTECTION_ACTIVE", "POSITION_CLOSED"}:
                 if event.dedup_key:
                     now = self.clock()
                     trade_key = (channel, event.dedup_key)
@@ -149,17 +149,15 @@ class NotificationPolicy:
 
     def delivered(self, event: NotificationEvent, channel: str) -> NotificationEvent | None:
         if channel in {"bark", "webhook"}:
-            if event.title in {"🚨 Trading App Offline", "⚠️ Trading App Unhealthy"}:
+            if event_code(event) in {"WATCHDOG_OFFLINE", "WATCHDOG_UNHEALTHY"}:
                 self._watchdog_delivered[channel] = True
                 self._watchdog_alert_pending[channel] = False
                 return self._watchdog_recovery_pending.pop(channel, None)
-            if event.title == "✅ Trading App Recovered":
+            if event_code(event) == "WATCHDOG_RECOVERED":
                 self._watchdog_delivered[channel] = False
         return None
 
     def failed(self, event: NotificationEvent, channel: str) -> None:
-        if channel in {"bark", "webhook"} and event.title in {
-            "🚨 Trading App Offline", "⚠️ Trading App Unhealthy",
-        }:
+        if channel in {"bark", "webhook"} and event_code(event) in {"WATCHDOG_OFFLINE", "WATCHDOG_UNHEALTHY"}:
             self._watchdog_alert_pending[channel] = False
             self._watchdog_recovery_pending.pop(channel, None)

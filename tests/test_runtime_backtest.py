@@ -175,6 +175,7 @@ async def test_reconciliation_halts_on_unexpected_position(tmp_path):
     await runtime.reconcile()
     assert runtime.governor.state == GovernorState.EMERGENCY
     assert runtime.governor.reason == "protective stop cannot be verified"
+    await runtime.notifications.close()
     await runtime.store.close()
 
 
@@ -209,6 +210,7 @@ async def test_reconciliation_halts_on_unexplained_position_disappearance(tmp_pa
     runtime.client = FakeClient()
     await runtime.reconcile()
     assert runtime.governor.reason == "position mismatch"
+    await runtime.notifications.close()
     await runtime.store.close()
 
 
@@ -269,4 +271,5 @@ async def test_restart_recovers_owned_position_with_protective_algo(tmp_path):
     assert runtime.portfolio.synchronized
     assert runtime.portfolio.positions == {"BTC-USDT-SWAP": Decimal("1")}
     assert runtime.portfolio.open_risk == Decimal("5.00")
+    await runtime.notifications.close()
     await runtime.store.close()

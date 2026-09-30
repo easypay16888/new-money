@@ -13,6 +13,7 @@ from app.models import (
     NotificationLevel,
     NotificationPriority,
 )
+from app.notification_events import COMPONENTS, event_code
 from app.notification_policy import NotificationPolicy
 from app.recovery import AUTO_RECOVERABLE_REASONS
 
@@ -91,16 +92,8 @@ class IncidentManager:
 
     @staticmethod
     def _component(event: NotificationEvent) -> str | None:
-        title = event.title.lower()
-        if "websocket" in title or "ws " in title:
-            return "websocket"
-        if "redis" in title:
-            return "redis"
-        if "caa" in title or "cancel-all-after" in title:
-            return "caa"
-        if "reconciliation" in title:
-            return "reconciliation"
-        return None
+        component = event.metadata.get("component")
+        return component if isinstance(component, str) else COMPONENTS.get(event_code(event))
 
     def _open_or_update(
         self, key: str, component: str, reason: str, *, halt: bool, risk_state: str,
@@ -152,7 +145,7 @@ class IncidentManager:
     def observe(self, event: NotificationEvent) -> list[NotificationEvent]:
         if event.metadata.get("incident_notification"):
             return []
-        if event.title == "🚨 HALT":
+        if event_code(event) == "RISK_HALT":
             reason = NotificationPolicy.halt_reason(event)
             if reason in AUTO_RECOVERABLE_REASONS:
                 halt_component = {
@@ -174,11 +167,11 @@ class IncidentManager:
             elif reason not in {"startup reconciliation pending", "manual stop"}:
                 self._immediate(event, f"risk:{reason}", "safety", reason)
             return []
-        if event.title == "🚨 EMERGENCY":
+        if event_code(event) == "RISK_EMERGENCY":
             reason = NotificationPolicy.halt_reason(event) or "emergency"
             self._immediate(event, "risk:emergency", "emergency", reason)
             return []
-        if event.title == "🚨 Auto Recovery Disabled":
+        if event_code(event) == "AUTO_RECOVERY_DISABLED":
             self._immediate(
                 event, "auto-recovery:circuit-breaker", "auto_recovery",
                 "auto recovery circuit breaker",
@@ -205,9 +198,9 @@ class IncidentManager:
                         halt=False, risk_state=str(event.metadata.get("risk_state", "UNKNOWN")),
                     )
             return []
-        if event.title == "✅ Auto Recovery Completed" and event.metadata.get("recovery"):
+        if event_code(event) == "AUTO_RECOVERY_COMPLETED" and event.metadata.get("recovery"):
             return self._resolve("infra:trading")
-        if event.title == "✅ Risk State Recovered" and event.metadata.get("recovery"):
+        if event_code(event) == "RISK_RECOVERED" and event.metadata.get("recovery"):
             generated: list[NotificationEvent] = []
             for key in tuple(self.active):
                 if self.active[key].had_halt:
@@ -239,12 +232,13 @@ class IncidentManager:
         if incident.risk_state == "HALT":
             message += "\nNew entries: blocked"
         return NotificationEvent(
+            event_code="INCIDENT_OPEN",
             level=NotificationLevel.WARNING, category=NotificationCategory.INFRASTRUCTURE,
             title=title, message=message, priority=NotificationPriority.TIME_SENSITIVE,
             dedup_key=f"incident:{incident.id}:open",
             metadata={
                 "incident_notification": True, "incident_id": incident.id,
-                "incident_phase": "open", "transition": True,
+                "incident_phase": "open", "transition": True, "risk_state": incident.risk_state,
             },
         )
 
@@ -314,6 +308,11 @@ class IncidentManager:
                 f"\nDowntime: {int(incident.duration_seconds or 0)}s\nRisk: NORMAL"
             )
         return NotificationEvent(
+            event_code=(
+                "EMERGENCY_RETROSPECTIVE" if retrospective and incident.key == "risk:emergency"
+                else "SAFETY_RETROSPECTIVE" if retrospective and incident.severity == "CRITICAL"
+                else "INCIDENT_RETROSPECTIVE" if retrospective else "INCIDENT_RESOLVED"
+            ),
             level=level, category=NotificationCategory.INFRASTRUCTURE,
             title=title, message=message, priority=priority,
             dedup_key=f"incident:{incident.id}:resolved",

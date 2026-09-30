@@ -3,9 +3,11 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Callable
+from dataclasses import dataclass
 from time import monotonic
 from typing import Any
 from urllib.parse import urlsplit
+from uuid import uuid4
 
 import httpx
 from pydantic import Field, SecretStr, field_validator
@@ -18,6 +20,7 @@ from app.models import (
     NotificationPriority,
 )
 from app.monitoring import ConsoleNotification, Metrics, Notification
+from app.notification_events import event_code
 from app.notification_policy import NotificationPolicy
 from app.notifications import BarkNotification, NotificationManager
 
@@ -36,6 +39,8 @@ class WatchdogSettings(BaseSettings):
     watchdog_startup_grace_seconds: float = Field(default=120, ge=0)
     watchdog_unhealthy_alert_seconds: float = Field(default=60, ge=0)
     watchdog_bark_group: str = ""
+    bark_incident_retry_initial_seconds: float = Field(default=30, gt=0)
+    bark_incident_retry_max_seconds: float = Field(default=300, gt=0)
     bark_server: str = "https://api.day.app"
     bark_device_key: SecretStr = SecretStr("")
     bark_group: str = "OKX Quant"
@@ -55,6 +60,21 @@ class WatchdogSettings(BaseSettings):
         ):
             raise ValueError("WATCHDOG_STATUS_URL must point to /status")
         return value
+
+
+@dataclass
+class WatchdogOutage:
+    id: str
+    generation: int = 0
+    event: NotificationEvent | None = None
+    confirmed: bool = False
+    ever_delivered: bool = False
+    pending: bool = False
+    delivery_failures: int = 0
+    retry_at: float = 0
+    resolved: bool = False
+    recovery_bark_queued: bool = False
+    previous_kind: str = "APP_DOWN"
 
 
 class WatchdogMonitor:
@@ -77,6 +97,98 @@ class WatchdogMonitor:
         self.alerted_kind: str | None = None
         self.unhealthy_since: float | None = None
         self.unhealthy_bark_eligible = False
+        if settings.bark_incident_retry_max_seconds < settings.bark_incident_retry_initial_seconds:
+            raise ValueError("invalid watchdog notification retry interval")
+        self._outage: WatchdogOutage | None = None
+        notifications.add_delivery_observer(self)
+
+    @property
+    def outage_id(self) -> str | None:
+        return self._outage.id if self._outage else None
+
+    @property
+    def alert_delivery_confirmed(self) -> bool:
+        return bool(self._outage and self._outage.confirmed)
+
+    @property
+    def alert_delivery_pending(self) -> bool:
+        return bool(self._outage and self._outage.pending)
+
+    @property
+    def alert_delivery_failures(self) -> int:
+        return self._outage.delivery_failures if self._outage else 0
+
+    @property
+    def next_alert_retry_at(self) -> float:
+        return self._outage.retry_at if self._outage else 0
+
+    def _recovery_event(self, outage: WatchdogOutage) -> NotificationEvent:
+        return NotificationEvent(
+            event_code="WATCHDOG_RECOVERED", level=NotificationLevel.INFO,
+            category=NotificationCategory.INFRASTRUCTURE,
+            title="✅ Trading App Recovered",
+            message=f"Status endpoint healthy again\nPrevious: {outage.previous_kind}",
+            priority=NotificationPriority.ACTIVE,
+            dedup_key="watchdog:app-state",
+            metadata={"recovery": True, "watchdog_outage_id": outage.id,
+                      "watchdog_delivery_confirmed": outage.ever_delivered},
+        )
+
+    def _matches(self, event: NotificationEvent) -> bool:
+        return bool(self._outage and event.metadata.get("watchdog_outage_id") == self._outage.id)
+
+    def should_send(self, event: NotificationEvent, channel: str) -> bool:
+        if channel != "bark" or "watchdog_outage_id" not in event.metadata:
+            return True
+        if not self._matches(event):
+            return False
+        assert self._outage is not None
+        if event_code(event) in {"WATCHDOG_OFFLINE", "WATCHDOG_UNHEALTHY"}:
+            return (
+                not self._outage.resolved
+                and event.metadata.get("watchdog_alert_generation") == self._outage.generation
+            )
+        return True
+
+    def delivered(self, event: NotificationEvent, channel: str) -> NotificationEvent | None:
+        if channel != "bark" or not self._matches(event):
+            return None
+        if event_code(event) not in {"WATCHDOG_OFFLINE", "WATCHDOG_UNHEALTHY"}:
+            return None
+        assert self._outage is not None
+        outage = self._outage
+        outage.ever_delivered = True
+        if event.metadata.get("watchdog_alert_generation") == outage.generation:
+            outage.confirmed, outage.pending = True, False
+        # An HTTP request already in flight may succeed after the recovery check.
+        if outage.resolved and not outage.recovery_bark_queued:
+            outage.recovery_bark_queued = True
+            recovery = self._recovery_event(outage)
+            recovery.metadata["notification_retry"] = True
+            return recovery
+        return None
+
+    def failed(self, event: NotificationEvent, channel: str) -> None:
+        if channel != "bark" or not self._matches(event):
+            return
+        assert self._outage is not None
+        outage = self._outage
+        if (
+            event_code(event) not in {"WATCHDOG_OFFLINE", "WATCHDOG_UNHEALTHY"}
+            or event.metadata.get("watchdog_alert_generation") != outage.generation
+            or outage.resolved or outage.confirmed
+        ):
+            return
+        outage.pending = False
+        outage.delivery_failures += 1
+        delay = min(
+            self.settings.bark_incident_retry_max_seconds,
+            self.settings.bark_incident_retry_initial_seconds
+            * 2 ** min(outage.delivery_failures - 1, 30),
+        )
+        outage.retry_at = self.clock() + delay
+        logger.error("watchdog Bark delivery failed: failures=%s retry_seconds=%s",
+                     outage.delivery_failures, delay)
 
     async def check(self) -> None:
         kind, error, status = await self._probe()
@@ -85,17 +197,12 @@ class WatchdogMonitor:
             self.failure_kind = None
             self.successes += 1
             if self.alerted_kind and self.successes >= self.settings.watchdog_recovery_threshold:
-                previous = self.alerted_kind
                 self.alerted_kind = None
-                await self.notifications.publish(NotificationEvent(
-                    level=NotificationLevel.INFO,
-                    category=NotificationCategory.INFRASTRUCTURE,
-                    title="✅ Trading App Recovered",
-                    message=f"Status endpoint healthy again\nPrevious: {previous}",
-                    priority=NotificationPriority.ACTIVE,
-                    dedup_key="watchdog:app-state",
-                    metadata={"recovery": True},
-                ))
+                if self._outage is not None:
+                    self._outage.resolved = True
+                    self._outage.pending = False
+                    self._outage.recovery_bark_queued = self._outage.ever_delivered
+                    await self.notifications.publish(self._recovery_event(self._outage))
             if self.successes >= self.settings.watchdog_recovery_threshold:
                 self.unhealthy_since = None
                 self.unhealthy_bark_eligible = False
@@ -118,9 +225,29 @@ class WatchdogMonitor:
             >= self.settings.watchdog_unhealthy_alert_seconds
         )
         if self.alerted_kind == kind and (not bark_eligible or self.unhealthy_bark_eligible):
+            outage = self._outage
+            if (
+                outage is not None and outage.event is not None and not outage.resolved
+                and not outage.confirmed and not outage.pending
+                and (kind == "APP_DOWN" or self.unhealthy_bark_eligible)
+                and self.clock() >= outage.retry_at
+            ):
+                retry = outage.event.model_copy(deep=True)
+                retry.metadata["notification_retry"] = True
+                outage.pending = True
+                await self.notifications.publish(retry)
             return
         self.unhealthy_bark_eligible |= bark_eligible
         self.alerted_kind = kind
+        if self._outage is None or self._outage.resolved:
+            self._outage = WatchdogOutage(id=uuid4().hex)
+        outage = self._outage
+        outage.generation += 1
+        outage.previous_kind = kind
+        outage.confirmed = False
+        outage.pending = kind == "APP_DOWN" or bark_eligible
+        outage.delivery_failures = 0
+        outage.retry_at = 0
         if kind == "APP_DOWN":
             title = "🚨 Trading App Offline"
             message = (
@@ -133,15 +260,19 @@ class WatchdogMonitor:
             risk = status.get("risk_state", "unknown") if status else "unknown"
             message = f"App responds but is not ready\nFailures: {self.failures}\nRisk: {risk}"
             level, priority = NotificationLevel.ERROR, NotificationPriority.TIME_SENSITIVE
-        await self.notifications.publish(NotificationEvent(
+        outage.event = NotificationEvent(
+            event_code="WATCHDOG_OFFLINE" if kind == "APP_DOWN" else "WATCHDOG_UNHEALTHY",
             level=level,
             category=NotificationCategory.INFRASTRUCTURE,
             title=title,
             message=message,
             priority=priority,
             dedup_key="watchdog:app-state",
-            metadata={"transition": True, "bark_eligible": bark_eligible},
-        ))
+            metadata={"transition": True, "bark_eligible": bark_eligible,
+                      "watchdog_outage_id": outage.id,
+                      "watchdog_alert_generation": outage.generation},
+        )
+        await self.notifications.publish(outage.event.model_copy(deep=True))
 
     async def _probe(self) -> tuple[str | None, str, dict[str, Any] | None]:
         try:

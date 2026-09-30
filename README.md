@@ -94,6 +94,8 @@ WEBHOOK_NOTIFICATIONS_VERBOSE=true
 
 `NotificationPolicy` 按渠道筛选事件：Console 保留详细事件，Webhook 默认保留详细事件（设 `WEBHOOK_NOTIFICATIONS_VERBOSE=false` 可使用同样的低噪音规则），Bark 只接收重要事件。Bark 默认接收真实成交、保护单确认、平仓、系统启动及停机、日报和严重风控事件；心跳、entry 提交、计划停机的 Stopping、普通信号和单次基础设施抖动默认静默。可按需单独开启上述配置。成交与保护单各推一次，按对应订单或保护单 ID 去重；不会伪造缺失的单笔净盈亏或 R。
 
+Bark 的标题和正文统一使用简体中文，例如“🟢 量化系统已启动”“🛡 BTC 止损保护已生效”“🚨 紧急风控已触发”。`NotificationEvent.event_code` 提供稳定机器标识，路由、事故分类与 CRITICAL 判断优先读取 code、原始 reason 和 metadata；旧英文事件在统一入口兼容识别。`localize_bark_event` 仅在 Bark HTTP 发送边界生成展示副本，Console、Webhook 和内部审计仍保留原始事件。中文化不会修改事件 ID、去重 key、incident key、priority、category 或机器状态；HALT、EMERGENCY、NORMAL、PAPER 等保留英文。未知原因使用经过凭据及地址脱敏的 `reason_code` 提示。
+
 `IncidentManager` 按 key 独立跟踪基础设施、安全 HALT、EMERGENCY 和自动恢复熔断事故。WebSocket、Redis、CAA 与对账异常合并为一个基础设施事故；持续不足 60 秒且恢复的异常只写入内部记录，持续超过阈值才推告警。安全事故独立且立即通知。`BARK_INCIDENT_MERGE_WINDOW_SECONDS` 只把再次发生的事故关联到同一历史系列，不延长新事故的 60 秒告警阈值。
 
 Bark 的渠道内重试耗尽后，事故仍标记为未送达，由独立通知 worker 按 30、60、120、240、300 秒的封顶退避重投同一 `incident_id`；成功回执才将 `notified_open` 或 `notified_resolved` 置为 true。若事故结束前始终未成功发送开场告警，通知恢复后只发送一条注明延迟及持续时间的 retrospective 摘要；曾发生的 EMERGENCY 保留 CRITICAL 级别。组件自己的恢复事件不逐条推 Bark，事故恢复须等到风险状态真正 NORMAL。`system_events` 保留开场、失败、重试、恢复和 retrospective 生命周期；Prometheus 增加送达失败、事故重试与 retrospective 指标。通知重试只重发 `NotificationEvent`，不调用交易、风控或恢复操作。日报复用现有 `daily_reports`，Grafana 继续负责完整历史监控。
@@ -114,6 +116,10 @@ WATCHDOG_BARK_GROUP=OKX Quant Watchdog
 ```
 
 本机独立运行时，把 `WATCHDOG_STATUS_URL` 改为 `http://127.0.0.1:8000/status`，然后在另一个受监督的进程中执行 `uv run python -m app.watchdog`。启动前 120 秒只检查不告警；之后连续 3 次不可达或返回错误状态才通知 App Offline。HTTP 可达但 `running=false`、未同步或 WebSocket 不新鲜属于 App Unhealthy，Bark 要在异常持续达到 `WATCHDOG_UNHEALTHY_ALERT_SECONDS` 后才推送。连续 2 次健康后，仅当先前的告警真正送达 Bark 才推送恢复。风险状态 HALT/EMERGENCY 本身不代表进程离线。Watchdog 不发送常规心跳，不参与交易安全决策。
+
+Watchdog 将“告警已生成”“发送中”“Bark 已确认”分别记录。Bark 渠道内重试耗尽或队列丢弃后，复用 `BARK_INCIDENT_RETRY_INITIAL_SECONDS=30`、`BARK_INCIDENT_RETRY_MAX_SECONDS=300`，按 30、60、120、240、300 秒封顶退避；到期且下次 `/status` 检查仍异常时，重投同一 outage ID 和事件 ID。Console 或 Webhook 成功不会确认手机送达。离线通知成功后保持静默，连续两次健康后推一次“✅ 交易程序已恢复”。若整个离线期间从未成功送达 Bark，恢复后手机保持静默，Console 和日志保留故障及恢复记录；队列中的过时离线通知也会停止发送。已发出的单次 HTTP 请求无法撤回，若它在恢复检查后才确认成功，则补一条恢复消息以保留上下文。
+
+通知及 Watchdog 重试状态保存在内存中，重启不会恢复待送达历史；Bark 服务确认成功也不代表 iPhone 已展示消息。Watchdog 的重投时刻还受 `WATCHDOG_INTERVAL_SECONDS` 检查间隔影响。它始终只读取状态并发送通知，没有交易控制权限。
 
 ## 切换到 LIVE
 

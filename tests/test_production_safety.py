@@ -153,6 +153,7 @@ async def test_halt_cancels_pending_entries(tmp_path):
     assert request.client_order_id in exchange.cancelled
     assert runtime.order_manager.orders[request.client_order_id]["state"] == "CANCELLED"
     assert runtime.governor.state == GovernorState.HALT
+    await runtime.notifications.close()
     await runtime.store.close()
 
 
@@ -185,6 +186,7 @@ async def test_halt_waits_for_inflight_entry_then_cancels(tmp_path):
     await asyncio.gather(submit_task, halt_task)
     assert request.client_order_id in exchange.cancelled
     assert runtime.order_manager.orders[request.client_order_id]["state"] == "CANCELLED"
+    await runtime.notifications.close()
     await runtime.store.close()
 
 
@@ -199,6 +201,7 @@ async def test_halt_preserves_protective_orders(tmp_path):
     assert all(
         item not in {algo["algoClOrdId"] for algo in exchange.algos} for item in exchange.cancelled
     )
+    await runtime.notifications.close()
     await runtime.store.close()
 
 
@@ -210,6 +213,7 @@ async def test_halt_preserves_reduce_only_exit(tmp_path):
     await runtime.enter_halt("test")
     assert not exchange.cancelled
     assert exchange.pending[0]["clOrdId"] == "exit-1"
+    await runtime.notifications.close()
     await runtime.store.close()
 
 
@@ -221,6 +225,7 @@ async def test_expired_signal_cancels_entry(tmp_path):
     await runtime.entry_controller.expire()
     assert request.client_order_id in exchange.cancelled
     assert row["state"] == "CANCELLED"
+    await runtime.notifications.close()
     await runtime.store.close()
 
 
@@ -249,6 +254,7 @@ async def test_stale_pending_order_never_late_fills(tmp_path):
     assert runtime.governor.state == GovernorState.EMERGENCY
     assert exchange.placed and exchange.placed[-1]["reduceOnly"] is True
     assert runtime.emergency.targets[SYMBOL] == 0
+    await runtime.notifications.close()
     await runtime.store.close()
 
 
@@ -259,6 +265,7 @@ async def test_shutdown_cancels_pending_entry(tmp_path):
     await runtime.stop()
     assert request.client_order_id in exchange.cancelled
     assert not runtime.running
+    await runtime.notifications.close()
     await runtime.store.close()
 
 
@@ -271,6 +278,7 @@ async def test_shutdown_refuses_unconfirmed_cancel(tmp_path):
     with pytest.raises(RuntimeError, match="unconfirmed"):
         await runtime.stop()
     assert runtime.running
+    await runtime.notifications.close()
     await runtime.store.close()
 
 
@@ -297,6 +305,7 @@ async def test_shutdown_preserves_open_position_stop(tmp_path):
     runtime.running = True
     await runtime.stop()
     assert exchange.algos and not exchange.cancelled
+    await runtime.notifications.close()
     await runtime.store.close()
 
 
@@ -331,6 +340,7 @@ async def test_graceful_shutdown_disables_caa_for_retained_reduce_only_exit(tmp_
     await runtime._dead_man_loop()
     assert exchange.caa_calls == [0]
     runtime.running = False
+    await runtime.notifications.close()
     await runtime.store.close()
 
 
@@ -374,6 +384,7 @@ async def test_shutdown_keeps_heartbeat_when_caa_disable_fails(tmp_path):
     await asyncio.gather(heartbeat, return_exceptions=True)
     assert exchange.caa_calls == [0, runtime.settings.cancel_all_after_seconds]
     runtime.running = False
+    await runtime.notifications.close()
     await runtime.store.close()
 
 
@@ -403,6 +414,7 @@ async def assert_invalid_protection(tmp_path, modification):
     assert runtime.governor.state == GovernorState.EMERGENCY
     assert exchange.placed and exchange.placed[0]["reduceOnly"] is True
     assert exchange.placed[0]["sz"] == "1"
+    await runtime.notifications.close()
     await runtime.store.close()
 
 
@@ -442,6 +454,7 @@ async def test_protective_replacement_confirms_before_old_cancel(tmp_path):
         runtime.order_manager.orders[next(iter(runtime.order_manager.orders))]["protective_algo_id"]
         == exchange.algos[0]["algoClOrdId"]
     )
+    await runtime.notifications.close()
     await runtime.store.close()
 
 
@@ -462,6 +475,7 @@ async def test_orders_algo_websocket_updates_state(tmp_path):
     }
     await runtime._on_private({"arg": {"channel": "orders-algo"}, "data": [event]})
     assert runtime.algo_manager.algos["algo-1"]["failCode"] == "51008"
+    await runtime.notifications.close()
     await runtime.store.close()
 
 
@@ -478,6 +492,7 @@ async def test_startup_foreign_entry_halts_without_canceling_it(tmp_path):
     assert runtime.governor.state == GovernorState.HALT
     assert runtime.governor.reason == "foreign risk-increasing pending order"
     assert exchange.cancelled == []
+    await runtime.notifications.close()
     await runtime.store.close()
 
 
@@ -488,6 +503,7 @@ async def test_startup_owned_stale_entry_cancels_and_reconciles(tmp_path):
     assert request.client_order_id in exchange.cancelled
     assert runtime.order_manager.orders[request.client_order_id]["state"] == "CANCELLED"
     assert runtime.reconciliation_healthy
+    await runtime.notifications.close()
     await runtime.store.close()
 
 
@@ -625,6 +641,7 @@ async def assert_global_limit_cancels(tmp_path, field, value, reason):
     await runtime._check_portfolio_limits([])
     assert runtime.governor.reason == reason
     assert request.client_order_id in exchange.cancelled
+    await runtime.notifications.close()
     await runtime.store.close()
 
 
@@ -652,6 +669,7 @@ async def test_margin_usage_cancels_existing_pending_entry(tmp_path):
     await runtime._check_portfolio_limits([])
     assert runtime.governor.reason == "margin usage limit"
     assert request.client_order_id in exchange.cancelled
+    await runtime.notifications.close()
     await runtime.store.close()
 
 
@@ -663,6 +681,7 @@ async def test_low_margin_ratio_enters_emergency(tmp_path):
     assert runtime.governor.state == GovernorState.EMERGENCY
     assert request.client_order_id in exchange.cancelled
     assert exchange.placed and exchange.placed[-1]["reduceOnly"] is True
+    await runtime.notifications.close()
     await runtime.store.close()
 
 
@@ -672,6 +691,7 @@ async def test_missing_margin_ratio_fails_closed(tmp_path):
     exchange.position = Decimal(1)
     await runtime._check_portfolio_limits([{"instId": SYMBOL, "pos": "1"}])
     assert runtime.governor.state == GovernorState.EMERGENCY
+    await runtime.notifications.close()
     await runtime.store.close()
 
 
@@ -710,4 +730,5 @@ async def test_backtest_and_live_decision_pipeline_parity(tmp_path):
     assert live[1] is not None and offline[1] is not None
     assert live[1].direction == offline[1].direction == Side.LONG
     await runtime.client.close()
+    await runtime.notifications.close()
     await runtime.store.close()

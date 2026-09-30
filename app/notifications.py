@@ -14,6 +14,7 @@ from urllib.parse import urlsplit
 import httpx
 from pydantic import SecretStr
 
+from app.bark_formatter import localize_bark_event
 from app.incidents import IncidentManager
 from app.models import (
     NotificationCategory,
@@ -22,6 +23,7 @@ from app.models import (
     NotificationPriority,
 )
 from app.monitoring import Metrics, Notification
+from app.notification_events import normalize_event
 from app.notification_policy import NotificationPolicy
 from app.storage import Store
 
@@ -51,6 +53,14 @@ class BarkConfig(Protocol):
     bark_critical_volume: int
 
 
+class DeliveryObserver(Protocol):
+    """Receipts observe notification delivery only; callbacks must never do I/O."""
+
+    def should_send(self, event: NotificationEvent, channel: str) -> bool: ...
+    def delivered(self, event: NotificationEvent, channel: str) -> NotificationEvent | None: ...
+    def failed(self, event: NotificationEvent, channel: str) -> None: ...
+
+
 class BarkDeliveryError(RuntimeError):
     def __init__(self, status_code: int | None = None) -> None:
         super().__init__("Bark response did not confirm delivery")
@@ -77,10 +87,15 @@ class BarkNotification(Notification):
         self._owns_client = client is None
 
     async def send(self, event: NotificationEvent) -> None:
+        display = localize_bark_event(event)
+        title, body = display.title, display.message
+        if self._device_key:
+            title = title.replace(self._device_key, "[凭证已隐藏]")
+            body = body.replace(self._device_key, "[凭证已隐藏]")
         payload: dict[str, Any] = {
             "device_key": self._device_key,
-            "title": event.title,
-            "body": event.message,
+            "title": title,
+            "body": body,
             "group": self.group,
             "level": BARK_LEVEL[event.priority],
         }
@@ -166,6 +181,7 @@ class NotificationManager:
         self.channel_timeout_seconds = channel_timeout_seconds
         self.policy = policy
         self.incidents = incidents
+        self._delivery_observers: list[DeliveryObserver] = []
         self._incident_task: asyncio.Task[None] | None = None
         self._incident_audits: set[asyncio.Task[None]] = set()
         self._channels = [
@@ -190,6 +206,25 @@ class NotificationManager:
     @property
     def queue_size(self) -> int:
         return self._size + sum(channel.size for channel in self._channels)
+
+    def add_delivery_observer(self, observer: DeliveryObserver) -> None:
+        self._delivery_observers.append(observer)
+
+    def _delivery_receipt(
+        self, event: NotificationEvent, channel: str, *, sent: bool,
+    ) -> list[NotificationEvent]:
+        generated: list[NotificationEvent] = []
+        for observer in self._delivery_observers:
+            try:
+                if sent:
+                    derived = observer.delivered(event, channel)
+                    if derived is not None:
+                        generated.append(derived)
+                else:
+                    observer.failed(event, channel)
+            except Exception as exc:
+                logger.error("notification observer receipt error_type=%s", type(exc).__name__)
+        return generated
 
     def _update_queue_metric(self) -> None:
         self.metrics.notification_queue_size.set(self.queue_size)
@@ -279,6 +314,7 @@ class NotificationManager:
     async def publish(self, event: NotificationEvent) -> None:
         """Enqueue without awaiting network, persistence, or queue capacity."""
         try:
+            event = normalize_event(event)
             if (
                 NotificationPolicy.is_critical(event)
                 and event.priority != NotificationPriority.CRITICAL
@@ -303,14 +339,18 @@ class NotificationManager:
             for derived in generated:
                 await self.publish(derived)
             now = monotonic()
+            stateful = bool(event.metadata.get("recovery") or event.metadata.get("transition"))
             fingerprint = (
                 event.dedup_key or "",
                 event.level.value,
-                event.title,
-                event.message,
+                event.event_code,
+                repr(tuple(event.metadata.get(key) for key in (
+                    "reason", "risk_state", "component", "recovery", "transition",
+                    "incident_phase", "side", "bark_eligible", "watchdog_alert_generation",
+                    "watchdog_outage_id",
+                ))) if stateful else event.message,
             )
-            stateful = bool(event.metadata.get("recovery") or event.metadata.get("transition"))
-            incident_retry = bool(event.metadata.get("incident_retry"))
+            incident_retry = bool(event.metadata.get("incident_retry") or event.metadata.get("notification_retry"))
             if event.dedup_key and not incident_retry:
                 if stateful and self._last_stateful.get(event.dedup_key) == fingerprint:
                     return
@@ -342,6 +382,10 @@ class NotificationManager:
         ).inc()
         if event.priority == NotificationPriority.CRITICAL:
             logger.error("critical notification dropped: category=%s", event.category.value)
+        if channel is None and any(state.name == "bark" for state in self._channels):
+            self._delivery_receipt(event, "bark", sent=False)
+        elif channel == "bark":
+            self._delivery_receipt(event, channel, sent=False)
         if (
             self.incidents is not None
             and (channel is None or channel == "bark")
@@ -511,6 +555,12 @@ class NotificationManager:
 
     async def _send_once(self, state: _ChannelState, delivery: _Delivery) -> None:
         event = delivery.event
+        for observer in self._delivery_observers:
+            try:
+                if not observer.should_send(event, state.name):
+                    return
+            except Exception as exc:
+                logger.error("notification observer eligibility error_type=%s", type(exc).__name__)
         if (
             state.name == "bark" and self.incidents is not None
             and self.incidents.should_supersede_open(event)
@@ -589,6 +639,10 @@ class NotificationManager:
                 except Exception as exc:
                     logger.error("incident receipt error_type=%s", type(exc).__name__)
             sent = True
+        for derived in self._delivery_receipt(event, state.name, sent=sent):
+            # A receipt may finish during bounded shutdown drain. Keep its
+            # follow-up on this channel, as with policy delivery receipts.
+            self._enqueue_channel(state, _Delivery(normalize_event(derived)))
         self.metrics.notification_latency.labels(**labels).observe(monotonic() - delivery.started)
         await self._audit(event, state.name, sent, delivery.attempts, delivery.error_type)
 
@@ -600,6 +654,7 @@ class NotificationManager:
             return
         payload = {
             "event_id": event.id,
+            "event_code": event.event_code,
             "created_at": event.timestamp.isoformat(),
             "category": event.category.value,
             "priority": event.priority.value,
