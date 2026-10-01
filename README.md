@@ -98,7 +98,7 @@ Bark 的标题和正文统一使用简体中文，例如“🟢 量化系统已�
 
 `IncidentManager` 按 key 独立跟踪基础设施、安全 HALT、EMERGENCY 和自动恢复熔断事故。WebSocket、Redis、CAA 与对账异常合并为一个基础设施事故；持续不足 60 秒且恢复的异常只写入内部记录，持续超过阈值才推告警。安全事故独立且立即通知。`BARK_INCIDENT_MERGE_WINDOW_SECONDS` 只把再次发生的事故关联到同一历史系列，不延长新事故的 60 秒告警阈值。
 
-Bark 的渠道内重试耗尽后，事故仍标记为未送达，由独立通知 worker 按 30、60、120、240、300 秒的封顶退避重投同一 `incident_id`；成功回执才将 `notified_open` 或 `notified_resolved` 置为 true。若事故结束前始终未成功发送开场告警，通知恢复后只发送一条注明延迟及持续时间的 retrospective 摘要；曾发生的 EMERGENCY 保留 CRITICAL 级别。组件自己的恢复事件不逐条推 Bark，事故恢复须等到风险状态真正 NORMAL。`system_events` 保留开场、失败、重试、恢复和 retrospective 生命周期；Prometheus 增加送达失败、事故重试与 retrospective 指标。通知重试只重发 `NotificationEvent`，不调用交易、风控或恢复操作。日报复用现有 `daily_reports`，Grafana 继续负责完整历史监控。
+Bark 的渠道内重试耗尽后，事故仍标记为未送达，由独立通知 worker 按 30、60、120、240、300 秒的封顶退避重投同一 `incident_id`；成功回执才将 `notified_open` 或 `notified_resolved` 置为 true。若事故结束前始终未成功发送开场告警，通知恢复后只发送一条注明延迟及持续时间的 retrospective 摘要；曾发生的 EMERGENCY 保留 CRITICAL 级别。组件恢复按事故聚合，不逐条推 Bark；独立组件事故可以结束并说明当前风控仍被暂停，而“交易系统已恢复”须等到风险状态真正 NORMAL。`system_events` 保留开场、失败、重试、恢复和 retrospective 生命周期；Prometheus 增加送达失败、事故重试与 retrospective 指标。通知重试只重发 `NotificationEvent`，不调用交易、风控或恢复操作。日报复用现有 `daily_reports`，Grafana 继续负责完整历史监控。
 
 ### External Watchdog
 
@@ -160,7 +160,11 @@ ssh -N -L 18000:127.0.0.1:18000 -L 13300:127.0.0.1:13300 your-server
 
 交易所的挂单快照与 WS 成交更新并非原子读取。已经同步的运行实例发现 owned order 的挂单状态不一致时，会读取该订单详情：核验 client/order ID、交易对、方向、reduce-only、原始数量、累计成交数量与已成交/已取消的最终状态，再审计更新并重新读取账户、仓位、挂单和保护单一次。所有现有对账和风险门禁继续执行；未知订单、未确认状态、查询失败或第二次快照仍不一致，仍阻断交易，不重试下单。
 
-基础设施组件已恢复但系统仍因独立安全原因停留在 EMERGENCY 时，不继续发送“组件不可用”的延迟告警。基础设施短暂故障的持续时间按组件实际恢复时间计算；风险事件仍单独告警，风险恢复仍须通过原有安全门禁。
+通知层读取最近一次**完成**的对账结果，对账进行中不会被误报为 OKX 不可用；交易安全门禁继续在对账执行期间保持未确认状态。通知侧超过 `max(60 秒, 2 × 对账间隔, 4 × 请求超时)` 没有新完成结果时仍判为异常，避免掩盖卡住的对账。
+
+基础设施组件已恢复但系统仍因独立安全原因停留在 EMERGENCY 时，本次组件事故单独结束；如已推送组件告警，发送“交易基础设施已恢复”，并明确风控仍为 EMERGENCY、新开仓仍被阻断。该消息不会宣称交易恢复。之后再次异常会新建事件，从复发时间重新计算持续时间；风险事件继续独立跟踪，风险恢复仍须通过原有安全门禁。
+
+部分成交与撤单竞态可能留下 symbol 阻断。完整对账通过后，只有交易所订单详情确认本系统最新 entry 已处于最终状态，client/order ID、标的、方向、reduce-only、原始数量与累计成交数量均匹配、本地累计成交量一致、账本净仓位与实际仓位一致、无未完成 entry/风险增加挂单/待处理 Emergency 目标，并且现有持仓仍有有效止损覆盖时，才释放该记账阻断。释放前写入验证审计；查询失败、审计失败或验证期间保护状态变化会保留阻断。**释放 symbol 阻断不解除 HALT/EMERGENCY**；恢复新开仓仍需人工 `POST /system/resume` 通过数据库、Redis、CAA、WS、完整对账和风险限制的全部检查。
 
 `HALT` 时先查看 `/status` 的原因，确认 Demo 凭据、账户模式、区域 API 地址、Redis 与 PostgreSQL 连通性以及行情时效。订单超时会查询同一个 `clOrdId`，未确认状态不会自动重试。
 

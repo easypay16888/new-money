@@ -17,6 +17,7 @@ LEGACY_CODES = {
     "⚠️ Trading Temporarily Halted": "INCIDENT_OPEN",
     "⚠️ Trading Infrastructure Unhealthy": "INCIDENT_OPEN",
     "✅ Trading Recovered": "INCIDENT_RESOLVED",
+    "✅ Trading Infrastructure Recovered": "INFRASTRUCTURE_RECOVERED",
     "ℹ️ Trading Incident Resolved": "INCIDENT_RETROSPECTIVE",
     "⚠️ Safety Incident Resolved": "SAFETY_RETROSPECTIVE",
     "🚨 Emergency Incident Resolved": "EMERGENCY_RETROSPECTIVE",

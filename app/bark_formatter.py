@@ -81,6 +81,7 @@ TITLES = {
     "AUTO_RECOVERY_COMPLETED": "✅ 系统已自动恢复交易",
     "AUTO_RECOVERY_DISABLED": "🚨 自动恢复已停用",
     "INCIDENT_RESOLVED": "✅ 交易系统已恢复",
+    "INFRASTRUCTURE_RECOVERED": "✅ 交易基础设施已恢复",
     "INCIDENT_RETROSPECTIVE": "ℹ️ 交易异常已恢复",
     "EMERGENCY_RETROSPECTIVE": "🚨 紧急风控事件已结束",
     "SAFETY_RETROSPECTIVE": "⚠️ 安全风控事件已结束",
@@ -187,6 +188,7 @@ SENTENCES = {
     "Repeated transient failures": "短时间内重复发生故障",
     "Manual resume required": "系统将继续保持 HALT，需要人工检查后恢复",
     "Alert delivery was delayed; incident occurred while notifications were unavailable": "通知服务此前不可用，因此本条消息延迟送达",
+    "Alert delivery was delayed; incident has ended": "此前告警延迟送达，基础设施异常现已结束",
 }
 
 

@@ -57,6 +57,8 @@ class Incident:
             "last_updated_at": self.last_updated_at.isoformat(),
             "resolved_at": self.resolved_at.isoformat() if self.resolved_at else None,
             "severity": self.severity, "components": sorted(self.components),
+            "recovered_components": sorted(self.recovered_components),
+            "risk_state": self.risk_state,
             "reasons": sorted(self.reasons), "notification_open_sent": self.notified_open,
             "notification_resolved_sent": self.notified_resolved,
             "notification_open_queued": self.open_queued,
@@ -187,6 +189,7 @@ class IncidentManager:
                     if active_infra is not None:
                         active_infra.last_updated_at = datetime.now(UTC)
                         active_infra.recovered_components.add(component)
+                        active_infra.risk_state = str(event.metadata.get("risk_state", active_infra.risk_state))
                         if (
                             active_infra.components <= active_infra.recovered_components
                             and active_infra.components_recovered_tick is None
@@ -196,7 +199,6 @@ class IncidentManager:
                         if (
                             not active_infra.had_halt
                             and active_infra.components <= active_infra.recovered_components
-                            and event.metadata.get("risk_state") == "NORMAL"
                         ):
                             return self._resolve("infra:trading")
                 else:
@@ -206,6 +208,8 @@ class IncidentManager:
                     )
             return []
         if event_code(event) == "AUTO_RECOVERY_COMPLETED" and event.metadata.get("recovery"):
+            if "infra:trading" in self.active:
+                self.active["infra:trading"].risk_state = "NORMAL"
             return self._resolve("infra:trading")
         if event_code(event) == "RISK_RECOVERED" and event.metadata.get("recovery"):
             generated: list[NotificationEvent] = []
@@ -214,6 +218,7 @@ class IncidentManager:
                 if incident.had_halt or (
                     key == "infra:trading" and incident.components_recovered_tick is not None
                 ):
+                    incident.risk_state = "NORMAL"
                     generated.extend(self._resolve(key))
             return generated
         return []
@@ -296,6 +301,7 @@ class IncidentManager:
 
     def _resolved_notification(self, incident: Incident) -> NotificationEvent:
         retrospective = not incident.notified_open and incident.alert_threshold_met
+        component_only = incident.key == "infra:trading" and incident.risk_state != "NORMAL"
         if retrospective:
             if incident.key == "risk:emergency":
                 title = "🚨 Emergency Incident Resolved"
@@ -312,7 +318,7 @@ class IncidentManager:
                 "Alert delivery was delayed; incident occurred while notifications "
                 "were unavailable\n"
                 f"Reason: {', '.join(sorted(incident.reasons))}\n"
-                f"Duration: {int(incident.duration_seconds or 0)}s\nCurrent Risk: NORMAL"
+                f"Duration: {int(incident.duration_seconds or 0)}s\nCurrent Risk: {incident.risk_state}"
             )
         else:
             title = "✅ Trading Recovered"
@@ -322,9 +328,19 @@ class IncidentManager:
                 f"Previous: {previous}\nReason: {', '.join(sorted(incident.reasons))}"
                 f"\nDowntime: {int(incident.duration_seconds or 0)}s\nRisk: NORMAL"
             )
+        if component_only:
+            title = "✅ Trading Infrastructure Recovered"
+            message = (
+                f"Components: {', '.join(sorted(incident.components))}\n"
+                f"Downtime: {int(incident.duration_seconds or 0)}s\nRisk: {incident.risk_state}"
+                "\nNew entries: blocked"
+            )
+            if retrospective:
+                message = "Alert delivery was delayed; incident has ended\n" + message
         return NotificationEvent(
             event_code=(
-                "EMERGENCY_RETROSPECTIVE" if retrospective and incident.key == "risk:emergency"
+                "INFRASTRUCTURE_RECOVERED" if component_only
+                else "EMERGENCY_RETROSPECTIVE" if retrospective and incident.key == "risk:emergency"
                 else "SAFETY_RETROSPECTIVE" if retrospective and incident.severity == "CRITICAL"
                 else "INCIDENT_RETROSPECTIVE" if retrospective else "INCIDENT_RESOLVED"
             ),

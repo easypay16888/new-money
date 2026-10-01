@@ -98,6 +98,8 @@ class TradingRuntime:
         self._caa_lock = asyncio.Lock()
         self._caa_shutting_down = False
         self.reconciliation_healthy = False
+        self._reconciliation_observed_result = False
+        self._reconciliation_completed_at: float | None = None
         self._last_reconcile_safe = False
         self._reconcile_lock = asyncio.Lock()
         self.strategies = build_strategies(settings)
@@ -353,12 +355,94 @@ class TradingRuntime:
 
     async def reconcile(self) -> None:
         async with self._reconcile_lock:
-            await self._reconcile_impl()
+            await self._run_reconciliation()
 
     async def _reconcile_and_assess(self) -> tuple[bool, list[str]]:
         async with self._reconcile_lock:
-            await self._reconcile_impl()
+            await self._run_reconciliation()
             return await self._resume_health()
+
+    async def _run_reconciliation(self) -> None:
+        completed = False
+        try:
+            await self._reconcile_impl()
+            completed = True
+        finally:
+            # Observation uses a completed result; trading gates retain their in-flight False.
+            self._reconciliation_observed_result = completed and self.reconciliation_healthy
+            self._reconciliation_completed_at = self._clock()
+
+    def _reconciliation_notification_health(self) -> bool:
+        max_age = max(
+            60.0, self.settings.reconcile_interval_seconds * 2,
+            self.settings.request_timeout_seconds * 4,
+        )
+        return (
+            self._reconciliation_observed_result
+            and self._reconciliation_completed_at is not None
+            and self._clock() - self._reconciliation_completed_at <= max_age
+        )
+
+    def _entry_block_settled(self, entry: dict[str, Any], pending: list[dict[str, Any]]) -> bool:
+        symbol = entry["symbol"]
+        quantity = self.portfolio.positions.get(symbol, Decimal(0))
+        instrument = self.instruments.get(symbol)
+        covered = quantity == 0 or (
+            instrument is not None and bool(entry.get("stop_price"))
+            and self.algo_manager.valid(
+                self.algo_manager.algos.get(entry.get("protective_algo_id", "")),
+                symbol=symbol, position=quantity,
+                stop_price=Decimal(entry["stop_price"]), tolerance=instrument.tick_size,
+            )
+        )
+        return (
+            self.governor.state in {GovernorState.HALT, GovernorState.EMERGENCY}
+            and self._last_reconcile_safe and not self.emergency.targets and covered
+            and not any(row["symbol"] == symbol for row in self.order_manager.pending_entries())
+            and not any(
+                row.get("instId") == symbol
+                and str(row.get("reduceOnly", "false")).lower() not in {"true", "1"}
+                for row in pending
+            )
+            and {key: value for key, value in self._audited_positions().items() if value}
+            == self.portfolio.positions
+        )
+
+    async def _release_reconciled_entry_blocks(self, pending: list[dict[str, Any]]) -> None:
+        """Release cancellation bookkeeping only; never resume the Governor here."""
+        if self.governor.state not in {GovernorState.HALT, GovernorState.EMERGENCY}:
+            return
+        for symbol in tuple(self.entry_controller.blocked):
+            entry = next((
+                row for row in reversed(list(self.order_manager.orders.values()))
+                if row["symbol"] == symbol and not row["reduce_only"]
+            ), None)
+            if (
+                entry is None or entry["state"] not in {"FILLED", "CANCELLED"}
+                or Decimal(entry["filled"]) <= 0 or not self._entry_block_settled(entry, pending)
+            ):
+                continue
+            try:
+                details = await self.client.order(symbol, entry["clOrdId"])
+                if (
+                    len(details) != 1 or not self._verified_terminal_order(entry, details[0])
+                    or Decimal(str(details[0]["accFillSz"])) != Decimal(entry["filled"])
+                    or not self._entry_block_settled(entry, pending)
+                ):
+                    continue
+                await self.store.append("risk_events", {
+                    "event": "entry block release verified", "symbol": symbol,
+                    "clOrdId": entry["clOrdId"], "filled": entry["filled"],
+                    "risk_state": self.governor.state.value,
+                })
+                if (
+                    self._entry_block_settled(entry, pending)
+                    and self._verified_terminal_order(entry, details[0])
+                    and Decimal(str(details[0]["accFillSz"])) == Decimal(entry["filled"])
+                ):
+                    self.entry_controller.blocked.discard(symbol)
+            except Exception as exc:
+                logger.warning("entry block recovery deferred error_type=%s", type(exc).__name__)
 
     def _pending_order_ids(self) -> set[str]:
         return {
@@ -735,6 +819,7 @@ class TradingRuntime:
             if self.emergency.targets:
                 await self.emergency.step_all()
             self._last_reconcile_safe = True
+            await self._release_reconciled_entry_blocks(orders)
         except OkxError as exc:
             operation, endpoint, code, status, error_type = safe_reconciliation_diagnostics(exc)
             reason = (
@@ -1409,7 +1494,7 @@ class TradingRuntime:
             outage="🚨 Redis Unavailable", recovery="✅ Redis Recovered",
         )
         await self._observe_component(
-            "Reconciliation", self.reconciliation_healthy,
+            "Reconciliation", self._reconciliation_notification_health(),
             outage="🚨 Reconciliation Unhealthy", recovery="✅ Reconciliation Recovered",
             threshold=2,
         )
