@@ -377,10 +377,11 @@ async def test_auto_recovery_requires_recent_caa_refresh(recovery_runtime):
 
 
 @pytest.mark.parametrize("operation", [
-    "account", "positions", "pending_orders", "pending_algos",
+    "account", "positions", "pending_orders", "pending_algos", "account_config",
 ])
+@pytest.mark.parametrize("code", ["50011", "50013"])
 async def test_reconciliation_endpoint_transient_fault_then_auto_recovers(
-    tmp_path, operation
+    tmp_path, operation, code
 ):
     settings = Settings(
         _env_file=None,
@@ -417,11 +418,19 @@ async def test_reconciliation_endpoint_transient_fault_then_auto_recovers(
         async def maybe_fail(self, name):
             if name == operation and not self.failed:
                 self.failed = True
-                raise OkxError(
-                    "temporary read failure", code="50011", retryable=True,
-                    operation=name, endpoint="/api/v5/account/balance",
-                    http_status=429,
-                )
+                endpoints = {
+                    "account": "/api/v5/account/balance",
+                    "positions": "/api/v5/account/positions",
+                    "pending_orders": "/api/v5/trade/orders-pending",
+                    "pending_algos": "/api/v5/trade/orders-algo-pending",
+                    "account_config": "/api/v5/account/config",
+                }
+                async with httpx.AsyncClient(
+                    transport=httpx.MockTransport(lambda _: httpx.Response(
+                        200, json={"code": code, "msg": "temporary failure", "data": []}
+                    )), base_url="https://openapi.okx.com",
+                ) as http:
+                    await OkxRestClient(settings, http).request("GET", endpoints[name])
 
         async def account(self):
             await self.maybe_fail("account")
@@ -440,6 +449,7 @@ async def test_reconciliation_endpoint_transient_fault_then_auto_recovers(
             return []
 
         async def account_config(self):
+            await self.maybe_fail("account_config")
             return [{"posMode": "net_mode", "acctLv": "2"}]
 
     runtime.client = Exchange()
@@ -511,6 +521,7 @@ async def test_account_read_timeout_enters_transient_recovery(recovery_runtime):
 
 @pytest.mark.parametrize("status,body,expected", [
     (200, {"code": "50011", "msg": "rate limited", "data": []}, True),
+    (200, {"code": "50013", "msg": "system busy", "data": []}, True),
     (503, {"code": "50026", "msg": "server error", "data": []}, True),
     (401, {"code": "50105", "msg": "bad passphrase", "data": []}, False),
     (200, {"code": "50113", "msg": "bad signature", "data": []}, False),
@@ -532,6 +543,33 @@ async def test_okx_error_preserves_safe_diagnostics(status, body, expected):
     assert exc.operation == "positions"
     assert exc.endpoint == "/api/v5/account/positions"
     assert is_retryable_okx_error(exc) is expected
+
+
+@pytest.mark.parametrize("method,path,status", [
+    ("POST", "/api/v5/trade/order", 200),
+    ("POST", "/api/v5/trade/cancel-order", 200),
+    ("POST", "/api/v5/trade/order-algo", 200),
+    ("POST", "/api/v5/trade/cancel-all-after", 200),
+    ("POST", "/api/v5/account/positions", 200),
+    ("GET", "/api/v5/market/candles", 200),
+    ("GET", "/api/v5/account/positions", 401),
+    ("GET", "/api/v5/account/positions", 403),
+])
+async def test_busy_code_does_not_expand_write_or_auth_recovery(method, path, status):
+    calls = []
+
+    def respond(request):
+        calls.append(request)
+        return httpx.Response(status, json={"code": "50013", "data": []})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(respond), base_url="https://openapi.okx.com"
+    ) as client:
+        okx = OkxRestClient(Settings(_env_file=None), client)
+        with pytest.raises(OkxError) as caught:
+            await okx.request(method, path)
+    assert not caught.value.retryable
+    assert len(calls) == 1
 
 
 @pytest.mark.parametrize("failure", [httpx.ConnectError("dns"), httpx.ReadTimeout("timeout")])

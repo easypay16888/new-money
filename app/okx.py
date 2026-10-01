@@ -174,6 +174,12 @@ class OkxRestClient:
                 retryable=code not in PERMANENT_OKX_CODES and (
                     code in RETRYABLE_OKX_CODES
                     or response.status_code in {429, 500, 502, 503, 504}
+                    # Busy responses are transient only for known reconciliation reads.
+                    # Do not expand recovery classification for any trading write.
+                    or (
+                        code == "50013" and method == "GET"
+                        and path in RECONCILIATION_OPERATIONS
+                    )
                 ) and response.status_code not in {401, 403},
             )
         return result.get("data", [])

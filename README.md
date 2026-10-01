@@ -180,4 +180,6 @@ PAPER 模式默认开启自动恢复。只有 `reconciliation failed`、`WebSock
 
 OKX 对账故障日志记录失败的接口操作、无查询参数的路径、数字错误码、HTTP 状态和是否可重试；不记录交易所返回的原始消息、请求头、凭据或完整 URL。仅网络故障、HTTP 429/指定临时服务错误及明确的 OKX 限流/超时代码可进入瞬态恢复。交易写请求不会因本功能自动重试。OKX 限流码 `50011` 与超时码 `50004` 的含义见 [OKX V5 文档](https://www.okx.com/docs-v5/en/)和 [OKX API FAQ](https://www.okx.com/en-us/help/api-faq)。
 
+OKX `50013`（系统繁忙）仅在已知的 `GET` 对账接口上归为瞬态故障，包括余额、持仓、普通挂单、保护单和账户配置。故障时仍立即 HALT；只有原有连续健康检查全部通过后才可自动恢复。HTTP 401/403、认证/权限错误、未知错误及交易写请求继续保持原有处理。此分类不会增加下单、撤单或 CAA 写请求的重试，也不能把已锁定的安全 HALT 自动改为 NORMAL。
+
 接口依据：[OKX V5 官方文档](https://www.okx.com/docs-v5/en/)。Demo REST 请求使用 `x-simulated-trading: 1`；K 线通过 business WS；Cancel All After 为 `POST /api/v5/trade/cancel-all-after`。
