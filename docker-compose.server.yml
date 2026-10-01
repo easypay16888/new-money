@@ -59,6 +59,7 @@ services:
     depends_on:
       app:
         condition: service_started
+    stop_signal: SIGINT
     stop_grace_period: 10s
     restart: unless-stopped
     logging: *bounded_logs

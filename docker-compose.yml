@@ -38,6 +38,8 @@ services:
       BARK_INCIDENT_RETRY_MAX_SECONDS: ${BARK_INCIDENT_RETRY_MAX_SECONDS:-300}
     depends_on:
       - app
+    stop_signal: SIGINT
+    stop_grace_period: 10s
     restart: unless-stopped
   postgres:
     image: postgres:16-alpine

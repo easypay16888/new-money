@@ -117,6 +117,8 @@ WATCHDOG_BARK_GROUP=OKX Quant Watchdog
 
 本机独立运行时，把 `WATCHDOG_STATUS_URL` 改为 `http://127.0.0.1:8000/status`，然后在另一个受监督的进程中执行 `uv run python -m app.watchdog`。启动前 120 秒只检查不告警；之后连续 3 次不可达或返回错误状态才通知 App Offline。HTTP 可达但 `running=false`、未同步或 WebSocket 不新鲜属于 App Unhealthy，Bark 要在异常持续达到 `WATCHDOG_UNHEALTHY_ALERT_SECONDS` 后才推送。连续 2 次健康后，仅当先前的告警真正送达 Bark 才推送恢复。风险状态 HALT/EMERGENCY 本身不代表进程离线。Watchdog 不发送常规心跳，不参与交易安全决策。
 
+Compose 对 watchdog 使用 `stop_signal: SIGINT` 和 10 秒停机宽限期，触发 Python asyncio 的正常取消流程，完成有界通知 drain 后退出。app 的安全停机仍使用自己的交易恢复与保护检查。
+
 Watchdog 将“告警已生成”“发送中”“Bark 已确认”分别记录。Bark 渠道内重试耗尽或队列丢弃后，复用 `BARK_INCIDENT_RETRY_INITIAL_SECONDS=30`、`BARK_INCIDENT_RETRY_MAX_SECONDS=300`，按 30、60、120、240、300 秒封顶退避；到期且下次 `/status` 检查仍异常时，重投同一 outage ID 和事件 ID。Console 或 Webhook 成功不会确认手机送达。离线通知成功后保持静默，连续两次健康后推一次“✅ 交易程序已恢复”。若整个离线期间从未成功送达 Bark，恢复后手机保持静默，Console 和日志保留故障及恢复记录；队列中的过时离线通知也会停止发送。已发出的单次 HTTP 请求无法撤回，若它在恢复检查后才确认成功，则补一条恢复消息以保留上下文。
 
 通知及 Watchdog 重试状态保存在内存中，重启不会恢复待送达历史；Bark 服务确认成功也不代表 iPhone 已展示消息。Watchdog 的重投时刻还受 `WATCHDOG_INTERVAL_SECONDS` 检查间隔影响。它始终只读取状态并发送通知，没有交易控制权限。
