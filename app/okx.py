@@ -4,6 +4,7 @@ import asyncio
 import base64
 import hashlib
 import hmac
+import ipaddress
 import json
 import logging
 import random
@@ -99,6 +100,16 @@ class OkxRestClient:
         )
         self.owns_client = client is None
         self.latency_observer: Callable[[str, float], None] | None = None
+        self._verified_live_identity: bytes | None = None
+
+    def _live_identity(self) -> bytes:
+        # Invalidate the grant if account, credentials or endpoint changes in memory.
+        values = (
+            self.settings.confirm_live_account_id, self.settings.okx_api_key,
+            self.settings.okx_secret_key, self.settings.okx_passphrase,
+            self.settings.okx_rest_url,
+        )
+        return hashlib.sha256(json.dumps(values).encode()).digest()
 
     async def close(self) -> None:
         if self.owns_client:
@@ -114,6 +125,14 @@ class OkxRestClient:
         private: bool = False,
     ) -> list[Any]:
         method = method.upper()
+        if self.settings.mode == Mode.LIVE and method != "GET":
+            if (
+                not self.settings.live_trading_enabled
+                or not self.settings.confirm_live_account_id
+                or not self.settings.has_credentials
+                or self._verified_live_identity != self._live_identity()
+            ):
+                raise OkxError("LIVE write blocked: account identity not verified")
         query = "?" + urlencode(params) if params else ""
         request_path = path + query
         body_text = json.dumps(body, separators=(",", ":")) if body is not None else ""
@@ -211,7 +230,37 @@ class OkxRestClient:
         return sorted(data, key=lambda row: int(row[0]))
 
     async def account_config(self) -> list[dict[str, Any]]:
-        return await self.request("GET", "/api/v5/account/config", private=True)
+        identity = self._live_identity()
+        try:
+            rows = await self.request("GET", "/api/v5/account/config", private=True)
+        except Exception as exc:
+            # A transient read failure must not disable emergency writes to an
+            # already verified account with unchanged credentials. Runtime still HALTs entries.
+            if not is_retryable_okx_error(exc):
+                self._verified_live_identity = None
+            raise
+        if self.settings.mode == Mode.LIVE:
+            self._verified_live_identity = None
+            if len(rows) != 1 or not isinstance(rows[0], dict):
+                raise OkxError("LIVE account configuration invalid")
+            config = rows[0]
+            if config.get("uid") != self.settings.confirm_live_account_id:
+                raise OkxError("LIVE account identity mismatch")
+            if config.get("posMode") != "net_mode" or config.get("acctLv") not in {"2", "3", "4"}:
+                raise OkxError("LIVE derivatives account mode required")
+            permissions = {item.strip() for item in str(config.get("perm") or "").split(",")}
+            if permissions != {"read_only", "trade"}:
+                raise OkxError("LIVE requires read and trade permissions without withdrawal")
+            try:
+                addresses = str(config.get("ip") or "").split(",")
+                for address in addresses:
+                    ipaddress.ip_address(address.strip())
+            except ValueError:
+                raise OkxError("LIVE requires API key IP binding") from None
+            if identity != self._live_identity():
+                raise OkxError("LIVE configuration changed during identity verification")
+            self._verified_live_identity = identity
+        return rows
 
     async def set_leverage(self, symbol: str, leverage: int) -> None:
         await self.request(

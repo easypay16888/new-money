@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+from secrets import compare_digest
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Response
 
@@ -28,7 +29,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     async def authorize(authorization: str | None = Header(default=None)) -> None:
         if settings.mode == Mode.LIVE and (
-            not settings.api_token or authorization != f"Bearer {settings.api_token}"
+            not settings.api_token or not matches_token(authorization, settings.api_token)
+        ):
+            raise HTTPException(status_code=401, detail="authorization required")
+
+    def matches_token(authorization: str | None, token: str) -> bool:
+        return bool(token and authorization and compare_digest(
+            authorization.encode(), ("Bearer " + token).encode()
+        ))
+
+    async def authorize_status(authorization: str | None = Header(default=None)) -> None:
+        if settings.mode == Mode.LIVE and not (
+            matches_token(authorization, settings.api_token)
+            or matches_token(authorization, settings.status_api_token)
         ):
             raise HTTPException(status_code=401, detail="authorization required")
 
@@ -52,7 +65,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         )
         return Response(runtime.metrics.render(), media_type="text/plain; version=0.0.4")
 
-    @app.get("/status", dependencies=[Depends(authorize)])
+    @app.get("/status", dependencies=[Depends(authorize_status)])
     async def status() -> dict:
         return {
             "mode": settings.mode,
@@ -60,6 +73,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "risk_state": runtime.governor.state,
             "reason": runtime.governor.reason,
             "synchronized": runtime.portfolio.synchronized,
+            "database_backend": runtime.store.engine.dialect.name,
             "blocked_symbols": sorted(runtime.entry_controller.blocked),
             "emergency_targets": {
                 symbol: str(target) for symbol, target in runtime.emergency.targets.items()

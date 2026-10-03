@@ -29,10 +29,11 @@ ALLOWED_RISK_STATES = {"NORMAL", "CAUTION", "REDUCE", "HALT", "EMERGENCY"}
 
 
 class WatchdogSettings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore", hide_input_in_errors=True)
 
     watchdog_enabled: bool = True
     watchdog_status_url: str = "http://app:8000/status"
+    watchdog_status_token: SecretStr = SecretStr("")
     watchdog_interval_seconds: float = Field(default=60, gt=0)
     watchdog_failure_threshold: int = Field(default=3, ge=1)
     watchdog_recovery_threshold: int = Field(default=2, ge=1)
@@ -276,7 +277,9 @@ class WatchdogMonitor:
 
     async def _probe(self) -> tuple[str | None, str, dict[str, Any] | None]:
         try:
-            response = await self.client.get(self.settings.watchdog_status_url)
+            token = self.settings.watchdog_status_token.get_secret_value()
+            headers = {"Authorization": "Bearer " + token} if token else {}
+            response = await self.client.get(self.settings.watchdog_status_url, headers=headers)
         except Exception as exc:
             return "APP_DOWN", type(exc).__name__, None
         if response.status_code != 200:

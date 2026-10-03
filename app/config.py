@@ -14,7 +14,7 @@ class Mode(StrEnum):
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore", hide_input_in_errors=True)
 
     mode: Mode = Mode.PAPER
     live_trading_enabled: bool = False
@@ -70,6 +70,7 @@ class Settings(BaseSettings):
     regime_low_volatility: float = Field(default=0.15, ge=0)
     strategy_weights: dict[str, float] = {"trend": 1.0, "breakout": 1.0, "mean_reversion": 0.8}
     api_token: str = ""
+    status_api_token: str = ""
     alert_webhook_url: str = ""
     bark_enabled: bool = False
     bark_server: str = "https://api.day.app"
@@ -106,6 +107,17 @@ class Settings(BaseSettings):
             self.live_trading_enabled and self.confirm_live_account_id
         ):
             raise ValueError("LIVE requires LIVE_TRADING_ENABLED and CONFIRM_LIVE_ACCOUNT_ID")
+        if self.mode == Mode.LIVE:
+            if not all(value.strip() for value in (
+                self.okx_api_key, self.okx_secret_key, self.okx_passphrase
+            )):
+                raise ValueError("LIVE requires complete OKX credentials")
+            if len(self.api_token.strip()) < 32:
+                raise ValueError("LIVE requires a control API token of at least 32 characters")
+            if self.status_api_token and (
+                len(self.status_api_token.strip()) < 32 or self.status_api_token == self.api_token
+            ):
+                raise ValueError("LIVE status token must be distinct and at least 32 characters")
         if self.leverage > self.max_leverage:
             raise ValueError("leverage exceeds configured maximum")
         if self.risk_per_trade > self.max_risk_per_trade:

@@ -15,7 +15,8 @@ async def test_live_sensitive_endpoints_require_token(tmp_path):
         mode=Mode.LIVE,
         live_trading_enabled=True,
         confirm_live_account_id="expected",
-        api_token="test-token",
+        api_token="test-token" * 4,
+        okx_api_key="test", okx_secret_key="test", okx_passphrase="test",
         database_url=f"sqlite+aiosqlite:///{tmp_path}/auth.db",
     )
     app = create_app(settings)
@@ -26,7 +27,7 @@ async def test_live_sensitive_endpoints_require_token(tmp_path):
         assert (await client.get("/positions")).status_code == 401
         assert (await client.get("/metrics")).status_code == 401
         assert (
-            await client.get("/positions", headers={"Authorization": "Bearer test-token"})
+            await client.get("/positions", headers={"Authorization": "Bearer " + "test-token" * 4})
         ).status_code == 200
 
 

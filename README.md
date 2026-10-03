@@ -150,9 +150,25 @@ ssh -N -L 18000:127.0.0.1:18000 -L 13300:127.0.0.1:13300 your-server
 
 ## 切换到 LIVE
 
-**真实资金交易存在损失风险。当前版本尚未完成全部验收，不得启用 LIVE。** 配置层要求 `MODE=LIVE`、`LIVE_TRADING_ENABLED=true` 和 `CONFIRM_LIVE_ACCOUNT_ID` 三项同时存在；启动时还核对账户 UID。LIVE 控制 API 需要额外配置 `API_TOKEN` 并以 Bearer token 调用。Compose 的 `MODE` 从 `.env` 读取，默认始终为 PAPER。上线前必须完成账户模式、止损单、故障注入和全链路人工验收。
+**当前版本尚未完成全部现场验收，不得启用 LIVE。** 原有 `MODE=LIVE`、`LIVE_TRADING_ENABLED=true` 和 `CONFIRM_LIVE_ACCOUNT_ID` 三项门禁保留。LIVE 配置还必须包含完整 OKX 凭据和至少 32 字符的 `API_TOKEN`；配置校验错误不展示输入凭据。启动时先读取账户配置，验证 UID、合约账户模式、单向持仓、恰好 Read/Trade 权限、无 Withdraw 权限及 API IP 绑定，然后才恢复订单及 Emergency 目标。字段依据 [OKX 账户配置 API](https://app.okx.com/docs-v5/en/#trading-account-rest-api-get-account-configuration)。
 
-当前安全修复已经通过本地自动化检查，但尚未经过 OKX Demo 的真实网络故障注入、断线重连、部分成交、保护单触发及停机演练，当前仍 **NOT READY FOR LIVE**。停机如果撤单、保护确认或 CAA 停用失败会返回错误并保持风控任务运行，需排障后重试。
+所有 LIVE HTTP 写请求（包括撤单、CAA、杠杆和只减仓订单）均要求此前通过账户核验；凭据、预期 UID 或 REST 地址变化会使授权失效。身份、权限或认证核验失败会撤销授权。已核验账户的临时只读网络故障不会阻断对同一账户的既有紧急减仓能力，运行时仍暂停新 entry，LIVE 不自动恢复。核验成功的既有授权也不会因一次进行中的账户配置刷新而暂时失效。
+
+LIVE 必须使用全新或已绑定同一真实账户的独立交易账本。`account_bindings` 仅保存 UID 的 SHA-256 摘要与模式，不保存 API 凭据；Demo 或无绑定的既有交易记录不能被自动导入 LIVE。长期验收使用 PostgreSQL；CI 使用专门的一次性 PostgreSQL 数据库核验绑定与权益聚合，绝不清理运行数据库。
+
+每次 LIVE 启动或重启都保持 HALT，先执行既有仓位、保护单及 Emergency 恢复；只有人工 `POST /system/resume` 通过完整健康门禁后才允许新 entry。重启不会自动绕过此前的安全暂停；PAPER 的启动与自动恢复行为保持原有规则。
+
+LIVE 控制接口使用 `API_TOKEN`。只读 `/status` 可额外使用独立、至少 32 字符且不同于控制 token 的 `STATUS_API_TOKEN`。Compose 仅将后者映射为 watchdog 的 `WATCHDOG_STATUS_TOKEN`，不传入控制 token 或 OKX 凭据；本机 watchdog 单独配置 `WATCHDOG_STATUS_TOKEN`。状态 token 不能调用 start/stop/halt/resume/cancel 等控制接口。两个 token 均为 secret，使用环境变量或未跟踪 `.env` 配置，不展示真实值。
+
+已有 Demo 自然成交、保护单触发、断线/服务异常恢复及安全停机记录，但这些不替代受控的部分成交重启、CAA 到期、带持仓故障恢复等现场演练，当前仍 **NOT READY FOR LIVE**。停机如果撤单、保护确认或 CAA 停用失败会返回错误并保持风控任务运行，需排障后重试。具体验收证据与未完成项见 [LIVE 验收说明](docs/LIVE_ACCEPTANCE.md)。
+
+可在部署环境运行只读预检：
+
+```sh
+uv run python -m app.live_preflight --status-url http://127.0.0.1:18000/status --output data/live-preflight.json
+```
+
+预检仅 GET `/status`、`/health`、`/positions`、`/orders`，不会加载交易引擎或调用恢复、撤单、下单接口。报告不保存凭据、token、UID 或完整 endpoint。它输出已观察到的 PASS/BLOCKED 和必须现场确认的 UNVERIFIED；**正常 HTTP 或自动化测试不能使其宣称 LIVE ready**。未完成现场验收与人工批准时退出码为 `2`，这是验收未完成，不是进程崩溃。
 
 ## 排障
 

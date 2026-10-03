@@ -11,6 +11,7 @@ from app.notification_events import event_code, normalize_event, reason_code
 REASONS = {
     "reconciliation failed": "OKX 对账暂时失败",
     "reconciliation permanent failure": "OKX 对账发生不可自动恢复的错误",
+    "LIVE startup requires manual resume": "实盘启动等待人工确认恢复",
     "WebSocket disconnected or stale": "WebSocket 连接中断或数据过期",
     "Redis unavailable": "Redis 不可用",
     "dead man switch unavailable": "Cancel-All-After 不可用",

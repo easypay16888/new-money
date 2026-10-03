@@ -2,10 +2,11 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from decimal import Decimal
+from hashlib import sha256
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import JSON, DateTime, Integer, Numeric, String, cast, func, select
+from sqlalchemy import JSON, DateTime, Integer, Numeric, String, cast, func, or_, select
 from sqlalchemy.engine.url import make_url
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -48,6 +49,7 @@ TABLES = (
     "backtest_runs",
     "daily_reports",
     "notification_events",
+    "account_bindings",
 )
 ROW_TYPES: dict[str, type[EventRow]] = {}
 for table in TABLES:
@@ -139,6 +141,33 @@ class Store:
                 select(func.max(equity)).where(row_type.timestamp >= timestamp)
             )
         return Decimal(peak) if peak is not None else None
+
+    async def bind_live_account(self, uid: str) -> None:
+        """A LIVE ledger must be new or already bound to the same verified account."""
+        if not uid.strip():
+            raise ValueError("LIVE account identity is required")
+        digest = sha256(uid.encode()).hexdigest()
+        bindings = ROW_TYPES["account_bindings"]
+        events = ROW_TYPES["system_events"]
+        async with self.sessions.begin() as session:
+            rows = (await session.scalars(select(bindings))).all()
+            incompatible = await session.scalar(select(func.count()).select_from(events).where(
+                events.payload["event"].as_string() == "start",
+                or_(events.payload["mode"].as_string() != "LIVE",
+                    events.payload["mode"].as_string().is_(None)),
+            ))
+            if incompatible or any(
+                row.payload.get("mode") != "LIVE" or row.payload.get("account_digest") != digest
+                for row in rows
+            ):
+                raise ValueError("LIVE requires a separate ledger bound to the verified account")
+            if rows:
+                return
+            for table in ("orders", "order_events", "fills", "emergency_targets", "portfolio_snapshots"):
+                exists = await session.scalar(select(ROW_TYPES[table].id).limit(1))
+                if exists is not None:
+                    raise ValueError("LIVE cannot use an unbound existing trading ledger")
+            session.add(bindings(payload={"mode": "LIVE", "account_digest": digest}))
 
     async def all_for_symbol(self, table: str, symbol: str) -> list[dict[str, Any]]:
         if table not in ROW_TYPES:

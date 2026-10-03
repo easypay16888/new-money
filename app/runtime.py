@@ -318,6 +318,14 @@ class TradingRuntime:
 
     async def initialize(self) -> None:
         await self.store.initialize()
+        if self.settings.mode == Mode.LIVE:
+            # Verify the target account before restored cancellation/emergency actions.
+            await self.client.account_config()
+            await self.store.bind_live_account(self.settings.confirm_live_account_id)
+            # Restarting LIVE must never bypass an earlier safety/manual HALT.
+            # Position recovery runs, but entry requires an explicit, fully checked resume.
+            self.governor.halt("LIVE startup requires manual resume")
+            self._auto_recovery_forbidden = True
         await self.order_manager.restore()
         await self.algo_manager.restore()
         await self.emergency.restore()
