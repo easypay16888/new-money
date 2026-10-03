@@ -95,6 +95,7 @@ async def test_verified_live_account_allows_write_without_simulation_header():
                                  base_url="https://openapi.okx.com") as http:
         client = OkxRestClient(live_settings(), http)
         await client.account_config()
+        client.live_writer_guard = AsyncMock(return_value=True)
         await client.cancel_all_after(60)
     assert [r.method for r in requests] == ["GET", "POST"]
     assert all("x-simulated-trading" not in r.headers for r in requests)
@@ -408,8 +409,9 @@ async def test_verified_identity_entry_requires_writer_and_normal_but_reduction_
             await client.request("POST", "/api/v5/trade/order", body={"reduceOnly": False})
         await client.request("POST", "/api/v5/trade/order", body={"reduceOnly": True})
         await client.request("POST", "/api/v5/trade/order-algo", body={"reduceOnly": "true"})
-        await client.cancel_all_after(60)
-    assert len(writes) == 4
+        with pytest.raises(OkxError):
+            await client.cancel_all_after(60)
+    assert len(writes) == 3
 
 
 async def test_identity_change_during_lease_probe_is_rechecked_before_http():

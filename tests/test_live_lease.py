@@ -251,8 +251,9 @@ async def test_live_runtime_lease_loss_blocks_direct_and_execution_entries_but_e
             runtime.governor.halt("LIVE writer lease lost", emergency=True)
             await runtime.client.request("POST", "/api/v5/trade/order", body={"reduceOnly": True})
             await runtime.client.request("POST", "/api/v5/trade/order-algo", body={"reduceOnly": "true"})
-            await runtime.client.cancel_all_after(60)
-            assert len(writes) == 3
+            with pytest.raises(OkxError):
+                await runtime.client.cancel_all_after(60)
+            assert len(writes) == 2
     finally:
         await runtime.close()
 

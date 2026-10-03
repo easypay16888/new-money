@@ -327,6 +327,8 @@ class TradingRuntime:
     def _lease_lost(self) -> None:
         # Driver termination callback fences entries synchronously, before any await.
         self.governor.halt("LIVE writer lease lost")
+        self.dead_man_healthy = False
+        self._last_caa_success_at = None
         self._auto_recovery_forbidden = True
         self._auto_recovery_reason = None
         if self._lease_loss_task is None or self._lease_loss_task.done():
@@ -354,6 +356,17 @@ class TradingRuntime:
         if self.live_lease is None or not await self.live_lease.verify():
             return False
         return not entry or self.governor.state == GovernorState.NORMAL
+
+    async def _caa_owner_held(self) -> bool:
+        if self.settings.mode != Mode.LIVE:
+            return True
+        if await self._live_writer_guard(False):
+            return True
+        self.dead_man_healthy = False
+        self._last_caa_success_at = None
+        if self.governor.reason != "LIVE writer lease lost":
+            self._lease_lost()
+        return False
 
     async def _lease_monitor(self) -> None:
         while self.running and self.live_lease is not None:
@@ -1150,7 +1163,8 @@ class TradingRuntime:
             logger.error("notification shutdown failed: %s", type(exc).__name__)
 
     async def _safe_stop(self) -> None:
-        await self.enter_halt("manual stop")
+        owner = await self._caa_owner_held()
+        await self.enter_halt("manual stop" if owner else "LIVE writer lease lost")
         if self.settings.has_credentials:
             deadline = (
                 asyncio.get_running_loop().time() + self.settings.entry_cancel_confirm_seconds
@@ -1178,9 +1192,14 @@ class TradingRuntime:
                 self._caa_shutting_down = True
                 try:
                     async with self._caa_lock:
+                        if not await self._caa_owner_held():
+                            raise OkxError("CAA disable requires LIVE writer ownership")
                         await self.client.cancel_all_after(0)
                 except Exception:
                     self._caa_shutting_down = False
+                    if not await self._caa_owner_held():
+                        logger.error("CAA disable skipped: LIVE writer lease not owned")
+                        raise RuntimeError("shutdown CAA disable requires LIVE writer ownership") from None
                     raise RuntimeError("shutdown could not disable Cancel All After") from None
         elif (
             self.order_manager.pending_entries()
@@ -1582,7 +1601,11 @@ class TradingRuntime:
             outage="🚨 Reconciliation Unhealthy", recovery="✅ Reconciliation Recovered",
             threshold=2,
         )
-        if self.settings.has_credentials:
+        # A fenced writer cannot probe CAA; ownership loss is not an endpoint outage.
+        if self.settings.has_credentials and (
+            self.settings.mode != Mode.LIVE
+            or (self.live_lease is not None and self.live_lease.held)
+        ):
             await self._observe_component(
                 "Cancel-All-After", self.dead_man_healthy,
                 outage="🚨 CAA Unavailable", recovery="✅ CAA Recovered",
@@ -1868,12 +1891,18 @@ class TradingRuntime:
                 async with self._caa_lock:
                     if self._caa_shutting_down:
                         return
+                    if not await self._caa_owner_held():
+                        return
                     await self.client.cancel_all_after(self.settings.cancel_all_after_seconds)
+                    if not await self._caa_owner_held():
+                        return
                 self.dead_man_healthy = True
                 self._last_caa_success_at = self._clock()
             except Exception:
                 self.dead_man_healthy = False
                 self._last_caa_success_at = None
+                if not await self._caa_owner_held():
+                    return
                 await self.enter_halt("dead man switch unavailable")
             await asyncio.sleep(self.settings.cancel_all_after_refresh_seconds)
 

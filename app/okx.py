@@ -137,12 +137,19 @@ class OkxRestClient:
                 or self._verified_live_identity != self._live_identity()
             ):
                 raise OkxError("LIVE write blocked: account identity not verified")
-            # Ownership is needed for every risk-increasing write, even direct/manual calls.
-            # Verified cancel/CAA and explicit reduce-only protection/emergency retain access.
+            # Three classes: entry/configuration, emergency/protection, account-global CAA.
+            # Identity is mandatory for all. Only emergency/protection can survive lease loss.
+            account_global = path == "/api/v5/trade/cancel-all-after"
+            if account_global:
+                timeout = body.get("timeOut") if isinstance(body, dict) else None
+                if (
+                    method != "POST" or type(timeout) not in {str, int}
+                    or re.fullmatch(r"0|[1-9][0-9]*", str(timeout)) is None
+                ):
+                    raise OkxError("LIVE CAA write blocked: invalid timeout")
             safe = method == "POST" and (
                 path in {
                     "/api/v5/trade/cancel-order", "/api/v5/trade/cancel-algos",
-                    "/api/v5/trade/cancel-all-after",
                 } or (
                     path in {"/api/v5/trade/order", "/api/v5/trade/order-algo"}
                     and isinstance(body, dict)
@@ -150,7 +157,9 @@ class OkxRestClient:
                 )
             )
             if not safe:
-                entry = path != "/api/v5/account/set-leverage"
+                entry = path not in {
+                    "/api/v5/account/set-leverage", "/api/v5/trade/cancel-all-after",
+                }
                 try:
                     allowed = self.live_writer_guard is not None and await self.live_writer_guard(entry)
                 except Exception:

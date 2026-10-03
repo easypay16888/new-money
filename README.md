@@ -204,6 +204,6 @@ OKX `50013`（系统繁忙）仅在已知的 `GET` 对账接口上归为瞬态�
 
 默认仍为 PAPER；本轮代码不启用 LIVE。LIVE 必须使用 PostgreSQL asyncpg 账本、独立的至少 32 字符状态/控制 token，以及显式 `LIVE_LEASE_DATABASE_URL`。该 DSN 是 secret；所有使用同一 OKX UID 的实例必须连接**同一协调数据库**，不同账本也如此。协调会话不能通过 transaction/statement pooler。
 
-LIVE 先核验账户，再非等待获取 PostgreSQL session advisory lock、原子绑定账本、恢复并对账，最后保持 HALT 等人工 resume。绑定用事务锁和数据库单行唯一约束，拒绝 Demo/未知历史及不同 UID。lease 丢失会立即禁止 entry、HALT 并发 CRITICAL；不会自动抢锁或恢复，已验证账户的 reduce-only/保护/撤单/CAA 能力保留。`/status.live_writer_lease` 只返回 required/held，PAPER 不获取 lease。Bark/watchdog 故障仍不影响安全动作。
+LIVE 先核验账户，再非等待获取 PostgreSQL session advisory lock、原子绑定账本、恢复并对账，最后保持 HALT 等人工 resume。绑定用事务锁和数据库单行唯一约束，拒绝 Demo/未知历史及不同 UID。lease 丢失会立即禁止 entry、HALT 并发 CRITICAL；不会自动抢锁或恢复，已验证账户的 reduce-only/保护/撤单能力保留。账户级 CAA refresh 与 disable 均必须由当前 lease owner 执行；丢锁后立即停止全部 CAA 写入，不发送最后一次 refresh。dead-man 循环退出并保留 `LIVE writer lease lost`，不会误报 CAA endpoint 故障；若停机需保留普通 reduce-only exit 但无法合法停用 CAA，则停机 fail closed 并记录 `CAA disable skipped: LIVE writer lease not owned`。`/status.live_writer_lease` 只返回 required/held，PAPER 不获取 lease。Bark/watchdog 故障仍不影响安全动作。
 
 保证金下单 sizing target 默认 `MARGIN_USAGE_TARGET=0.20`，在原有 25% 硬上限内预留到止损的损失、双边费用/滑点和已有组合敞口。只向下减少合约数量，低于 minSz 不交易，不修改策略、risk_per_trade、杠杆或硬上限。公式与十项**人工**演练模板见 [LIVE 验收说明](docs/LIVE_ACCEPTANCE.md)。PostgreSQL 并发测试必须使用隔离 TEST_POSTGRES_URL；缺失会失败，不再跳过。

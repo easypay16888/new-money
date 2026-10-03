@@ -9,7 +9,7 @@
 - 协调连接必须直连 PostgreSQL 或使用保持会话的连接方式；禁止 PgBouncer transaction/statement pooling。lease 使用独立 NullPool 会话，非等待式 `pg_try_advisory_lock`，固定 namespace + UID 的 SHA-256 前 64 位稳定有符号整数。锁键、UID 和 digest 不出现在状态接口或日志中。
 - lease 持有后才原子绑定账本、恢复本地状态和对账；LIVE 始终 HALT，等待人工 `/system/resume`。绑定采用 PostgreSQL 事务 advisory lock + 常量唯一索引，一个账本最多一个 binding，仅存 mode / account_digest。
 - 初始化失败或安全关闭释放会话锁。连接断开、实际锁丢失或有界探测失败会锁死当前 lease，禁止自动重新获取；同步 fencing 禁止 entry、Governor 至少 HALT、CRITICAL 通知 `LIVE writer lease lost`，归类 SAFETY_OR_MANUAL。
-- 写入前验证身份；新开仓还须有效 lease 与 NORMAL。有效身份的只减仓、保护单、撤单及 CAA 不依赖 lease。凭据/endpoint 变化永久撤销缓存授权，必须重新核验，运行中的账户 UID 不可切换；认证 401/403 撤销身份授权；临时 config GET 故障暂停开仓，保留先前验证的 Emergency 减仓权限。未知写结果继续查询同一个 clOrdId，绝不盲重试。
+- 写入前验证身份；新开仓还须有效 lease 与 NORMAL。有效身份的只减仓、保护单及撤单不依赖 lease。账户级 CAA refresh/disable 必须持有当前 lease；丢锁后停止所有未来 CAA 写入（不采用 one-shot final refresh），包括直接 client 调用。dead-man 循环退出，不把 ownership loss 误报为 CAA unavailable；需要停用 CAA 才能安全保留普通 reduce-only exit 时，丢锁实例拒绝停机、记录 `CAA disable skipped: LIVE writer lease not owned`，不会自动重抢 lease，也不会关闭新 owner 的 CAA。凭据/endpoint 变化永久撤销缓存授权，必须重新核验，运行中的账户 UID 不可切换；认证 401/403 撤销身份授权；临时 config GET 故障暂停开仓，保留先前验证的 Emergency 减仓权限。未知写结果继续查询同一个 clOrdId，绝不盲重试。
 - `API_TOKEN`、`STATUS_API_TOKEN` trim 后均至少 32 字符且互不相同。状态令牌只能 GET `/status`；`/health` 保持原来的匿名行为。watchdog 只接收状态令牌与 Bark 配置，不接收交易凭据、控制令牌或数据库 DSN。
 - `/status.live_writer_lease` 只报告 required/held 布尔值。preflight 在 PAPER 标记 LIVE_SINGLE_WRITER 为 UNVERIFIED，观察 LIVE 时必须 held；报告永远不会自动批准 LIVE。
 
