@@ -14,12 +14,13 @@ from app.watchdog import WatchdogMonitor, WatchdogSettings
 
 
 def live_settings(**changes):
-    return Settings(
-        _env_file=None, mode=Mode.LIVE, live_trading_enabled=True,
-        confirm_live_account_id="account-A", okx_api_key="KEY_MARKER",
-        okx_secret_key="SECRET_MARKER", okx_passphrase="PASSPHRASE_MARKER",
-        api_token="t" * 32, **changes,
-    )
+    defaults = dict(mode=Mode.LIVE, live_trading_enabled=True,
+                    confirm_live_account_id="account-A", okx_api_key="KEY_MARKER",
+                    okx_secret_key="SECRET_MARKER", okx_passphrase="PASSPHRASE_MARKER",
+                    api_token="t" * 32, status_api_token="s" * 32,
+                    database_url="postgresql+asyncpg://quant_test@localhost/quant_live_acceptance_test",
+                    live_lease_database_url="postgresql+asyncpg://quant_test@localhost/quant_live_acceptance_test")
+    return Settings(_env_file=None, **(defaults | changes))
 
 
 def account_config(**changes):
@@ -112,7 +113,8 @@ async def test_credential_change_invalidates_live_write_verification():
 
 
 async def test_live_startup_verifies_identity_before_restoring_emergency(tmp_path):
-    runtime = TradingRuntime(live_settings(database_url=f"sqlite+aiosqlite:///{tmp_path}/live.db"))
+    runtime = TradingRuntime(live_settings())
+    runtime.store.initialize = AsyncMock()
     runtime.order_manager.restore = AsyncMock()
     runtime.emergency.restore = AsyncMock()
     runtime.client.account_config = AsyncMock(side_effect=OkxError("identity rejected"))
@@ -127,8 +129,12 @@ async def test_live_startup_verifies_identity_before_restoring_emergency(tmp_pat
         await runtime.store.close()
 
 
-async def test_live_startup_requires_manual_resume_even_after_valid_identity(tmp_path):
-    runtime = TradingRuntime(live_settings(database_url=f"sqlite+aiosqlite:///{tmp_path}/live.db"))
+async def test_live_startup_requires_manual_resume_even_after_valid_identity(tmp_path, monkeypatch):
+    runtime = TradingRuntime(live_settings())
+    runtime.store.initialize = AsyncMock()
+    runtime.store.bind_live_account = AsyncMock()
+    monkeypatch.setattr("app.live_lease.LiveRuntimeLease.acquire", AsyncMock())
+    monkeypatch.setattr("app.live_lease.LiveRuntimeLease.verify", AsyncMock(return_value=True))
     runtime.client.account_config = AsyncMock(return_value=[account_config()])
     runtime.order_manager.restore = AsyncMock(side_effect=RuntimeError("test stop after startup gates"))
     try:
@@ -185,7 +191,7 @@ async def test_live_ledger_binding_is_stable_and_rejects_another_account(tmp_pat
 ])
 async def test_readonly_status_token_cannot_control_live_runtime(path, tmp_path):
     app = create_app(live_settings(
-        status_api_token="s" * 32, database_url=f"sqlite+aiosqlite:///{tmp_path}/auth.db"
+        status_api_token="s" * 32
     ))
     runtime = app.state.runtime
     runtime.start = AsyncMock()
@@ -305,3 +311,180 @@ async def test_account_read_failure_preserves_only_previously_verified_emergency
                 await client.request("POST", "/api/v5/trade/order", private=True,
                                      body={"reduceOnly": "true"})
     assert bool(writes) is can_reduce
+
+
+@pytest.mark.parametrize("url", ["sqlite+aiosqlite:///:memory:", "sqlite:///secret.db",
+                                 "postgresql://user:DB_SECRET@localhost/live",
+                                 "mysql+aiomysql://user:DB_SECRET@localhost/live"])
+def test_live_requires_postgresql_asyncpg_and_redacts_url(url):
+    with pytest.raises(ValueError, match="LIVE requires PostgreSQL storage") as caught:
+        live_settings(database_url=url)
+    assert "DB_SECRET" not in str(caught.value) and url not in str(caught.value)
+
+
+@pytest.mark.parametrize("status", ["", " " * 40, "t" * 32, "  " + "t" * 32 + "  "])
+def test_live_requires_dedicated_status_token_after_trim(status):
+    with pytest.raises(ValueError):
+        live_settings(status_api_token=status)
+
+
+def test_live_trims_tokens_and_requires_explicit_shared_coordinator():
+    settings = live_settings(api_token=" " + "t" * 32 + " ", status_api_token=" " + "s" * 32)
+    assert settings.api_token == "t" * 32 and settings.status_api_token == "s" * 32
+    with pytest.raises(ValueError, match="shared PostgreSQL"):
+        live_settings(live_lease_database_url="")
+
+
+@pytest.mark.parametrize("field", ["okx_api_key", "okx_secret_key", "okx_passphrase",
+                                 "okx_rest_url", "confirm_live_account_id"])
+async def test_live_identity_mutations_block_all_writes_before_http(field):
+    requests = []
+    def respond(request):
+        requests.append(request)
+        return httpx.Response(200, json={"code": "0", "data": [account_config()]})
+    async with httpx.AsyncClient(transport=httpx.MockTransport(respond),
+                                 base_url="https://openapi.okx.com") as http:
+        settings = live_settings()
+        client = OkxRestClient(settings, http)
+        await client.account_config()
+        setattr(settings, field, "changed")
+        with pytest.raises(OkxError):
+            await client.cancel_all_after(60)
+    assert len(requests) == 1
+
+
+@pytest.mark.parametrize("invalid", [{"uid": "account-B"}, {"perm": "read_only"},
+    {"perm": "read_only,trade,withdraw"}, {"ip": ""}])
+async def test_live_reverification_revokes_prior_grant(invalid):
+    reads = [account_config(), account_config(**invalid)]
+    async with httpx.AsyncClient(transport=httpx.MockTransport(lambda _: httpx.Response(
+        200, json={"code": "0", "data": [reads.pop(0)]}
+    )), base_url="https://openapi.okx.com") as http:
+        client = OkxRestClient(live_settings(), http)
+        await client.account_config()
+        with pytest.raises(OkxError):
+            await client.account_config()
+        with pytest.raises(OkxError):
+            await client.cancel_all_after(60)
+
+
+@pytest.mark.parametrize("status", [401, 403])
+async def test_live_auth_rejection_on_any_endpoint_revokes_grant(status):
+    reads = 0
+    def respond(request):
+        nonlocal reads
+        reads += 1
+        if reads == 1:
+            return httpx.Response(200, json={"code": "0", "data": [account_config()]})
+        return httpx.Response(status, text="AUTH_SECRET_MARKER")
+    async with httpx.AsyncClient(transport=httpx.MockTransport(respond),
+                                 base_url="https://openapi.okx.com") as http:
+        client = OkxRestClient(live_settings(), http)
+        await client.account_config()
+        with pytest.raises(OkxError):
+            await client.account()
+        with pytest.raises(OkxError):
+            await client.cancel_all_after(60)
+    assert reads == 2
+
+
+async def test_verified_identity_entry_requires_writer_and_normal_but_reduction_does_not():
+    writes = []
+    def respond(request):
+        if request.method == "POST":
+            writes.append(request)
+        return httpx.Response(200, json={"code": "0", "data":
+                                      [account_config()] if request.method == "GET" else []})
+    async with httpx.AsyncClient(transport=httpx.MockTransport(respond),
+                                 base_url="https://openapi.okx.com") as http:
+        client = OkxRestClient(live_settings(), http)
+        await client.account_config()
+        with pytest.raises(OkxError):
+            await client.request("POST", "/api/v5/trade/order", body={"reduceOnly": False})
+        client.live_writer_guard = AsyncMock(return_value=True)
+        await client.request("POST", "/api/v5/trade/order", body={"reduceOnly": False})
+        client.live_writer_guard = AsyncMock(return_value=False)
+        with pytest.raises(OkxError):
+            await client.request("POST", "/api/v5/trade/order", body={"reduceOnly": False})
+        await client.request("POST", "/api/v5/trade/order", body={"reduceOnly": True})
+        await client.request("POST", "/api/v5/trade/order-algo", body={"reduceOnly": "true"})
+        await client.cancel_all_after(60)
+    assert len(writes) == 4
+
+
+async def test_identity_change_during_lease_probe_is_rechecked_before_http():
+    writes = []
+    def respond(request):
+        if request.method == "POST":
+            writes.append(request)
+        return httpx.Response(200, json={"code": "0", "data": [account_config()]})
+    async with httpx.AsyncClient(transport=httpx.MockTransport(respond),
+                                 base_url="https://openapi.okx.com") as http:
+        client = OkxRestClient(live_settings(), http)
+        await client.account_config()
+        async def probe(entry):
+            client.settings.okx_secret_key = "changed"
+            return True
+        client.live_writer_guard = probe
+        with pytest.raises(OkxError):
+            await client.request("POST", "/api/v5/trade/order", body={"reduceOnly": False})
+    assert writes == []
+
+
+async def test_status_live_lease_exposes_only_required_and_held():
+    app = create_app(live_settings())
+    runtime = app.state.runtime
+    try:
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),
+                                     base_url="http://local") as http:
+            response = await http.get("/status", headers={"Authorization": "Bearer " + "s" * 32})
+            assert response.json()["live_writer_lease"] == {"required": True, "held": False}
+            assert "account-A" not in response.text and "account_digest" not in response.text
+            assert "advisory" not in response.text and "postgresql+asyncpg" not in response.text
+    finally:
+        await runtime.close()
+
+
+@pytest.mark.parametrize("field", ["okx_api_key", "okx_rest_url"])
+async def test_reverting_identity_change_does_not_restore_cached_grant(field):
+    requests = []
+    async with httpx.AsyncClient(transport=httpx.MockTransport(lambda r: requests.append(r) or
+        httpx.Response(200, json={"code": "0", "data": [account_config()]})
+    ), base_url="https://openapi.okx.com") as http:
+        settings = live_settings()
+        client = OkxRestClient(settings, http)
+        await client.account_config()
+        original = getattr(settings, field)
+        setattr(settings, field, "changed")
+        with pytest.raises(OkxError):
+            await client.cancel_all_after(60)
+        setattr(settings, field, original)
+        with pytest.raises(OkxError):
+            await client.cancel_all_after(60)
+    assert len(requests) == 1
+
+
+async def test_new_uid_cannot_be_reverified_into_an_existing_live_runtime():
+    reads = [account_config(), account_config(uid="account-B")]
+    async with httpx.AsyncClient(transport=httpx.MockTransport(lambda _: httpx.Response(
+        200, json={"code": "0", "data": [reads.pop(0)]}
+    )), base_url="https://openapi.okx.com") as http:
+        client = OkxRestClient(live_settings(), http)
+        await client.account_config()
+        client.settings.confirm_live_account_id = "account-B"
+        with pytest.raises(OkxError):
+            await client.account_config()
+        with pytest.raises(OkxError):
+            await client.cancel_all_after(60)
+
+
+async def test_unknown_write_method_cannot_bypass_lease_with_reduce_only_field():
+    requests = []
+    async with httpx.AsyncClient(transport=httpx.MockTransport(lambda r: requests.append(r) or
+        httpx.Response(200, json={"code": "0", "data": [account_config()]})
+    ), base_url="https://openapi.okx.com") as http:
+        client = OkxRestClient(live_settings(), http)
+        await client.account_config()
+        with pytest.raises(OkxError):
+            await client.request("PUT", "/api/v5/trade/order", body={"reduceOnly": True})
+    assert len(requests) == 1

@@ -17,7 +17,9 @@ async def test_live_sensitive_endpoints_require_token(tmp_path):
         confirm_live_account_id="expected",
         api_token="test-token" * 4,
         okx_api_key="test", okx_secret_key="test", okx_passphrase="test",
-        database_url=f"sqlite+aiosqlite:///{tmp_path}/auth.db",
+        status_api_token="status-token" * 4,
+        database_url="postgresql+asyncpg://quant_test@localhost/quant_live_acceptance_test",
+        live_lease_database_url="postgresql+asyncpg://quant_test@localhost/quant_live_acceptance_test",
     )
     app = create_app(settings)
     async with httpx.AsyncClient(

@@ -158,7 +158,7 @@ LIVE 必须使用全新或已绑定同一真实账户的独立交易账本。`ac
 
 每次 LIVE 启动或重启都保持 HALT，先执行既有仓位、保护单及 Emergency 恢复；只有人工 `POST /system/resume` 通过完整健康门禁后才允许新 entry。重启不会自动绕过此前的安全暂停；PAPER 的启动与自动恢复行为保持原有规则。
 
-LIVE 控制接口使用 `API_TOKEN`。只读 `/status` 可额外使用独立、至少 32 字符且不同于控制 token 的 `STATUS_API_TOKEN`。Compose 仅将后者映射为 watchdog 的 `WATCHDOG_STATUS_TOKEN`，不传入控制 token 或 OKX 凭据；本机 watchdog 单独配置 `WATCHDOG_STATUS_TOKEN`。状态 token 不能调用 start/stop/halt/resume/cancel 等控制接口。两个 token 均为 secret，使用环境变量或未跟踪 `.env` 配置，不展示真实值。
+LIVE 控制接口使用 `API_TOKEN`。LIVE 必须配置独立、至少 32 字符且不同于控制 token 的 `STATUS_API_TOKEN`，仅用于只读 `/status`。Compose 仅将后者映射为 watchdog 的 `WATCHDOG_STATUS_TOKEN`，不传入控制 token 或 OKX 凭据；本机 watchdog 单独配置 `WATCHDOG_STATUS_TOKEN`。状态 token 不能调用 start/stop/halt/resume/cancel 等控制接口。两个 token 均为 secret，使用环境变量或未跟踪 `.env` 配置，不展示真实值。
 
 已有 Demo 自然成交、保护单触发、断线/服务异常恢复及安全停机记录，但这些不替代受控的部分成交重启、CAA 到期、带持仓故障恢复等现场演练，当前仍 **NOT READY FOR LIVE**。停机如果撤单、保护确认或 CAA 停用失败会返回错误并保持风控任务运行，需排障后重试。具体验收证据与未完成项见 [LIVE 验收说明](docs/LIVE_ACCEPTANCE.md)。
 
@@ -199,3 +199,11 @@ OKX 对账故障日志记录失败的接口操作、无查询参数的路径、�
 OKX `50013`（系统繁忙）仅在已知的 `GET` 对账接口上归为瞬态故障，包括余额、持仓、普通挂单、保护单和账户配置。故障时仍立即 HALT；只有原有连续健康检查全部通过后才可自动恢复。HTTP 401/403、认证/权限错误、未知错误及交易写请求继续保持原有处理。此分类不会增加下单、撤单或 CAA 写请求的重试，也不能把已锁定的安全 HALT 自动改为 NORMAL。
 
 接口依据：[OKX V5 官方文档](https://www.okx.com/docs-v5/en/)。Demo REST 请求使用 `x-simulated-trading: 1`；K 线通过 business WS；Cancel All After 为 `POST /api/v5/trade/cancel-all-after`。
+
+### Micro-Live 前单写与保证金加固
+
+默认仍为 PAPER；本轮代码不启用 LIVE。LIVE 必须使用 PostgreSQL asyncpg 账本、独立的至少 32 字符状态/控制 token，以及显式 `LIVE_LEASE_DATABASE_URL`。该 DSN 是 secret；所有使用同一 OKX UID 的实例必须连接**同一协调数据库**，不同账本也如此。协调会话不能通过 transaction/statement pooler。
+
+LIVE 先核验账户，再非等待获取 PostgreSQL session advisory lock、原子绑定账本、恢复并对账，最后保持 HALT 等人工 resume。绑定用事务锁和数据库单行唯一约束，拒绝 Demo/未知历史及不同 UID。lease 丢失会立即禁止 entry、HALT 并发 CRITICAL；不会自动抢锁或恢复，已验证账户的 reduce-only/保护/撤单/CAA 能力保留。`/status.live_writer_lease` 只返回 required/held，PAPER 不获取 lease。Bark/watchdog 故障仍不影响安全动作。
+
+保证金下单 sizing target 默认 `MARGIN_USAGE_TARGET=0.20`，在原有 25% 硬上限内预留到止损的损失、双边费用/滑点和已有组合敞口。只向下减少合约数量，低于 minSz 不交易，不修改策略、risk_per_trade、杠杆或硬上限。公式与十项**人工**演练模板见 [LIVE 验收说明](docs/LIVE_ACCEPTANCE.md)。PostgreSQL 并发测试必须使用隔离 TEST_POSTGRES_URL；缺失会失败，不再跳过。

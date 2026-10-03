@@ -12,8 +12,7 @@ from app.storage import ROW_TYPES, Store
 
 async def test_postgres_live_binding_and_equity_aggregation():
     url = os.environ.get("TEST_POSTGRES_URL")
-    if not url:
-        pytest.skip("dedicated PostgreSQL CI service not configured")
+    assert url, "TEST_POSTGRES_URL required; PostgreSQL integration cannot silently skip"
     parsed = make_url(url)
     assert parsed.database == "quant_live_acceptance_test"
     assert parsed.username == "quant_test" and parsed.host in {"127.0.0.1", "localhost"}

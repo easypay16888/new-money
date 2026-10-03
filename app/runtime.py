@@ -18,6 +18,7 @@ from app.decision import DecisionPipeline
 from app.execution import ExecutionEngine, OrderManager
 from app.features import compute_features
 from app.incidents import IncidentManager
+from app.live_lease import LiveLeaseError, LiveRuntimeLease
 from app.market import MarketDataEngine
 from app.models import (
     GovernorState,
@@ -69,13 +70,19 @@ class TradingRuntime:
             orderbook_snapshot_interval_seconds=settings.orderbook_snapshot_interval_seconds,
         )
         self.governor = RiskGovernor()
+        self.live_lease: LiveRuntimeLease | None = None
+        self._lease_loss_task: asyncio.Task[None] | None = None
+        self.client.live_writer_guard = self._live_writer_guard
         self.risk = RiskEngine(settings, self.governor)
         self.order_manager = OrderManager(self.store)
         self.entry_action_lock = asyncio.Lock()
         self.execution = ExecutionEngine(
             self.client,
             self.order_manager,
-            lambda: self.governor.state == GovernorState.NORMAL,
+            lambda: self.governor.state == GovernorState.NORMAL and (
+                self.settings.mode != Mode.LIVE or
+                (self.live_lease is not None and self.live_lease.held)
+            ),
             self.entry_action_lock,
         )
         self.instruments: dict[str, Instrument] = {}
@@ -299,6 +306,7 @@ class TradingRuntime:
         emergency_state = self.governor.state == GovernorState.EMERGENCY
         critical = emergency_state or self.governor.reason in {
             "position mismatch", "startup position mismatch", "startup fill size mismatch",
+            "LIVE writer lease lost",
         }
         lines = [f"Reason: {self.governor.reason}", "New entries: blocked"]
         if symbol:
@@ -316,12 +324,64 @@ class TradingRuntime:
             metadata={"transition": True},
         )
 
+    def _lease_lost(self) -> None:
+        # Driver termination callback fences entries synchronously, before any await.
+        self.governor.halt("LIVE writer lease lost")
+        self._auto_recovery_forbidden = True
+        self._auto_recovery_reason = None
+        if self._lease_loss_task is None or self._lease_loss_task.done():
+            self._lease_loss_task = asyncio.create_task(
+                self._handle_lease_loss()
+            )
+
+    async def _handle_lease_loss(self) -> None:
+        # Observation comes first; persistence and cancellation cannot delay the alert.
+        await self._send_observation(self._notify_risk_state())
+        try:
+            async with asyncio.timeout(0.5):
+                await self.store.append("risk_events", {
+                    "event": "enter_halt", "reason": "LIVE writer lease lost",
+                    "emergency": self.governor.state == GovernorState.EMERGENCY,
+                })
+        except Exception:
+            logger.error("LIVE lease loss audit unavailable")
+        try:
+            await self.enter_halt("LIVE writer lease lost")
+        except Exception as exc:
+            logger.error("LIVE lease loss cancellation unconfirmed: %s", type(exc).__name__)
+
+    async def _live_writer_guard(self, entry: bool) -> bool:
+        if self.live_lease is None or not await self.live_lease.verify():
+            return False
+        return not entry or self.governor.state == GovernorState.NORMAL
+
+    async def _lease_monitor(self) -> None:
+        while self.running and self.live_lease is not None:
+            if not await self.live_lease.verify():
+                return
+            await asyncio.sleep(1)
+
     async def initialize(self) -> None:
+        try:
+            await self._initialize()
+        except BaseException:
+            if self.live_lease is not None:
+                await self.live_lease.close()
+            raise
+
+    async def _initialize(self) -> None:
         await self.store.initialize()
         if self.settings.mode == Mode.LIVE:
             # Verify the target account before restored cancellation/emergency actions.
             await self.client.account_config()
+            self.live_lease = LiveRuntimeLease(
+                self.settings.live_lease_database_url.get_secret_value(),
+                self.settings.confirm_live_account_id, self._lease_lost,
+            )
+            await self.live_lease.acquire()
             await self.store.bind_live_account(self.settings.confirm_live_account_id)
+            if not await self.live_lease.verify():
+                raise LiveLeaseError("LIVE writer lease lost")
             # Restarting LIVE must never bypass an earlier safety/manual HALT.
             # Position recovery runs, but entry requires an explicit, fully checked resume.
             self.governor.halt("LIVE startup requires manual resume")
@@ -993,13 +1053,18 @@ class TradingRuntime:
     async def start(self) -> None:
         if self.running:
             return
-        if self.settings.mode != Mode.BACKTEST:
+        if self.settings.mode == Mode.PAPER:
             try:
                 self.notifications.start()
             except Exception as exc:
                 logger.error("notification worker unavailable: %s", type(exc).__name__)
         self.started_at = utcnow()
         await self.initialize()
+        if self.settings.mode == Mode.LIVE:
+            try:
+                self.notifications.start()
+            except Exception as exc:
+                logger.error("notification worker unavailable: %s", type(exc).__name__)
         if self.settings.mode == Mode.BACKTEST:
             return
         base = self.settings.ws_base
@@ -1050,6 +1115,8 @@ class TradingRuntime:
             asyncio.create_task(self._heartbeat_loop()),
             asyncio.create_task(self._safety_loop()),
         ]
+        if self.settings.mode == Mode.LIVE:
+            self.tasks.append(asyncio.create_task(self._lease_monitor()))
         if self.settings.has_credentials:
             self.tasks.append(asyncio.create_task(self._dead_man_loop()))
         await self.store.append(
@@ -1129,9 +1196,18 @@ class TradingRuntime:
         for task in self.tasks:
             task.cancel()
         await asyncio.gather(*self.tasks, return_exceptions=True)
-        await self.store.append("system_events", {"event": "stop"})
+        try:
+            await self.store.append("system_events", {"event": "stop"})
+        finally:
+            if self.live_lease is not None:
+                await self.live_lease.close()
 
     async def close(self) -> None:
+        if self.live_lease is not None:
+            self.governor.halt("LIVE runtime closing")
+            if self._lease_loss_task is not None:
+                await asyncio.gather(self._lease_loss_task, return_exceptions=True)
+            await self.live_lease.close()
         if not self.running:
             try:
                 await self.notifications.close()
@@ -1584,6 +1660,10 @@ class TradingRuntime:
 
     async def _resume_health(self) -> tuple[bool, list[str]]:
         issues: list[str] = []
+        if self.settings.mode == Mode.LIVE and (
+            self.live_lease is None or not await self.live_lease.verify()
+        ):
+            issues.append("live_writer_lease")
         if not self.reconciliation_healthy:
             issues.append("reconciliation")
         if not self._last_reconcile_safe:

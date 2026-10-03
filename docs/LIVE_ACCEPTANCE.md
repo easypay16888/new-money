@@ -1,44 +1,65 @@
 # LIVE 验收说明
 
-本次修复针对代码与验收证据缺口。默认 PAPER、服务器 LIVE 禁用配置和既有风险硬限制均保留。此文档不是实盘启用批准。
+代码加固和自动化测试不能替代 OKX 现场验收。默认 `MODE=PAPER`、`LIVE_TRADING_ENABLED=false`；服务器 Demo compose 继续使用 SQLite，不启用 LIVE。
 
-## 已修复并纳入自动化验收
+## 代码门禁
 
-| 项目 | 验证方式 |
-| --- | --- |
-| LIVE 完整凭据与控制 token | 配置拒绝缺失凭据、短 token；异常字符串不包含输入密钥 |
-| 写请求前确认账户 | 下单、保护单、撤单、CAA 和杠杆请求在首次账户核验前均不发送 HTTP |
-| UID、账户模式、权限、IP 绑定 | 使用 MockTransport 覆盖错误 UID、缺失字段、现货模式、双向持仓、Withdraw 权限及未绑定 IP；确认只有 GET |
-| Emergency 启动恢复前确认账户 | UID 核验失败时不恢复本地订单/目标、不启动后台任务 |
-| LIVE 重启不能自动恢复交易 | 正确 UID 和独立账本核验后仍为 HALT，等待人工完整恢复门禁 |
-| 凭据变更及核验失败 | 变更凭据撤销写授权；认证或身份失败撤销授权；临时读故障不剥夺已确认同一账户的减仓能力 |
-| 独立账本 | Demo、未知历史账本及另一个账户绑定均被拒绝；既有有效 LIVE 绑定可重新启动 |
-| Watchdog 最小权限 | 状态 token 可 GET /status，不能访问交易数据或控制接口；watchdog 只请求 /status |
-| PostgreSQL | GitHub CI 使用隔离数据库实测绑定与滚动权益峰值聚合 |
-| 预检 | 非阻塞交易外部工具；只读 HTTP；异常及报告脱敏；HTTP 健康不代表实盘验收通过 |
+- LIVE 账本仅支持 `postgresql+asyncpg://`；账户 UID、权限（仅 read_only + trade）、IP 绑定和账户模式核验通过后才获取单写 lease。
+- `LIVE_LEASE_DATABASE_URL` 是必须显式配置的 secret DSN。**同一 OKX UID 的所有实例必须使用同一个协调 PostgreSQL 数据库**，即使各自账本数据库不同。不同协调数据库的 advisory locks 不互斥，不能提供全局单写保证。
+- 协调连接必须直连 PostgreSQL 或使用保持会话的连接方式；禁止 PgBouncer transaction/statement pooling。lease 使用独立 NullPool 会话，非等待式 `pg_try_advisory_lock`，固定 namespace + UID 的 SHA-256 前 64 位稳定有符号整数。锁键、UID 和 digest 不出现在状态接口或日志中。
+- lease 持有后才原子绑定账本、恢复本地状态和对账；LIVE 始终 HALT，等待人工 `/system/resume`。绑定采用 PostgreSQL 事务 advisory lock + 常量唯一索引，一个账本最多一个 binding，仅存 mode / account_digest。
+- 初始化失败或安全关闭释放会话锁。连接断开、实际锁丢失或有界探测失败会锁死当前 lease，禁止自动重新获取；同步 fencing 禁止 entry、Governor 至少 HALT、CRITICAL 通知 `LIVE writer lease lost`，归类 SAFETY_OR_MANUAL。
+- 写入前验证身份；新开仓还须有效 lease 与 NORMAL。有效身份的只减仓、保护单、撤单及 CAA 不依赖 lease。凭据/endpoint 变化永久撤销缓存授权，必须重新核验，运行中的账户 UID 不可切换；认证 401/403 撤销身份授权；临时 config GET 故障暂停开仓，保留先前验证的 Emergency 减仓权限。未知写结果继续查询同一个 clOrdId，绝不盲重试。
+- `API_TOKEN`、`STATUS_API_TOKEN` trim 后均至少 32 字符且互不相同。状态令牌只能 GET `/status`；`/health` 保持原来的匿名行为。watchdog 只接收状态令牌与 Bark 配置，不接收交易凭据、控制令牌或数据库 DSN。
+- `/status.live_writer_lease` 只报告 required/held 布尔值。preflight 在 PAPER 标记 LIVE_SINGLE_WRITER 为 UNVERIFIED，观察 LIVE 时必须 held；报告永远不会自动批准 LIVE。
 
-测试中的 LIVE 使用固定测试凭据与 MockTransport，不发出真实交易请求。PostgreSQL 测试只有在 `TEST_POSTGRES_URL` 指向命名为 `quant_live_acceptance_test` 的一次性数据库时才会运行；未配置时必须明确显示 skipped，不能报告为通过。
+## 保证金安全余量
 
-## 尚需现场确认
+原有硬上限 `max_margin_usage=0.25` 和 risk_per_trade 定义保持不变。新增 `margin_usage_target=0.20`（必须 < 硬上限且 <= 0.22）只用于保守下单量上限。
 
-| 项目 | 所需证据 | 当前状态 |
-| --- | --- | --- |
-| 当前保证金 HALT | 完整恢复检查与人工恢复记录 | 原因已确认；不能通过重启或放宽上限绕过 |
-| 保证金余量 | 费用及止损损失下的保证金占用验证、相关回归测试 | 仓位计算调整需得到授权，25% 硬上限保留 |
-| 持续 Demo 运行 | 运行时长、成交样本、WS/CAA 故障及恢复、风险事件与停机证据 | 有自然运行记录，仍需审定稳定性 |
-| 部分成交与重启 | 带实际已成交仓位重启，确认 SL 覆盖及取消未确认时 Emergency 处理 | 自动化通过不替代受控现场演练 |
-| CAA 失联 | 确认进程失联后的交易所倒计时行为 | 未完成受控演练 |
-| 带持仓停机 | 保留保护单及必要只减仓退出；停用 CAA 后退出 | 空仓停机记录不能证明此场景 |
-| 受控故障 | Redis、WS、REST 故障中风险门禁和只减仓恢复均有效 | 需要在 Demo 受控执行并保存证据 |
-| 真实账户只读预检 | 真实 UID/权限/IP、独立 PostgreSQL 账本、控制与状态 token | 当前仅配置 Demo 凭据，不使用 Demo 结果替代 |
-| 启用 LIVE | 完成全部验收、人工审阅并明确授权 | 未授权，继续关闭 |
+定义：E=权益，M=已有组合保证金，O=已有 open_risk，P=已有组合名义敞口，L=原有杠杆，t=20%，d=按原规则取整后的 stop distance / entry，c=双边 max(maker_fee,taker_fee) + 双边 slippage_bps / 10000。
 
-不按固定日期自动升级，也不通过增加品种、余额或杠杆消除现有阻塞。任何扩容或实盘启用都是后续独立决策。
+```text
+E_stress = E - O - P*c
+N_buffer = max(0, (t*E_stress - M) / (1/L + t*(d+c)))
+N_available = available_balance / (1/L + d+c)
+N = max(0, min(original risk sizing, original leverage cap,
+               original 25% margin cap, N_buffer, N_available))
+contracts = floor(N / per_contract / lotSz) * lotSz
+```
 
-## 保证金余量的待审方案
+该公式要求 `(M + N/L) / (E_stress - N*(d+c)) <= t`，预留止损损失与双边费用/滑点。已有仓位保证金和 open_risk 已按组合聚合。低于 minSz 则不交易；非有限数字、异常 instrument 参数及极端止损距离 fail closed。费用较高只会减量。
 
-当前下单量可能把保证金占用推近硬上限，权益略微下降便触发 HALT。最近实测开仓后约 24.9898%，之后达到 25.00135% 触发原有 25% 上限。
+这不是交易所清算模型：跳空、资金费、保证金规则变化及在途请求仍须依靠已有保护、持续风控、CAA 和对账。PostgreSQL 锁无法撤回丢锁前已发出的 OKX HTTP 请求，现场演练必须检查这类在途订单。
 
-拟在现有硬上限内预留到止损的损失、双边手续费及已有滑点假设；仅保守减少允许的合约数量，继续按原有 lot size 向下取整，不改变止损、策略、杠杆或风险硬阈值。损失跳空和未知资金费用仍可能越限，原有持续风控与 HALT 必须保留。
+## PostgreSQL 自动化验收
 
-这是待审方案，当前尚未接入 RiskEngine，不代表已经修复保证金临界暂停。
+`TEST_POSTGRES_URL` 必须指向隔离的一次性测试服务：asyncpg、用户 `quant_test`、数据库 `quant_live_acceptance_test`、loopback 主机。未配置直接失败，不能 silent skip。测试清理仅允许该命名的数据库表；跨账本测试另创建并删除自己独占的一次性第二测试数据库，绝不使用生产账本。
+
+```sh
+# DSN 由隔离环境注入，不在命令或日志中展示生产密码。
+uv run pytest
+uv run ruff check app tests
+uv run mypy app
+```
+
+CI 使用独立 PostgreSQL 16 service，覆盖锁争用、释放、连接中断、实际锁移除、不同 UID 绑定竞争、同 UID 幂等绑定、Demo/未知历史拒绝及 LIVE 恢复门禁。LIVE HTTP 测试使用固定假凭据与 MockTransport，不发送真实交易。
+
+## 受控 Demo 现场演练（必须人工填写）
+
+自动化测试通过不构成下面任何项目的 PASS。所有项目先确认测试账户、单实例、仓位/挂单/保护和退出计划，按现场控制流程在 Demo 执行；本轮仅提供记录模板，不主动制造交易或故障。单写争用/丢锁演练使用隔离 PostgreSQL 和假 LIVE HTTP，LIVE 真实账户验收需要后续人工授权。
+
+| 编号 | 场景 | 时间戳 | commit SHA | 初始仓位 | orders | protection | 最终仓位 | Governor | reconciliation | Bark | 人工结论/证据 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 | partial fill + restart | 待填 | 待填 | 待填 | 待填 | 待填 | 待填 | 待填 | 待填 | 待填 | UNVERIFIED |
+| 2 | protected open position + restart | 待填 | 待填 | 待填 | 待填 | 待填 | 待填 | 待填 | 待填 | 待填 | UNVERIFIED |
+| 3 | CAA expiry | 待填 | 待填 | 待填 | 待填 | 待填 | 待填 | 待填 | 待填 | 待填 | UNVERIFIED |
+| 4 | Redis outage | 待填 | 待填 | 待填 | 待填 | 待填 | 待填 | 待填 | 待填 | 待填 | UNVERIFIED |
+| 5 | private WS outage | 待填 | 待填 | 待填 | 待填 | 待填 | 待填 | 待填 | 待填 | 待填 | UNVERIFIED |
+| 6 | reconciliation REST outage | 待填 | 待填 | 待填 | 待填 | 待填 | 待填 | 待填 | 待填 | 待填 | UNVERIFIED |
+| 7 | safe shutdown with protected position | 待填 | 待填 | 待填 | 待填 | 待填 | 待填 | 待填 | 待填 | 待填 | UNVERIFIED |
+| 8 | Emergency reduce-only flatten | 待填 | 待填 | 待填 | 待填 | 待填 | 待填 | 待填 | 待填 | 待填 | UNVERIFIED |
+| 9 | lease contention | 待填 | 待填 | 待填 | 待填 | 待填 | 待填 | 待填 | 待填 | 待填 | UNVERIFIED |
+| 10 | lease loss | 待填 | 待填 | 待填 | 待填 | 待填 | 待填 | 待填 | 待填 | 待填 | UNVERIFIED |
+
+每个场景保留脱敏日志、交易所订单/保护证据、最终对账和通知记录。验收后由操作者签名，记录是否满足预期；失败必须保持 HALT/EMERGENCY，不能通过重启、放宽硬上限或扩大自动恢复范围绕过。lease 丢失后人工确认仅一个实例，重启获取 lease、完整对账、人工 resume；EMERGENCY 和 LIVE 都不自动恢复 NORMAL。

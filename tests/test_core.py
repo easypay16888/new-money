@@ -73,8 +73,8 @@ def test_default_is_paper_and_live_requires_triple_gate():
 def test_position_sizing_respects_risk_and_contract_precision():
     decision = evaluate(ready_risk())
     assert decision.approved
-    assert decision.approved_contracts == Decimal("5.00")
-    assert decision.approved_notional == Decimal("2500.0000")
+    assert decision.approved_contracts == Decimal("3.99")
+    assert decision.approved_notional == Decimal("1995.0000")
     assert ExecutionEngine.from_risk(decision, instrument()).price == Decimal("50000")
 
 

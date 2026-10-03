@@ -84,10 +84,18 @@ async def inspect_readiness(
     record("POSTGRESQL_STORAGE", status.get("database_backend") == "postgresql",
            "Long-term acceptance requires the supported PostgreSQL deployment")
     record("LIVE_CONTROL_TOKENS", len(settings.api_token.strip()) >= 32 and
-           len(settings.status_api_token.strip()) >= 32 and settings.api_token != settings.status_api_token,
+           len(settings.status_api_token.strip()) >= 32 and settings.api_token.strip() != settings.status_api_token.strip(),
            "Distinct control and read-only status tokens required for LIVE operations")
     record("LIVE_REMAINS_DISABLED", settings.mode == Mode.PAPER and not settings.live_trading_enabled
            and status.get("mode") == "PAPER", "This acceptance stage runs in Demo only")
+    lease = status.get("live_writer_lease")
+    if settings.mode == Mode.LIVE or status.get("mode") == "LIVE":
+        record("LIVE_SINGLE_WRITER", isinstance(lease, dict) and
+               lease.get("required") is True and lease.get("held") is True,
+               "LIVE must hold the shared coordinator lease; no ownership keys exposed")
+    else:
+        checks.append({"check": "LIVE_SINGLE_WRITER", "result": "UNVERIFIED",
+                       "detail": "PAPER does not acquire LIVE ownership; field contention/loss drills required"})
     for name, detail in (
         ("LIVE_ACCOUNT_PREFLIGHT", "Verify real account UID, permissions, IP binding and separate ledger"),
         ("CAA_AND_SHUTDOWN_DRILLS", "Confirm CAA expiry, retained exits and safe shutdown on exchange"),

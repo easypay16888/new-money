@@ -9,6 +9,7 @@ from app.models import NotificationEvent, NotificationPriority
 from app.notification_events import event_code, normalize_event, reason_code
 
 REASONS = {
+    "LIVE writer lease lost": "LIVE 单写权限已丢失，需要人工检查并重启",
     "reconciliation failed": "OKX 对账暂时失败",
     "reconciliation permanent failure": "OKX 对账发生不可自动恢复的错误",
     "LIVE startup requires manual resume": "实盘启动等待人工确认恢复",

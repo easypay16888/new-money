@@ -73,6 +73,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "risk_state": runtime.governor.state,
             "reason": runtime.governor.reason,
             "synchronized": runtime.portfolio.synchronized,
+            "live_writer_lease": {
+                "required": settings.mode == Mode.LIVE,
+                "held": runtime.live_lease is not None and runtime.live_lease.held,
+            },
             "database_backend": runtime.store.engine.dialect.name,
             "blocked_symbols": sorted(runtime.entry_controller.blocked),
             "emergency_targets": {

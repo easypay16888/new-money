@@ -75,3 +75,22 @@ async def test_preflight_rejects_credentials_and_non_status_url(url):
     async with httpx.AsyncClient(transport=httpx.MockTransport(lambda _: pytest.fail("unexpected HTTP"))) as client:
         with pytest.raises(ValueError):
             await inspect_readiness(Settings(_env_file=None), client, url)
+
+
+async def test_paper_preflight_single_writer_is_unverified():
+    report, _ = await inspect(responses())
+    check = next(row for row in report["checks"] if row["check"] == "LIVE_SINGLE_WRITER")
+    assert check["result"] == "UNVERIFIED" and not report["live_ready"]
+
+
+@pytest.mark.parametrize("lease,expected", [
+    ({"required": True, "held": True}, "PASS"),
+    ({"required": True, "held": False}, "BLOCKED"), ({}, "BLOCKED"),
+])
+async def test_observed_live_preflight_requires_held_lease(lease, expected):
+    data = responses()
+    data["/status"]["mode"] = "LIVE"
+    data["/status"]["live_writer_lease"] = lease
+    report, _ = await inspect(data)
+    assert next(row for row in report["checks"] if row["check"] == "LIVE_SINGLE_WRITER")["result"] == expected
+    assert not report["live_ready"]

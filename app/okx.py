@@ -101,6 +101,8 @@ class OkxRestClient:
         self.owns_client = client is None
         self.latency_observer: Callable[[str, float], None] | None = None
         self._verified_live_identity: bytes | None = None
+        self._live_account_anchor: bytes | None = None
+        self.live_writer_guard: Callable[[bool], Awaitable[bool]] | None = None
 
     def _live_identity(self) -> bytes:
         # Invalidate the grant if account, credentials or endpoint changes in memory.
@@ -125,6 +127,8 @@ class OkxRestClient:
         private: bool = False,
     ) -> list[Any]:
         method = method.upper()
+        if self.settings.mode == Mode.LIVE and self._verified_live_identity != self._live_identity():
+            self._verified_live_identity = None
         if self.settings.mode == Mode.LIVE and method != "GET":
             if (
                 not self.settings.live_trading_enabled
@@ -133,6 +137,27 @@ class OkxRestClient:
                 or self._verified_live_identity != self._live_identity()
             ):
                 raise OkxError("LIVE write blocked: account identity not verified")
+            # Ownership is needed for every risk-increasing write, even direct/manual calls.
+            # Verified cancel/CAA and explicit reduce-only protection/emergency retain access.
+            safe = method == "POST" and (
+                path in {
+                    "/api/v5/trade/cancel-order", "/api/v5/trade/cancel-algos",
+                    "/api/v5/trade/cancel-all-after",
+                } or (
+                    path in {"/api/v5/trade/order", "/api/v5/trade/order-algo"}
+                    and isinstance(body, dict)
+                    and (body.get("reduceOnly") is True or body.get("reduceOnly") == "true")
+                )
+            )
+            if not safe:
+                entry = path != "/api/v5/account/set-leverage"
+                try:
+                    allowed = self.live_writer_guard is not None and await self.live_writer_guard(entry)
+                except Exception:
+                    allowed = False
+                # Recheck identity after the asynchronous lease probe.
+                if not allowed or self._verified_live_identity != self._live_identity():
+                    raise OkxError("LIVE write blocked: writer ownership or entry permission missing")
         query = "?" + urlencode(params) if params else ""
         request_path = path + query
         body_text = json.dumps(body, separators=(",", ":")) if body is not None else ""
@@ -167,6 +192,8 @@ class OkxRestClient:
         finally:
             if self.latency_observer is not None:
                 self.latency_observer(path, time.monotonic() - started)
+        if response.status_code in {401, 403}:
+            self._verified_live_identity = None
         try:
             result = response.json()
         except ValueError as exc:
@@ -246,6 +273,9 @@ class OkxRestClient:
             config = rows[0]
             if config.get("uid") != self.settings.confirm_live_account_id:
                 raise OkxError("LIVE account identity mismatch")
+            account_anchor = hashlib.sha256(self.settings.confirm_live_account_id.encode()).digest()
+            if self._live_account_anchor is not None and self._live_account_anchor != account_anchor:
+                raise OkxError("LIVE account identity changed; runtime restart required")
             if config.get("posMode") != "net_mode" or config.get("acctLv") not in {"2", "3", "4"}:
                 raise OkxError("LIVE derivatives account mode required")
             permissions = {item.strip() for item in str(config.get("perm") or "").split(",")}
@@ -259,6 +289,7 @@ class OkxRestClient:
                 raise OkxError("LIVE requires API key IP binding") from None
             if identity != self._live_identity():
                 raise OkxError("LIVE configuration changed during identity verification")
+            self._live_account_anchor = account_anchor
             self._verified_live_identity = identity
         return rows
 

@@ -6,7 +6,7 @@ from hashlib import sha256
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import JSON, DateTime, Integer, Numeric, String, cast, func, or_, select
+from sqlalchemy import JSON, DateTime, Integer, Numeric, String, cast, func, or_, select, text
 from sqlalchemy.engine.url import make_url
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -66,13 +66,19 @@ class Store:
             and database != ":memory:"
         ):
             Path(database).parent.mkdir(parents=True, exist_ok=True)
-        self.engine: AsyncEngine = create_async_engine(url, pool_pre_ping=True)
+        self.engine: AsyncEngine = create_async_engine(url, pool_pre_ping=True, hide_parameters=True)
         self.sessions = async_sessionmaker(self.engine, expire_on_commit=False)
         self.healthy = False
 
     async def initialize(self) -> None:
         async with self.engine.begin() as connection:
             await connection.run_sync(Base.metadata.create_all)
+            # A constant unique expression enforces one record, including legacy tables.
+            # Conflicting legacy bindings fail initialization instead of being discarded.
+            await connection.execute(text(
+                "CREATE UNIQUE INDEX IF NOT EXISTS account_bindings_singleton "
+                "ON account_bindings ((1))"
+            ))
         self.healthy = True
 
     async def append(
@@ -150,6 +156,10 @@ class Store:
         bindings = ROW_TYPES["account_bindings"]
         events = ROW_TYPES["system_events"]
         async with self.sessions.begin() as session:
+            if self.engine.dialect.name == "postgresql":
+                # Serialize check/history/insert inside the same transaction, across hosts.
+                await session.execute(text("SELECT pg_advisory_xact_lock(:key)"),
+                                      {"key": 579483812703578118})
             rows = (await session.scalars(select(bindings))).all()
             incompatible = await session.scalar(select(func.count()).select_from(events).where(
                 events.payload["event"].as_string() == "start",

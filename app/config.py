@@ -5,6 +5,7 @@ from functools import lru_cache
 
 from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from sqlalchemy.engine import make_url
 
 
 class Mode(StrEnum):
@@ -26,6 +27,7 @@ class Settings(BaseSettings):
     okx_paper_ws_url: str = "wss://wspap.okx.com:8443/ws/v5"
     okx_live_ws_url: str = "wss://ws.okx.com:8443/ws/v5"
     database_url: str = "sqlite+aiosqlite:///./data/trading.db"
+    live_lease_database_url: SecretStr = SecretStr("")
     redis_url: str = "redis://localhost:6379/0"
     symbols: tuple[str, ...] = ("BTC-USDT-SWAP", "ETH-USDT-SWAP")
     timeframes: tuple[str, ...] = ("1m", "5m", "15m", "1H", "4H")
@@ -35,6 +37,7 @@ class Settings(BaseSettings):
     max_daily_loss: float = Field(default=0.015, gt=0)
     max_weekly_drawdown: float = Field(default=0.04, gt=0)
     max_margin_usage: float = Field(default=0.25, gt=0, le=1)
+    margin_usage_target: float = Field(default=0.20, gt=0, le=0.22, allow_inf_nan=False)
     min_margin_ratio: float = Field(default=1.5, gt=0)
     max_open_positions: int = Field(default=3, ge=1)
     max_leverage: int = Field(default=3, ge=1, le=3)
@@ -108,16 +111,28 @@ class Settings(BaseSettings):
         ):
             raise ValueError("LIVE requires LIVE_TRADING_ENABLED and CONFIRM_LIVE_ACCOUNT_ID")
         if self.mode == Mode.LIVE:
+            def supported_postgres(value: str) -> bool:
+                try:
+                    return make_url(value).drivername == "postgresql+asyncpg"
+                except Exception:
+                    return False
+
+            if not supported_postgres(self.database_url):
+                raise ValueError("LIVE requires PostgreSQL storage")
+            if not supported_postgres(self.live_lease_database_url.get_secret_value()):
+                raise ValueError("LIVE requires a shared PostgreSQL lease coordinator")
             if not all(value.strip() for value in (
                 self.okx_api_key, self.okx_secret_key, self.okx_passphrase
             )):
                 raise ValueError("LIVE requires complete OKX credentials")
             if len(self.api_token.strip()) < 32:
                 raise ValueError("LIVE requires a control API token of at least 32 characters")
-            if self.status_api_token and (
-                len(self.status_api_token.strip()) < 32 or self.status_api_token == self.api_token
-            ):
+            self.api_token = self.api_token.strip()
+            self.status_api_token = self.status_api_token.strip()
+            if len(self.status_api_token) < 32 or self.status_api_token == self.api_token:
                 raise ValueError("LIVE status token must be distinct and at least 32 characters")
+        if self.margin_usage_target >= self.max_margin_usage:
+            raise ValueError("margin sizing target must be below hard margin limit")
         if self.leverage > self.max_leverage:
             raise ValueError("leverage exceeds configured maximum")
         if self.risk_per_trade > self.max_risk_per_trade:

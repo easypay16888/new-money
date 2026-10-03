@@ -44,6 +44,7 @@ async def recovery_runtime(tmp_path):
     runtime._reconcile_impl = AsyncMock(side_effect=successful_reconcile)
     runtime._resume_health = AsyncMock(return_value=(True, []))
     yield runtime, clock
+    await runtime.notifications.close()
     await original_client.close()
     await runtime.store.close()
 
@@ -72,7 +73,7 @@ async def test_transient_halt_auto_recovers_after_three_successes(recovery_runti
 @pytest.mark.parametrize("reason", [
     "position mismatch", "foreign risk-increasing pending order", "unexpected algo order",
     "protective stop cannot be verified", "margin ratio danger", "manual kill switch",
-    "unrecognized fault", "reconciliation permanent failure",
+    "unrecognized fault", "reconciliation permanent failure", "LIVE writer lease lost",
 ])
 async def test_safety_manual_and_unknown_halts_never_auto_recover(recovery_runtime, reason):
     runtime, clock = recovery_runtime
