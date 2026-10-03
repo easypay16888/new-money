@@ -223,7 +223,7 @@ def test_websocket_sequence_gap_is_fail_closed():
         pass
 
     ws = OkxWebSocket("wss://example.invalid", [], handle, Settings())
-    ws._check_sequence({"arg": {"channel": "books", "instId": "BTC"}, "data": [{"seqId": 2}]})
+    ws._check_sequence({"arg": {"channel": "books", "instId": "BTC"}, "action": "snapshot", "data": [{"seqId": 2}]})
     with pytest.raises(OkxError):
         ws._check_sequence(
             {"arg": {"channel": "books", "instId": "BTC"}, "data": [{"prevSeqId": 1, "seqId": 3}]}

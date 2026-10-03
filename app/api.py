@@ -59,8 +59,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         runtime.metrics.update(
             runtime.portfolio,
             runtime.governor.state,
-            {str(i): ws.reconnects for i, ws in enumerate(runtime.sockets)},
-            stale=any(not ws.is_fresh() for ws in runtime.sockets),
+            {ws.name: ws.reconnects for ws in runtime.sockets},
+            stale=any(not ws.is_data_fresh() for ws in runtime.sockets),
             trade_count=len(runtime.order_manager.seen_trade_ids),
         )
         return Response(runtime.metrics.render(), media_type="text/plain; version=0.0.4")
@@ -84,15 +84,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             },
             "auto_recovery": runtime.auto_recovery_status(),
             "protective_algos": list(runtime.algo_manager.algos.values()),
-            "websockets": [
-                {
-                    "url": ws.url,
-                    "connected": ws.connected,
-                    "fresh": ws.is_fresh(),
-                    "reconnects": ws.reconnects,
-                }
-                for ws in runtime.sockets
-            ],
+            "websockets": [ws.status() for ws in runtime.sockets],
         }
 
     @app.get("/market", dependencies=[Depends(authorize)])

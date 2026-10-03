@@ -68,6 +68,24 @@ class Metrics:
         self.ws_reconnects = Gauge(
             "quant_ws_reconnects", "WebSocket reconnect count", ["socket"], registry=self.registry
         )
+        self.ws_queue_depth = Gauge(
+            "quant_ws_queue_depth", "Queued business messages", ["socket"], registry=self.registry
+        )
+        self.ws_queue_wait = Histogram(
+            "quant_ws_queue_wait_seconds", "WS business queue wait", ["socket"], registry=self.registry
+        )
+        self.ws_handler_latency = Histogram(
+            "quant_ws_handler_latency_seconds", "WS business handler latency", ["socket"], registry=self.registry
+        )
+        self.ws_ping_rtt = Histogram(
+            "quant_ws_ping_rtt_seconds", "OKX application pong RTT", ["socket"], registry=self.registry
+        )
+        self.ws_transport_disconnects = Counter(
+            "quant_ws_transport_disconnects_total", "Ended WS sessions", ["socket"], registry=self.registry
+        )
+        self.ws_market_stale_events = Counter(
+            "quant_ws_market_stale_events_total", "Critical feed freshness failures", ["socket"], registry=self.registry
+        )
         self.orders = Counter("quant_orders_total", "Order submissions", registry=self.registry)
         self.order_errors = Counter(
             "quant_order_errors_total", "Order submission errors", registry=self.registry

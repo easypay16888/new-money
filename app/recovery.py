@@ -11,6 +11,9 @@ class HaltClass(StrEnum):
 AUTO_RECOVERABLE_REASONS = frozenset({
     "reconciliation failed",
     "WebSocket disconnected or stale",
+    "WebSocket transport unavailable",
+    "Market data stale",
+    "WebSocket processing backlog",
     "Redis unavailable",
     "dead man switch unavailable",
 })

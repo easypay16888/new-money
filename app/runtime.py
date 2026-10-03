@@ -167,8 +167,10 @@ class TradingRuntime:
         self._auto_resume_times: deque[float] = deque()
         self._auto_recovery_flaps: deque[float] = deque()
         self._auto_recovery_notice: tuple[str, float] | None = None
+        self._ws_safety_tasks: dict[str, asyncio.Task[None]] = {}
+        self._ws_reconcile_requested: set[str] = set()
 
-    async def enter_halt(self, reason: str, *, emergency: bool = False) -> None:
+    def _halt_state(self, reason: str, *, emergency: bool = False) -> tuple[str, bool, bool]:
         self.entry_controller.client = self.client
         emergency = emergency or self.governor.state == GovernorState.EMERGENCY
         if (
@@ -205,6 +207,10 @@ class TradingRuntime:
             and (not emergency or self.governor.state == GovernorState.EMERGENCY)
         )
         self.governor.halt(reason, emergency=emergency)
+        return reason, repeated, emergency
+
+    async def enter_halt(self, reason: str, *, emergency: bool = False) -> None:
+        reason, repeated, emergency = self._halt_state(reason, emergency=emergency)
         await self._send_observation(self._notify_risk_state())
         if not repeated:
             try:
@@ -445,6 +451,8 @@ class TradingRuntime:
 
     async def _run_reconciliation(self) -> None:
         completed = False
+        epochs = [(ws, ws.generation) for ws in self.sockets
+                  if ws.private and ws.is_transport_healthy() and ws.business_idle]
         try:
             await self._reconcile_impl()
             completed = True
@@ -452,6 +460,11 @@ class TradingRuntime:
             # Observation uses a completed result; trading gates retain their in-flight False.
             self._reconciliation_observed_result = completed and self.reconciliation_healthy
             self._reconciliation_completed_at = self._clock()
+            if completed and self.reconciliation_healthy and self._last_reconcile_safe:
+                for ws, generation in epochs:
+                    if ws.generation == generation and ws.is_transport_healthy() and ws.business_idle:
+                        ws.reconciliation_required = False
+                        ws.processing_unsafe = False
 
     def _reconciliation_notification_health(self) -> bool:
         max_age = max(
@@ -1086,13 +1099,15 @@ class TradingRuntime:
                 base + "/public",
                 public_subscriptions(self.settings.symbols),
                 self._on_market,
-                self.settings,
+                self.settings, name="public-market", metrics=self.metrics,
+                on_fault=self._on_ws_fault, on_ready=self._on_ws_ready,
             ),
             OkxWebSocket(
                 base + "/business",
                 candle_subscriptions(self.settings.symbols, self.settings.timeframes),
                 self._on_market,
-                self.settings,
+                self.settings, name="business-candles", metrics=self.metrics,
+                on_fault=self._on_ws_fault, on_ready=self._on_ws_ready,
             ),
         ]
         if self.settings.has_credentials:
@@ -1106,7 +1121,8 @@ class TradingRuntime:
                     ],
                     self._on_private,
                     self.settings,
-                    private=True,
+                    private=True, name="private-account", metrics=self.metrics,
+                    on_fault=self._on_ws_fault, on_ready=self._on_ws_ready,
                 )
             )
             self.sockets.append(
@@ -1115,7 +1131,8 @@ class TradingRuntime:
                     [{"channel": "orders-algo", "instType": "ANY"}],
                     self._on_private,
                     self.settings,
-                    private=True,
+                    private=True, name="private-algo", metrics=self.metrics,
+                    on_fault=self._on_ws_fault, on_ready=self._on_ws_ready,
                 )
             )
         self.running = True
@@ -1172,6 +1189,13 @@ class TradingRuntime:
             while self.entry_controller.blocked and asyncio.get_running_loop().time() < deadline:
                 await self.entry_controller.cancel_all()
                 await asyncio.sleep(0.5)
+            # Settle accepted private events before the final shutdown snapshot.
+            # Timeout cancels only the join waiter, never a trading handler/write.
+            try:
+                async with asyncio.timeout(self.settings.entry_cancel_confirm_seconds):
+                    await asyncio.gather(*(ws.queue.join() for ws in self.sockets if ws.private))
+            except TimeoutError:
+                raise RuntimeError("shutdown WebSocket processing unconfirmed") from None
             await self.reconcile()
             if (
                 self.entry_controller.blocked
@@ -1212,9 +1236,12 @@ class TradingRuntime:
                 "shutdown positions or cancellations cannot be verified without credentials"
             )
         self.running = False
-        for task in self.tasks:
+        shutdown_tasks = [*self.tasks, *self._ws_safety_tasks.values()]
+        for task in shutdown_tasks:
             task.cancel()
-        await asyncio.gather(*self.tasks, return_exceptions=True)
+        await asyncio.gather(*shutdown_tasks, return_exceptions=True)
+        self._ws_safety_tasks.clear()
+        self._ws_reconcile_requested.clear()
         try:
             await self.store.append("system_events", {"event": "stop"})
         finally:
@@ -1347,6 +1374,67 @@ class TradingRuntime:
             symbol=symbol, dedup_key=f"position-closed:{symbol}:{utcnow().isoformat()}",
         )
 
+    def _ws_health_reason(self) -> str | None:
+        if any(not ws.is_processing_healthy() for ws in self.sockets):
+            return "WebSocket processing backlog"
+        if any(not ws.is_transport_healthy() for ws in self.sockets):
+            return "WebSocket transport unavailable"
+        if any(not ws.is_data_fresh() for ws in self.sockets):
+            return "Market data stale"
+        return None
+
+    def _websockets_healthy(self) -> bool:
+        return self._ws_health_reason() is None and not any(
+            ws.reconciliation_required for ws in self.sockets
+        )
+
+    def _on_ws_fault(self, ws: OkxWebSocket, reason: str) -> None:
+        # Receive-loop callback performs immediate entry fencing without awaiting
+        # notifications, cancellation HTTP, or reconciliation.
+        self._halt_state(reason)
+        if ws.private:
+            self.reconciliation_healthy = False
+            self._last_reconcile_safe = False
+            self.portfolio.synchronized = False
+        self._schedule_ws_reconciliation(ws, reason)
+
+    def _on_ws_ready(self, ws: OkxWebSocket) -> None:
+        if ws.private:
+            self._schedule_ws_reconciliation(ws)
+
+    def _schedule_ws_reconciliation(self, ws: OkxWebSocket, reason: str | None = None) -> None:
+        self._ws_reconcile_requested.add(ws.name)
+        current = self._ws_safety_tasks.get(ws.name)
+        if current is not None and not current.done():
+            return
+
+        async def recover() -> None:
+            try:
+                if reason:
+                    await self._send_observation(self._observe_infrastructure())
+                    await self.enter_halt(reason)
+                    try:
+                        await self.store.append("risk_events", {
+                            "event": "websocket_fault", "reason": self.governor.reason,
+                            "socket_name": ws.name,
+                        })
+                    except Exception:
+                        logger.error("WS fault audit unavailable")
+                while ws.name in self._ws_reconcile_requested:
+                    self._ws_reconcile_requested.discard(ws.name)
+                    if ws.is_transport_healthy():
+                        await ws.queue.join()
+                    if self.settings.has_credentials:
+                        await self.reconcile()
+                    await self._send_observation(self._observe_infrastructure())
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.error("WS recovery failed", extra={
+                    "socket_name": ws.name, "exception_type": type(exc).__name__,
+                })
+        self._ws_safety_tasks[ws.name] = asyncio.create_task(recover(), name=f"{ws.name}-recovery")
+
     async def _on_market(self, message: dict[str, Any]) -> None:
         try:
             await self.market.handle(message)
@@ -1432,11 +1520,14 @@ class TradingRuntime:
             if book and book.asks and book.bids
             else Decimal(1)
         )
+        ws_reason = self._ws_health_reason()
+        if ws_reason:
+            await self.enter_halt(ws_reason)
         decision = self.risk.evaluate(
             intent,
             self.portfolio,
             self.instruments[symbol],
-            data_fresh=market_fresh and all(ws.is_fresh() for ws in self.sockets),
+            data_fresh=market_fresh and self._websockets_healthy(),
             infrastructure_healthy=self.store.healthy
             and self.redis is not None
             and self.dead_man_healthy,
@@ -1562,7 +1653,8 @@ class TradingRuntime:
             self.market.redis = None
 
     async def _observe_component(
-        self, name: str, healthy: bool, *, outage: str, recovery: str, threshold: int = 1
+        self, name: str, healthy: bool, *, outage: str, recovery: str, threshold: int = 1,
+        details: str = "", component: str | None = None,
     ) -> None:
         previous = self._component_health.get(name)
         if previous is None:
@@ -1581,16 +1673,44 @@ class TradingRuntime:
         await self.alert(
             "INFO" if healthy else "WARNING",
             recovery if healthy else outage,
-            f"Component: {name}\nStatus: {'recovered' if healthy else 'unavailable'}",
+            f"Component: {name}\nStatus: {'recovered' if healthy else 'unavailable'}"
+            + ("\n" + details if details and not healthy else ""),
             category=NotificationCategory.INFRASTRUCTURE,
             dedup_key=f"infrastructure:{name}",
-            metadata={"recovery": healthy},
+            metadata={"recovery": healthy, **({"component": component, "ws_details": details}
+                                           if component else {})},
         )
 
     async def _observe_infrastructure(self) -> None:
+        disconnected = [ws for ws in self.sockets if not ws.is_transport_healthy()]
+        stale = [(ws, feed) for ws in self.sockets for feed in ws.stale_feeds()]
+        backlog = [ws for ws in self.sockets if not ws.is_processing_healthy()]
+        for component in ("WebSocket", "MarketData", "WSProcessing"):
+            self._component_health.setdefault(component, True)
         await self._observe_component(
-            "WebSocket", all(ws.is_fresh() for ws in self.sockets),
-            outage="🚨 WebSocket Disconnected", recovery="✅ WS Recovered", threshold=2,
+            "WebSocket", not disconnected,
+            outage="🚨 WebSocket 连接中断", recovery="✅ WebSocket 已恢复",
+            component="websocket", details="\n".join(
+                f"Socket: {ws.name}\nReason: {ws.disconnect_reason}\nReconnects: {ws.reconnects}"
+                for ws in disconnected
+            ),
+        )
+        await self._observe_component(
+            "MarketData", not stale,
+            outage="⚠️ 市场数据过期", recovery="✅ 市场数据已恢复",
+            component="market_data", details="\n".join(
+                f"Socket: {ws.name}\nFeed: {feed['feed']}\nSymbol: {feed['symbol']}"
+                f"\nAge: {feed['age_seconds'] if feed['age_seconds'] is not None else 'no data'}s"
+                for ws, feed in stale
+            ),
+        )
+        await self._observe_component(
+            "WSProcessing", not backlog,
+            outage="🚨 WebSocket 消息处理积压", recovery="✅ WS 消息处理恢复",
+            component="ws_backlog", details="\n".join(
+                f"Socket: {ws.name}\nQueue: {ws.queue.qsize()}/{ws.queue.maxsize}"
+                "\nNew entries: blocked" for ws in backlog
+            ),
         )
         await self._observe_component(
             "Redis", self.redis is not None,
@@ -1610,7 +1730,7 @@ class TradingRuntime:
                 "Cancel-All-After", self.dead_man_healthy,
                 outage="🚨 CAA Unavailable", recovery="✅ CAA Recovered",
             )
-        reconnect_total = sum(ws.reconnects for ws in self.sockets)
+        reconnect_total = sum(ws.reconnects - ws.maintenance_reconnects for ws in self.sockets)
         now = monotonic()
         self._reconnect_times.extend(
             [now] * max(0, reconnect_total - self._last_reconnect_total)
@@ -1633,11 +1753,11 @@ class TradingRuntime:
         if not (
             self.portfolio.synchronized and self.reconciliation_healthy
             and self.store.healthy and self.redis is not None
-            and self.dead_man_healthy and all(ws.is_fresh() for ws in self.sockets)
+            and self.dead_man_healthy and self._websockets_healthy()
         ):
             return
         self._started_notified = True
-        healthy_ws = sum(ws.is_fresh() for ws in self.sockets)
+        healthy_ws = sum(ws.is_fresh() and not ws.reconciliation_required for ws in self.sockets)
         await self.alert(
             "INFO", "🟢 Quant System Started",
             f"Mode: {self.settings.mode.value}\nEquity: {self.portfolio.equity} USDT"
@@ -1647,7 +1767,7 @@ class TradingRuntime:
         )
 
     async def _publish_heartbeat(self) -> None:
-        ws_healthy = sum(ws.is_fresh() for ws in self.sockets)
+        ws_healthy = sum(ws.is_fresh() and not ws.reconciliation_required for ws in self.sockets)
         lines = [
             f"Mode: {self.settings.mode.value}",
             f"Uptime: {utcnow() - self.started_at}",
@@ -1727,7 +1847,7 @@ class TradingRuntime:
             issues.append("emergency_targets")
         if self.settings.mode != Mode.BACKTEST and (
             not self.sockets
-            or not all(ws.connected and ws.is_fresh() for ws in self.sockets)
+            or not self._websockets_healthy()
         ):
             issues.append("websockets")
         if self.portfolio_monitor.breached(self.portfolio, [])[0]:
@@ -1778,7 +1898,7 @@ class TradingRuntime:
                     f"Previous state: HALT\nReason: {reason}\n"
                     f"Healthy checks: {self.settings.auto_recovery_success_threshold}/"
                     f"{self.settings.auto_recovery_success_threshold}\n"
-                    f"Reconciliation: healthy\nWS: {sum(ws.is_fresh() for ws in self.sockets)}/"
+                    f"Reconciliation: healthy\nWS: {sum(ws.is_fresh() and not ws.reconciliation_required for ws in self.sockets)}/"
                     f"{len(self.sockets)}\nPositions: {len(self.portfolio.positions)}\n"
                     f"Orders: {len(self.order_manager.pending_entries())}\nRisk: NORMAL",
                     category=NotificationCategory.RISK, priority=NotificationPriority.ACTIVE,
@@ -1859,12 +1979,13 @@ class TradingRuntime:
             self.metrics.update(
                 self.portfolio,
                 self.governor.state,
-                {str(i): ws.reconnects for i, ws in enumerate(self.sockets)},
-                stale=any(not ws.is_fresh() for ws in self.sockets),
+                {ws.name: ws.reconnects for ws in self.sockets},
+                stale=any(not ws.is_data_fresh() for ws in self.sockets),
                 trade_count=len(self.order_manager.seen_trade_ids),
             )
-            if any(not ws.is_fresh() for ws in self.sockets):
-                await self.enter_halt("WebSocket disconnected or stale")
+            ws_reason = self._ws_health_reason()
+            if ws_reason:
+                await self.enter_halt(ws_reason)
             elif (
                 self.governor.reason == "startup reconciliation pending"
                 and self.governor.state != GovernorState.EMERGENCY

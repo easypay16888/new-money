@@ -30,6 +30,7 @@ class Incident:
     recovered_components: set[str] = field(default_factory=set)
     components_recovered_tick: float | None = None
     reasons: set[str] = field(default_factory=set)
+    ws_details: dict[str, str] = field(default_factory=dict)
     open_queued: bool = False
     notified_open: bool = False
     resolved_queued: bool = False
@@ -155,6 +156,9 @@ class IncidentManager:
                 halt_component = {
                     "reconciliation failed": "reconciliation",
                     "WebSocket disconnected or stale": "websocket",
+                    "WebSocket transport unavailable": "websocket",
+                    "Market data stale": "market_data",
+                    "WebSocket processing backlog": "ws_backlog",
                     "Redis unavailable": "redis",
                     "dead man switch unavailable": "caa",
                 }[reason]
@@ -202,10 +206,13 @@ class IncidentManager:
                         ):
                             return self._resolve("infra:trading")
                 else:
-                    self._open_or_update(
+                    incident = self._open_or_update(
                         "infra:trading", component, component + " unavailable",
                         halt=False, risk_state=str(event.metadata.get("risk_state", "UNKNOWN")),
                     )
+                    detail = event.metadata.get("ws_details")
+                    if isinstance(detail, str) and detail:
+                        incident.ws_details[component] = detail
             return []
         if event_code(event) == "AUTO_RECOVERY_COMPLETED" and event.metadata.get("recovery"):
             if "infra:trading" in self.active:
@@ -246,8 +253,22 @@ class IncidentManager:
         )
         if incident.risk_state == "HALT":
             message += "\nNew entries: blocked"
+        code = "INCIDENT_OPEN"
+        if incident.ws_details:
+            message += "\n" + "\n".join(incident.ws_details.values())
+            if incident.components <= {"websocket", "market_data", "ws_backlog"}:
+                if "ws_backlog" in incident.components:
+                    code, title = "WS_BACKLOG", "🚨 WebSocket 消息处理积压"
+                elif "websocket" in incident.components:
+                    maintenance = "server maintenance notice 64008" in message
+                    code, title = (
+                        ("WS_SERVER_RECONNECT", "⚠️ OKX WebSocket 服务端要求重连") if maintenance
+                        else ("WS_DISCONNECTED", "🚨 WebSocket 连接中断")
+                    )
+                else:
+                    code, title = "WS_MARKET_STALE", "⚠️ 市场数据过期"
         return NotificationEvent(
-            event_code="INCIDENT_OPEN",
+            event_code=code,
             level=NotificationLevel.WARNING, category=NotificationCategory.INFRASTRUCTURE,
             title=title, message=message, priority=NotificationPriority.TIME_SENSITIVE,
             dedup_key=f"incident:{incident.id}:open",
@@ -277,7 +298,7 @@ class IncidentManager:
         incident.last_updated_at = incident.resolved_at
         end_tick = (
             incident.components_recovered_tick
-            if not incident.had_halt and incident.components_recovered_tick is not None
+            if (not incident.had_halt or (incident.ws_details and incident.components <= {"websocket", "market_data", "ws_backlog"})) and incident.components_recovered_tick is not None
             else self.clock()
         )
         incident.duration_seconds = max(0, end_tick - incident.opened_tick)
@@ -337,13 +358,21 @@ class IncidentManager:
             )
             if retrospective:
                 message = "Alert delivery was delayed; incident has ended\n" + message
+        ws_recovery_code = ""
+        if not retrospective and incident.ws_details and incident.components <= {"websocket", "market_data", "ws_backlog"}:
+            if "ws_backlog" in incident.components:
+                ws_recovery_code, title = "WS_BACKLOG_RECOVERED", "✅ WS 消息处理恢复"
+            elif "websocket" in incident.components:
+                ws_recovery_code, title = "WS_RECOVERED", "✅ WebSocket 已恢复"
+            else:
+                ws_recovery_code, title = "WS_MARKET_RECOVERED", "✅ 市场数据已恢复"
         return NotificationEvent(
-            event_code=(
+            event_code=(ws_recovery_code or (
                 "INFRASTRUCTURE_RECOVERED" if component_only
                 else "EMERGENCY_RETROSPECTIVE" if retrospective and incident.key == "risk:emergency"
                 else "SAFETY_RETROSPECTIVE" if retrospective and incident.severity == "CRITICAL"
                 else "INCIDENT_RETROSPECTIVE" if retrospective else "INCIDENT_RESOLVED"
-            ),
+            )),
             level=level, category=NotificationCategory.INFRASTRUCTURE,
             title=title, message=message, priority=priority,
             dedup_key=f"incident:{incident.id}:resolved",
@@ -373,7 +402,8 @@ class IncidentManager:
         for incident in tuple(self.active.values()):
             if incident.open_queued or incident.notified_open:
                 continue
-            if not incident.had_halt and incident.components_recovered_tick is not None:
+            ws_only = bool(incident.ws_details) and incident.components <= {"websocket", "market_data", "ws_backlog"}
+            if (not incident.had_halt or ws_only) and incident.components_recovered_tick is not None:
                 continue
             if incident.had_halt and incident.risk_state == "NORMAL":
                 continue

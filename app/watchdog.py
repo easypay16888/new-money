@@ -297,10 +297,27 @@ class WatchdogMonitor:
         if status.get("risk_state") not in ALLOWED_RISK_STATES:
             return "APP_ALIVE_BUT_UNHEALTHY", "InvalidRiskState", status
         sockets = status.get("websockets")
-        if not isinstance(sockets, list) or not sockets or not all(
-            isinstance(socket, dict) and socket.get("fresh") is True for socket in sockets
-        ):
+        if not isinstance(sockets, list) or not sockets:
             return "APP_ALIVE_BUT_UNHEALTHY", "WebSocketStale", status
+        for socket in sockets:
+            if not isinstance(socket, dict):
+                return "APP_ALIVE_BUT_UNHEALTHY", "InvalidWebSocketStatus", status
+            modern_fields = {"transport_healthy", "critical_data_fresh", "processing_healthy",
+                             "reconciliation_required"}
+            if modern_fields.intersection(socket):
+                if not modern_fields.issubset(socket):
+                    return "APP_ALIVE_BUT_UNHEALTHY", "InvalidWebSocketStatus", status
+                if socket.get("transport_healthy") is not True:
+                    return "APP_ALIVE_BUT_UNHEALTHY", "WebSocketTransportUnavailable", status
+                if socket.get("critical_data_fresh") is not True:
+                    return "APP_ALIVE_BUT_UNHEALTHY", "MarketDataStale", status
+                if socket.get("processing_healthy") is not True:
+                    return "APP_ALIVE_BUT_UNHEALTHY", "WebSocketProcessingBacklog", status
+                if socket.get("reconciliation_required") is not False:
+                    return "APP_ALIVE_BUT_UNHEALTHY", "WebSocketReconciliationPending", status
+            elif socket.get("fresh") is not True:
+                # Existing deployed status schema remains readable during upgrades.
+                return "APP_ALIVE_BUT_UNHEALTHY", "WebSocketStale", status
         return None, "", status
 
 

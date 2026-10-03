@@ -27,6 +27,8 @@ async def test_websocket_reconnects_after_disconnect():
         if connections == 1:
             await socket.close()
         else:
+            await socket.send(json.dumps({"event": "subscribe",
+                "arg": {"channel": "tickers", "instId": "BTC"}}))
             await socket.send(
                 json.dumps(
                     {"arg": {"channel": "tickers", "instId": "BTC"}, "data": [{"last": "100"}]}
@@ -60,9 +62,12 @@ def test_stale_websocket_blocks_data_freshness():
         pass
 
     settings = Settings(_env_file=None, stale_timeout_seconds=1)
-    ws = OkxWebSocket("ws://example.invalid", [], handler, settings)
+    ws = OkxWebSocket("ws://example.invalid", [{"channel": "books5", "instId": "BTC"}], handler, settings)
     ws.connected = True
-    ws.last_message_at = time.monotonic() - 2
+    ws.subscribed.add("books5:BTC")
+    ws.last_message_at = time.monotonic()
+    ws.last_data_at["books5:BTC"] = time.monotonic() - 2
+    assert ws.is_transport_healthy()
     assert not ws.is_fresh()
 
 

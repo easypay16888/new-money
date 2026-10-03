@@ -541,8 +541,16 @@ async def test_system_start_waits_for_reconciliation(tmp_path):
     runtime.dead_man_healthy = True
 
     class HealthySocket:
+        private = False
+        reconciliation_required = False
+
         def is_fresh(self) -> bool:
             return True
+
+        is_data_fresh = is_fresh
+        is_processing_healthy = is_fresh
+        def is_transport_healthy(self):
+            return getattr(self, "connected", True)
 
     runtime.sockets = [HealthySocket() for _ in range(4)]
     await runtime._publish_started_if_ready()

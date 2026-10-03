@@ -26,6 +26,9 @@ class JsonFormatter(logging.Formatter):
             "clOrdId",
             "risk_state",
             "error_code",
+            "socket_name", "exception_type", "close_code", "close_reason", "ws_reason",
+            "last_rx_age", "last_pong_age", "reconnect_count", "queue_depth",
+            "channel", "expected", "actual",
         ):
             value = getattr(record, key, None)
             payload[key] = value

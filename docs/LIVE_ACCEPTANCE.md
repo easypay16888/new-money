@@ -63,3 +63,20 @@ CI 使用独立 PostgreSQL 16 service，覆盖锁争用、释放、连接中断�
 | 10 | lease loss | 待填 | 待填 | 待填 | 待填 | 待填 | 待填 | 待填 | 待填 | 待填 | UNVERIFIED |
 
 每个场景保留脱敏日志、交易所订单/保护证据、最终对账和通知记录。验收后由操作者签名，记录是否满足预期；失败必须保持 HALT/EMERGENCY，不能通过重启、放宽硬上限或扩大自动恢复范围绕过。lease 丢失后人工确认仅一个实例，重启获取 lease、完整对账、人工 resume；EMERGENCY 和 LIVE 都不自动恢复 NORMAL。
+
+
+## WebSocket V2 补充现场验收（不得自动标记 PASS）
+
+除上述十项安全演练外，在受控 Demo 中记录以下证据：
+
+| 场景 | 预期 | 人工结论 |
+| --- | --- | --- |
+| 官方 443 四路 login/subscribe | transport healthy、关键 feed fresh、重连对账完成；保留配置和 commit 证据，不记录认证内容 | UNVERIFIED |
+| private 无订单事件至少 5 分钟 | text ping/pong 正常，不因业务静默 HALT | UNVERIFIED |
+| private 网络中断及恢复 | 立即 HALT；重新 login/subscribe、完整 orders/positions/algos 对账；通过全部健康门禁后恢复 | UNVERIFIED |
+| 只中断 books5/ticker/mark/index 数据 | transport 可健康，但对应 feed 过期、禁止新 entry；恢复须重新通过全部门禁 | UNVERIFIED |
+| 受控慢 handler / queue backlog | pong 不被异步等待卡住；积压立即 fencing；未接受事件明确记录，已接受事件按序处理，后续完整对账 | UNVERIFIED |
+| 实际 64008（若观察到） | 服务端维护日志、有序重连；不标成本地网络错误；没有观察到不能填 PASS | UNVERIFIED |
+| 有积压时安全停机 | private queue drain 超时拒绝停机，不取消正在执行的写请求；恢复处理后再次对账并安全退出 | UNVERIFIED |
+
+每项沿用 timestamp、commit、initial/final position、orders、protection、Governor、reconciliation、Bark 的证据格式。模拟协议服务器测试只证明代码行为，不能充当真实 OKX 演练证据。运行实例仍须安全升级后才生效。

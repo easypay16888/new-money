@@ -115,7 +115,7 @@ WATCHDOG_UNHEALTHY_ALERT_SECONDS=60
 WATCHDOG_BARK_GROUP=OKX Quant Watchdog
 ```
 
-本机独立运行时，把 `WATCHDOG_STATUS_URL` 改为 `http://127.0.0.1:8000/status`，然后在另一个受监督的进程中执行 `uv run python -m app.watchdog`。启动前 120 秒只检查不告警；之后连续 3 次不可达或返回错误状态才通知 App Offline。HTTP 可达但 `running=false`、未同步或 WebSocket 不新鲜属于 App Unhealthy，Bark 要在异常持续达到 `WATCHDOG_UNHEALTHY_ALERT_SECONDS` 后才推送。连续 2 次健康后，仅当先前的告警真正送达 Bark 才推送恢复。风险状态 HALT/EMERGENCY 本身不代表进程离线。Watchdog 不发送常规心跳，不参与交易安全决策。
+本机独立运行时，把 `WATCHDOG_STATUS_URL` 改为 `http://127.0.0.1:8000/status`，然后在另一个受监督的进程中执行 `uv run python -m app.watchdog`。启动前 120 秒只检查不告警；之后连续 3 次不可达或返回错误状态才通知 App Offline。HTTP 可达但 `running=false`、未同步或 WebSocket transport 不健康、关键行情过期、处理积压或重连对账未完成属于 App Unhealthy，Bark 要在异常持续达到 `WATCHDOG_UNHEALTHY_ALERT_SECONDS` 后才推送。连续 2 次健康后，仅当先前的告警真正送达 Bark 才推送恢复。风险状态 HALT/EMERGENCY 本身不代表进程离线。Watchdog 不发送常规心跳，不参与交易安全决策。
 
 Compose 对 watchdog 使用 `stop_signal: SIGINT` 和 10 秒停机宽限期，触发 Python asyncio 的正常取消流程，完成有界通知 drain 后退出。app 的安全停机仍使用自己的交易恢复与保护检查。
 
@@ -188,7 +188,7 @@ uv run python -m app.live_preflight --status-url http://127.0.0.1:18000/status -
 
 ### PAPER 模式受控自动恢复
 
-PAPER 模式默认开启自动恢复。只有 `reconciliation failed`、`WebSocket disconnected or stale`、`Redis unavailable`、`dead man switch unavailable` 属于自动恢复白名单。进入 HALT 后至少等待 30 秒，每隔 30 秒重新完整对账并检查数据库、Redis 读写、CAA、全部 WebSocket、组合风险、未确认 entry 及 Emergency 目标；连续 3 次通过后再次完整对账和检查，才允许恢复 NORMAL。任一次失败会清零计数。`/status.auto_recovery` 显示启用状态、是否符合资格、当前连续通过次数和熔断状态。
+PAPER 模式默认开启自动恢复。只有 `reconciliation failed`、`WebSocket transport unavailable`、`Market data stale`、`WebSocket processing backlog`、`Redis unavailable`、`dead man switch unavailable` 属于自动恢复白名单；旧 `WebSocket disconnected or stale` 原因仅保留兼容。协议错误、未知 handler 错误和 LIVE lease 丢失不属于白名单。进入 HALT 后至少等待 30 秒，每隔 30 秒重新完整对账并检查数据库、Redis 读写、CAA、全部 WebSocket、组合风险、未确认 entry 及 Emergency 目标；连续 3 次通过后再次完整对账和检查，才允许恢复 NORMAL。任一次失败会清零计数。`/status.auto_recovery` 显示启用状态、是否符合资格、当前连续通过次数和熔断状态。
 
 仓位或订单不一致、外部风险订单、意外条件单、保护单异常、保证金风险、人工 HALT、未知原因及认证/权限错误均须人工处理；安全性 HALT 不会被后续瞬态故障覆盖。EMERGENCY 永不自动恢复。`MODE=LIVE` 时自动恢复始终关闭，即使设置了 `AUTO_RECOVERY_ENABLED=true`。人工 `POST /system/resume` 保留完整对账与同一套健康检查，不会强制跳过安全门。
 
@@ -207,3 +207,24 @@ OKX `50013`（系统繁忙）仅在已知的 `GET` 对账接口上归为瞬态�
 LIVE 先核验账户，再非等待获取 PostgreSQL session advisory lock、原子绑定账本、恢复并对账，最后保持 HALT 等人工 resume。绑定用事务锁和数据库单行唯一约束，拒绝 Demo/未知历史及不同 UID。lease 丢失会立即禁止 entry、HALT 并发 CRITICAL；不会自动抢锁或恢复，已验证账户的 reduce-only/保护/撤单能力保留。账户级 CAA refresh 与 disable 均必须由当前 lease owner 执行；丢锁后立即停止全部 CAA 写入，不发送最后一次 refresh。dead-man 循环退出并保留 `LIVE writer lease lost`，不会误报 CAA endpoint 故障；若停机需保留普通 reduce-only exit 但无法合法停用 CAA，则停机 fail closed 并记录 `CAA disable skipped: LIVE writer lease not owned`。`/status.live_writer_lease` 只返回 required/held，PAPER 不获取 lease。Bark/watchdog 故障仍不影响安全动作。
 
 保证金下单 sizing target 默认 `MARGIN_USAGE_TARGET=0.20`，在原有 25% 硬上限内预留到止损的损失、双边费用/滑点和已有组合敞口。只向下减少合约数量，低于 minSz 不交易，不修改策略、risk_per_trade、杠杆或硬上限。公式与十项**人工**演练模板见 [LIVE 验收说明](docs/LIVE_ACCEPTANCE.md)。PostgreSQL 并发测试必须使用隔离 TEST_POSTGRES_URL；缺失会失败，不再跳过。
+
+
+## WebSocket Reliability V2
+
+默认 PAPER 使用 `wss://wspap.okx.com/ws/v5`，LIVE 使用 `wss://ws.okx.com/ws/v5`，均使用 TLS 标准 443，没有 8443 fallback。显式环境变量 URL 保持原值；升级部署前检查旧 `.env` 的 `OKX_PAPER_WS_URL` / `OKX_LIVE_WS_URL`，如仍为官方 `:8443` 地址，应由部署操作者移除端口。[OKX 端口迁移公告](https://www.okx.com/docs-v5/log_en/)规定 8443 将于 2026-10-31 停用。
+
+四路连接命名为 `public-market`、`business-candles`、`private-account`、`private-algo`。接收循环负责有界帧接收、订阅确认、text ping/pong、notice、序列验证和非阻塞入队；每路一个有序业务 worker。慢订单处理或完整对账不会卡住 recv/pong。队列不做 coalescing、不丢弃已接受的 private 事件；重连前先排空旧会话队列，避免旧消息在新快照后覆盖状态。
+
+- **Transport**：必须完成连接、private login、所有 subscription ack；10 秒无入站帧发送 text `ping`，5 秒内无 `pong` 则断线重连。其他帧不会延长已等待的 pong deadline。底层 WebSocket ping 继续提供额外保护。
+- **Data**：按 `channel:instId` 记录成功应用数据的原始到达时间，不用 pong 或其他品种的数据刷新该频道。`books5`、`tickers`、`mark-price`、`index-tickers` 必须在原有 `STALE_TIMEOUT_SECONDS=20` 内更新；K线按两倍周期加 20 秒判定。funding、OI、trades 和 private 事件流不按 20 秒业务活动判 stale。Risk Engine 的 book/tick **交易所时间戳**门禁保持不变。
+- **Processing**：每路 `WS_QUEUE_MAXSIZE=1000`，WebSocket 帧缓冲最多 16、单帧最多 1 MiB。队列溢出立即同步 HALT，原因为 `WebSocket processing backlog`；记录异常并断开，重连及完整对账后才可通过恢复门禁。handler/排队超过 20 秒也阻止开仓。若 worker 不结束，保持 HALT，不为清空队列而中断交易写请求。正常停机先有界 drain private 队列，再执行原有安全对账；超时拒绝停机并保留运行中的 handler。
+- **Reconnect**：指数退避和 jitter，重新 login/subscribe，重置心跳和序列。增量书必须从 snapshot 开始；序列断档 fail closed 并记录频道、品种、expected/actual。private 重连必须在同一连接 generation、队列已排空且完整对账安全后解除 `reconciliation_required`；连接成功本身不会恢复 Governor。
+- **Maintenance**：官方 `event=notice, code=64008` 走有序服务端维护重连，记录 INFO 结构化日志，维护重连不计入本地网络抖动告警预算；未知 notice/协议错误保持人工 HALT。参见 [OKX 维护通知说明](https://www.okx.com/docs-v5/log_en/)。
+
+`/status.websockets` 输出连接名、transport/data/processing 健康、重连对账是否待完成、rx/pong 年龄、ping RTT、队列深度/容量和过期 feed 明细；不输出 URL、认证参数或凭据。`fresh` 保留为组合健康的兼容字段，不能用于推断 private 业务活动。外部 watchdog 支持新分层状态和旧 `fresh` schema；仍只读状态，不控制交易。
+
+Bark 分别显示 **🚨 WebSocket 连接中断**、**⚠️ 市场数据过期**、**🚨 WebSocket 消息处理积压**、**⚠️ OKX WebSocket 服务端要求重连**，附 socket/feed/symbol/原因；恢复标题对应。沿用事故合并、60 秒确认延迟和可靠重试。短暂 WS 故障已恢复而 Governor 仍等待健康检查时，不误报连接仍断开；其他持久风险/基础设施故障仍按既有规则通知。降噪不延迟内部 HALT，也不提前恢复 NORMAL。
+
+新增 Prometheus：`quant_ws_queue_depth`、`quant_ws_queue_wait_seconds`、`quant_ws_handler_latency_seconds`、`quant_ws_ping_rtt_seconds`、`quant_ws_transport_disconnects_total`、`quant_ws_market_stale_events_total`。标签只有稳定 socket name，不包含品种、订单或消息。同步 CPU 阻塞仍会阻塞同一 Python event loop；本轮隔离的是异步 handler 等待，队列/延迟观测会反映处理不足。
+
+本轮代码/模拟协议测试不能代替实际 443 接入、网络中断和 OKX 维护现场验收。默认仍 PAPER、LIVE 关闭，策略、风险额度及保证金目标不变。

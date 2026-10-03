@@ -312,8 +312,16 @@ async def test_full_resume_health_gate_checks_redis_ws_caa_and_blocked_symbols(
     class Socket:
         connected = True
 
+        private = False
+        reconciliation_required = False
+
         def is_fresh(self):
             return True
+
+        is_data_fresh = is_fresh
+        is_processing_healthy = is_fresh
+        def is_transport_healthy(self):
+            return self.connected
 
     runtime.redis = RedisProbe()
     runtime.sockets = [Socket()]
@@ -357,8 +365,15 @@ async def test_auto_recovery_requires_recent_caa_refresh(recovery_runtime):
     class FreshSocket:
         connected = True
 
+        private = False
+        reconciliation_required = False
+
         def is_fresh(self):
             return True
+
+        is_data_fresh = is_fresh
+        is_processing_healthy = is_fresh
+        is_transport_healthy = is_fresh
 
     del runtime._resume_health
     runtime.running = True
@@ -410,8 +425,15 @@ async def test_reconciliation_endpoint_transient_fault_then_auto_recovers(
     class FreshSocket:
         connected = True
 
+        private = False
+        reconciliation_required = False
+
         def is_fresh(self):
             return True
+
+        is_data_fresh = is_fresh
+        is_processing_healthy = is_fresh
+        is_transport_healthy = is_fresh
 
     class Exchange:
         failed = False

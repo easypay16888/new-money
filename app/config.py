@@ -24,8 +24,8 @@ class Settings(BaseSettings):
     okx_secret_key: str = ""
     okx_passphrase: str = ""
     okx_rest_url: str = "https://openapi.okx.com"
-    okx_paper_ws_url: str = "wss://wspap.okx.com:8443/ws/v5"
-    okx_live_ws_url: str = "wss://ws.okx.com:8443/ws/v5"
+    okx_paper_ws_url: str = "wss://wspap.okx.com/ws/v5"
+    okx_live_ws_url: str = "wss://ws.okx.com/ws/v5"
     database_url: str = "sqlite+aiosqlite:///./data/trading.db"
     live_lease_database_url: SecretStr = SecretStr("")
     redis_url: str = "redis://localhost:6379/0"
@@ -49,6 +49,9 @@ class Settings(BaseSettings):
     entry_cancel_confirm_seconds: float = Field(default=15, gt=0)
     protection_confirm_seconds: float = Field(default=10, gt=0)
     ws_backoff_max_seconds: float = Field(default=30, gt=0)
+    ws_idle_ping_seconds: float = Field(default=10, gt=0, lt=30)
+    ws_pong_timeout_seconds: float = Field(default=5, gt=0, le=10)
+    ws_queue_maxsize: int = Field(default=1000, ge=1, le=10000)
     cancel_all_after_seconds: int = Field(default=60, ge=10, le=120)
     cancel_all_after_refresh_seconds: int = Field(default=20, ge=1)
     min_signal_confidence: float = Field(default=0.65, ge=0, le=1)
