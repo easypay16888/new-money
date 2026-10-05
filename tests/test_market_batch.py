@@ -9,6 +9,7 @@ from app.models import utcnow
 from app.okx import OkxWebSocket
 from app.runtime import TradingRuntime
 from app.storage import Store
+from tests.test_live_lease import postgres_store as postgres_store
 from tests.test_ws_reliability import BTC, noop, ready_socket
 
 
@@ -16,12 +17,16 @@ async def test_market_batch_retains_all_rows_order_and_references_with_one_commi
     store = Store(f"sqlite+aiosqlite:///{tmp_path}/batch.db")
     await store.initialize()
     commits = []
+    inserts = []
     event.listen(store.engine.sync_engine, "commit", lambda _: commits.append(True))
+    event.listen(store.engine.sync_engine, "before_cursor_execute", lambda c, cursor, sql,
+                 params, context, many: inserts.append(many) if sql.startswith("INSERT") else None)
     try:
         async with store.market_batch():
             for n in range(64):
                 await store.append("market_trades", {"n": n}, symbol=BTC, reference_id=str(n))
         assert len(commits) == 1
+        assert inserts == [True]  # Actual executemany, not 64 ORM INSERT round trips.
         assert await store.latest("market_trades") == [{"n": n} for n in reversed(range(64))]
         async with store.sessions() as session:
             from sqlalchemy import text
@@ -31,6 +36,16 @@ async def test_market_batch_retains_all_rows_order_and_references_with_one_commi
         assert rows == [str(n) for n in range(64)]
     finally:
         await store.close()
+
+
+async def test_postgres_market_bulk_preserves_all_payloads_and_order(postgres_store):
+    async with postgres_store.market_batch():
+        for n in range(64):
+            await postgres_store.append("market_trades", {"n": n}, reference_id=str(n))
+            await postgres_store.append("market_derivatives", {"n": n})
+    expected = [{"n": n} for n in reversed(range(64))]
+    assert await postgres_store.latest("market_trades") == expected
+    assert await postgres_store.latest("market_derivatives") == expected
 
 
 @pytest.mark.parametrize("table", ["orders", "fills", "emergency_targets", "market_candles"])
