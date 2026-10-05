@@ -596,6 +596,10 @@ class OkxWebSocket:
 
     async def _receive(self, ws: Any) -> None:
         wanted = {self.feed_key(arg) for arg in self.subscriptions}
+        # OKX may push the initial snapshot before its subscribe acknowledgement.
+        # Buffer requested feeds until every acknowledgement arrives; neither
+        # transport readiness nor applied-data freshness is granted early.
+        awaiting_ack: list[tuple[dict[str, Any], float]] = []
         ready_announced = False
         while True:
             now = self.clock()
@@ -652,24 +656,35 @@ class OkxWebSocket:
                     raise WebSocketFault("invalid subscription acknowledgement", kind="protocol")
                 self.subscribed.add(key)
             if not ready_announced and wanted <= self.subscribed:
+                for buffered, arrival in awaiting_ack:
+                    self._enqueue_message(buffered, arrival)
+                awaiting_ack.clear()
                 ready_announced = True
                 if self.on_ready is not None:
                     self.on_ready(self)
             if "data" not in message:
                 continue
             key = self.feed_key(message.get("arg", {}))
-            if key not in wanted or key not in self.subscribed:
+            if key not in wanted:
                 raise WebSocketFault("unacknowledged subscription data", kind="protocol")
             self._check_sequence(message)
-            try:
-                self.queue.put_nowait((message, self.last_rx_at))
-                self._queued_at.append(self.last_rx_at)
-                self._queue_metric()
-            except asyncio.QueueFull:
-                # This frame isn't accepted: fence immediately, log and reconnect.
-                # REST reconciliation recovers private events missed during the gap.
-                self._fault("processing queue full", kind="backlog")
-                raise WebSocketFault("processing queue full", kind="backlog") from None
+            if not ready_announced:
+                if len(awaiting_ack) + self.queue.qsize() >= self.queue.maxsize:
+                    self._fault("processing queue full", kind="backlog")
+                    raise WebSocketFault("processing queue full", kind="backlog")
+                awaiting_ack.append((message, received_at))
+            else:
+                self._enqueue_message(message, received_at)
+
+    def _enqueue_message(self, message: dict[str, Any], received_at: float) -> None:
+        try:
+            self.queue.put_nowait((message, received_at))
+            self._queued_at.append(received_at)
+            self._queue_metric()
+        except asyncio.QueueFull:
+            # Reject the frame and require reconciliation, never silently drop it.
+            self._fault("processing queue full", kind="backlog")
+            raise WebSocketFault("processing queue full", kind="backlog") from None
 
     async def _business_worker(self) -> None:
         while True:

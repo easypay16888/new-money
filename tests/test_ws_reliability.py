@@ -249,6 +249,82 @@ async def test_subscription_timeout_is_bounded_even_with_regular_pong():
         await ws._receive(Wire(["pong"]))
 
 
+@pytest.mark.parametrize("private,channel", [(False, "candle1m"), (True, "orders")])
+async def test_requested_snapshot_before_ack_is_buffered_without_early_health(private, channel):
+    ws, now = ready_socket(private=private, channels=(channel,))
+    ws.subscribed.clear()
+    message = dict(arg=ws.subscriptions[0], data=[dict(n=1)])
+    wire = Wire([message])
+    task = asyncio.create_task(ws._receive(wire))
+    try:
+        await wait_until(lambda: wire.messages.empty())
+        assert ws.queue.empty() and not ws.last_data_at
+        assert not ws.is_transport_healthy()
+        now[0] += 1
+        wire.messages.put_nowait(json.dumps(dict(event="subscribe", arg=ws.subscriptions[0])))
+        await wait_until(lambda: ws.queue.qsize() == 1)
+        queued, arrival = ws.queue.get_nowait()
+        assert queued == message and arrival == 100.0
+        assert ws.is_transport_healthy()
+        assert not ws.last_data_at  # The business handler must still apply the frame.
+        ws.queue.task_done()
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_pre_ack_buffer_preserves_interleaved_subscription_order():
+    ws, _ = ready_socket(channels=("candle1m", "candle15m"))
+    ws.subscribed.clear()
+    wire = Wire([
+        dict(arg=ws.subscriptions[1], data=[dict(n=1)]),
+        dict(event="subscribe", arg=ws.subscriptions[0]),
+        dict(arg=ws.subscriptions[0], data=[dict(n=2)]),
+        dict(event="subscribe", arg=ws.subscriptions[1]),
+        dict(arg=ws.subscriptions[1], data=[dict(n=3)]),
+    ])
+    task = asyncio.create_task(ws._receive(wire))
+    try:
+        await wait_until(lambda: ws.queue.qsize() == 3)
+        assert [ws.queue.get_nowait()[0]["data"][0]["n"] for _ in range(3)] == [1, 2, 3]
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_pre_ack_data_does_not_bypass_ack_timeout():
+    ws, now = ready_socket(channels=("candle1m",))
+    ws.subscribed.clear()
+    wire = Wire([dict(arg=ws.subscriptions[0], data=[dict(n=1)])])
+    task = asyncio.create_task(ws._receive(wire))
+    await wait_until(lambda: wire.messages.empty())
+    now[0] += ws.settings.request_timeout_seconds + 1
+    wire.messages.put_nowait("pong")
+    with pytest.raises(WebSocketFault, match="acknowledgement timeout"):
+        await asyncio.wait_for(task, 2)
+    assert ws.queue.empty() and not ws.last_data_at and not ws.is_transport_healthy()
+
+
+async def test_pre_ack_buffer_overflow_fails_closed():
+    ws, _ = ready_socket(private=True, channels=("orders",), ws_queue_maxsize=1)
+    ws.subscribed.clear()
+    faults = []
+    ws.on_fault = lambda _, reason: faults.append(reason)
+    wire = Wire([dict(arg=ws.subscriptions[0], data=[dict(n=n)]) for n in (1, 2)])
+    with pytest.raises(WebSocketFault, match="queue full"):
+        await ws._receive(wire)
+    assert faults == ["WebSocket processing backlog"]
+    assert not ws.is_processing_healthy() and ws.queue.empty()
+
+
+async def test_unsolicited_pre_ack_data_is_still_rejected():
+    ws, _ = ready_socket(channels=("candle1m",))
+    ws.subscribed.clear()
+    with pytest.raises(WebSocketFault, match="unacknowledged subscription data"):
+        await ws._receive(Wire([dict(arg=dict(channel="orders", instId=BTC), data=[{}])]))
+    assert ws.queue.empty() and not ws.subscribed
+
+
 async def test_slow_private_reconcile_does_not_block_transport_pong(tmp_path):
     runtime = TradingRuntime(
         Settings(_env_file=None, database_url=f"sqlite+aiosqlite:///{tmp_path}/slow.db")
