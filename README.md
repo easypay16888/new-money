@@ -217,6 +217,7 @@ LIVE 先核验账户，再非等待获取 PostgreSQL session advisory lock、原
 
 - **Transport**：必须完成连接、private login、所有 subscription ack；10 秒无入站帧发送 text `ping`，5 秒内无 `pong` 则断线重连。其他帧不会延长已等待的 pong deadline。底层 WebSocket ping 继续提供额外保护。
 - **初始数据与订阅确认竞态**：OKX 可以先返回已请求频道的初始数据，再返回 subscribe ack。这些数据与业务队列共用容量预算，暂存至所有 ack 完成后按接收顺序处理；保留原始接收时间，不提前授予 transport health 或数据 freshness。未请求频道、ack 超时或缓冲溢出仍 fail closed。
+- **公开市场写入吞吐**：公开市场 worker 每轮最多处理已排队的 64 帧，在一个任务内专用事务中提交市场记录，保留全部帧、记录及顺序，不等待凑批、不丢弃 trades、不合并快照。事务提交成功后才更新应用数据 freshness；失败继续 HALT。private 事件、K 线决策及所有交易安全写入不参与批处理。服务器 Demo SQLite 可在安全停机后使用 WAL，保持 `synchronous=FULL`；备份应使用 SQLite backup API。
 - **Data**：按 `channel:instId` 记录成功应用数据的原始到达时间，不用 pong 或其他品种的数据刷新该频道。`books5`、`tickers`、`mark-price`、`index-tickers` 必须在原有 `STALE_TIMEOUT_SECONDS=20` 内更新；K线按两倍周期加 20 秒判定。funding、OI、trades 和 private 事件流不按 20 秒业务活动判 stale。Risk Engine 的 book/tick **交易所时间戳**门禁保持不变。
 - **Processing**：每路 `WS_QUEUE_MAXSIZE=1000`，WebSocket 帧缓冲最多 16、单帧最多 1 MiB。队列溢出立即同步 HALT，原因为 `WebSocket processing backlog`；记录异常并断开，重连及完整对账后才可通过恢复门禁。handler/排队超过 20 秒也阻止开仓。若 worker 不结束，保持 HALT，不为清空队列而中断交易写请求。正常停机先有界 drain private 队列，再执行原有安全对账；超时拒绝停机并保留运行中的 handler。
 - **Reconnect**：指数退避和 jitter，重新 login/subscribe，重置心跳和序列。增量书必须从 snapshot 开始；序列断档 fail closed 并记录频道、品种、expected/actual。private 重连必须在同一连接 generation、队列已排空且完整对账安全后解除 `reconciliation_required`；连接成功本身不会恢复 Governor。

@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from datetime import UTC, datetime
 from decimal import Decimal
 from hashlib import sha256
@@ -8,7 +11,12 @@ from typing import Any
 
 from sqlalchemy import JSON, DateTime, Integer, Numeric, String, cast, func, or_, select, text
 from sqlalchemy.engine.url import make_url
-from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import (
+    AsyncEngine,
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -68,7 +76,23 @@ class Store:
             Path(database).parent.mkdir(parents=True, exist_ok=True)
         self.engine: AsyncEngine = create_async_engine(url, pool_pre_ping=True, hide_parameters=True)
         self.sessions = async_sessionmaker(self.engine, expire_on_commit=False)
+        self._market_session: ContextVar[AsyncSession | None] = ContextVar(
+            "market_batch_session", default=None
+        )
         self.healthy = False
+
+    @asynccontextmanager
+    async def market_batch(self) -> AsyncIterator[None]:
+        """Group only market records in one durable, task-local transaction."""
+        if self._market_session.get() is not None:
+            raise RuntimeError("nested market batch")
+        async with self.sessions.begin() as session:
+            token = self._market_session.set(session)
+            try:
+                yield
+            finally:
+                self._market_session.reset(token)
+        self.healthy = True
 
     async def initialize(self) -> None:
         async with self.engine.begin() as connection:
@@ -91,6 +115,14 @@ class Store:
     ) -> None:
         if table not in ROW_TYPES:
             raise ValueError(f"unknown table: {table}")
+        market_session = self._market_session.get()
+        if market_session is not None:
+            if table not in {"market_trades", "market_derivatives", "market_orderbook_snapshots"}:
+                raise ValueError("non-market record forbidden in market batch")
+            market_session.add(
+                ROW_TYPES[table](symbol=symbol, reference_id=reference_id, payload=payload)
+            )
+            return
         async with self.sessions.begin() as session:
             session.add(ROW_TYPES[table](symbol=symbol, reference_id=reference_id, payload=payload))
         self.healthy = True

@@ -1101,6 +1101,7 @@ class TradingRuntime:
                 self._on_market,
                 self.settings, name="public-market", metrics=self.metrics,
                 on_fault=self._on_ws_fault, on_ready=self._on_ws_ready,
+                batch_handler=self._on_public_market_batch,
             ),
             OkxWebSocket(
                 base + "/business",
@@ -1434,6 +1435,13 @@ class TradingRuntime:
                     "socket_name": ws.name, "exception_type": type(exc).__name__,
                 })
         self._ws_safety_tasks[ws.name] = asyncio.create_task(recover(), name=f"{ws.name}-recovery")
+
+    async def _on_public_market_batch(self, messages: list[dict[str, Any]]) -> None:
+        # This callback is used only by public market subscriptions, never by
+        # candles/decisions, orders, protection, emergency or reconciliation.
+        async with self.store.market_batch():
+            for message in messages:
+                await self.market.handle(message)
 
     async def _on_market(self, message: dict[str, Any]) -> None:
         try:

@@ -416,6 +416,7 @@ class OkxRestClient:
 
 
 MessageHandler = Callable[[dict[str, Any]], Awaitable[None]]
+BatchMessageHandler = Callable[[list[dict[str, Any]]], Awaitable[None]]
 
 
 class WebSocketFault(OkxError):
@@ -436,11 +437,20 @@ class OkxWebSocket:
         on_fault: Callable[[OkxWebSocket, str], None] | None = None,
         on_ready: Callable[[OkxWebSocket], None] | None = None,
         clock: Callable[[], float] = time.monotonic,
+        batch_handler: BatchMessageHandler | None = None,
     ) -> None:
         self.url = url
         self.name = name
         self.subscriptions = subscriptions
         self.handler = handler
+        if batch_handler is not None and (private or any(
+            arg.get("channel") not in {
+                "tickers", "trades", "books5", "mark-price", "index-tickers",
+                "funding-rate", "open-interest",
+            } for arg in subscriptions
+        )):
+            raise ValueError("batch handler only supports public market subscriptions")
+        self.batch_handler = batch_handler
         self.settings = settings
         self.private = private
         self.metrics = metrics
@@ -689,8 +699,15 @@ class OkxWebSocket:
     async def _business_worker(self) -> None:
         while True:
             message, received_at = await self.queue.get()
-            if self._queued_at:
-                self._queued_at.popleft()
+            batch = [(message, received_at)]
+            if self.batch_handler is not None:
+                # Consume only already queued frames, never wait to build a batch.
+                # Private/candle handlers keep their original per-event semantics.
+                while len(batch) < 64 and not self.queue.empty():
+                    batch.append(self.queue.get_nowait())
+            for _ in batch:
+                if self._queued_at:
+                    self._queued_at.popleft()
             self._queue_metric()
             self._handler_started_at = self.clock()
             if self.metrics is not None:
@@ -698,11 +715,15 @@ class OkxWebSocket:
                     max(0, self.clock() - received_at)
                 )
             try:
-                await self.handler(message)
+                if self.batch_handler is None:
+                    await self.handler(message)
+                else:
+                    await self.batch_handler([item for item, _ in batch])
                 # Freshness credits only successfully applied data, using arrival time
                 # rather than completion time (a slow handler cannot make old data fresh).
-                if message.get("data"):
-                    self.last_data_at[self.feed_key(message.get("arg", {}))] = received_at
+                for item, arrival in batch:
+                    if item.get("data"):
+                        self.last_data_at[self.feed_key(item.get("arg", {}))] = arrival
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -718,7 +739,8 @@ class OkxWebSocket:
                         max(0, self.clock() - self._handler_started_at)
                     )
                 self._handler_started_at = None
-                self.queue.task_done()
+                for _ in batch:
+                    self.queue.task_done()
 
     def _queue_metric(self) -> None:
         if self.metrics is not None:
