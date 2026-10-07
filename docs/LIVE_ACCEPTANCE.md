@@ -80,3 +80,19 @@ CI 使用独立 PostgreSQL 16 service，覆盖锁争用、释放、连接中断�
 | 有积压时安全停机 | private queue drain 超时拒绝停机，不取消正在执行的写请求；恢复处理后再次对账并安全退出 | UNVERIFIED |
 
 每项沿用 timestamp、commit、initial/final position、orders、protection、Governor、reconciliation、Bark 的证据格式。模拟协议服务器测试只证明代码行为，不能充当真实 OKX 演练证据。运行实例仍须安全升级后才生效。
+
+## Ledger Repair V1 补充现场验收
+
+仍仅在受控 OKX Demo 中执行，LIVE 关闭。升级前安全停机并使用数据库原生 backup API 保留审计账本；不得清空、删除或修改旧订单/成交来消除差异。唯一 fills reference 索引若发现既有冲突，应停止启动并人工审计，不能删除冲突行。
+
+| 场景 | 必须观察的证据 | 人工结论 |
+| --- | --- | --- |
+| 10/6 型保护单平仓事件漏记，交易所空仓 | 已知 entry / algo 身份；官方 algo detail 的 spawned order；exit fills；追加记录；审计仓位归零；完整 reconciliation；仍 HALT/EMERGENCY；Bark | UNVERIFIED |
+| 同一补录再次执行 / 崩溃后重启 | tradeId 不重复；原记录不变；事务全有或全无；人工恢复标记保留；不能自动 NORMAL | UNVERIFIED |
+| 多笔 partial exit / 部分成交已存在 | 每个 tradeId 一条；只补缺失；聚合 accFillSz 正确；费用/PnL 原样保留 | UNVERIFIED |
+| 外部成交 / malformed / 历史缺失 / 冲突 | 不猜测归属，不修改账本，保持 HALT/EMERGENCY；安全报告注明失败原因 | UNVERIFIED |
+| LIVE 身份/lease 校验（独立测试环境） | 无有效身份或 lease 无补录；不抢锁、不改变 Emergency/CAA 写门禁 | UNVERIFIED |
+
+每项记录 timestamp、commit SHA、initial/final position、orders、protective algos、官方 fill/order/algo 证据、补录前后计数、Governor、完整 reconciliation、Bark 结果。不得记录 UID、凭据、完整数据库 URL 或 API token。真实 10/6 事故的只读证据证明出口可精确关联已知保护 algo；单独查询证据不等于已完成现场修复验收。
+
+成功补录仍要求显式人工 resume。身份、lease、WS、Redis、CAA、portfolio limits 或完整对账任一不满足，拒绝 resume。V1 没有通用手工归属注入接口。回滚代码也必须保留新增恢复记录和 manual hold，禁止用旧版本启动后自动恢复交易；若旧版本不理解 hold，保持进程停止直至人工安全处理。

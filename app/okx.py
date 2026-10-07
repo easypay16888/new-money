@@ -322,6 +322,76 @@ class OkxRestClient:
             "GET", "/api/v5/trade/orders-pending", params={"instType": "SWAP"}, private=True
         )
 
+    async def fills(
+        self, symbol: str | None = None, *, after: str = "", before: str = "", limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        return await self._fills_page("fills", symbol, after=after, before=before, limit=limit)
+
+    async def fills_history(
+        self, symbol: str | None = None, *, after: str = "", before: str = "", limit: int = 100,
+        begin: int | None = None, end: int | None = None,
+    ) -> list[dict[str, Any]]:
+        return await self._fills_page(
+            "fills-history", symbol, after=after, before=before, limit=limit, begin=begin, end=end,
+        )
+
+    async def _fills_page(
+        self, endpoint: str, symbol: str | None, *, after: str, before: str, limit: int,
+        begin: int | None = None, end: int | None = None,
+    ) -> list[dict[str, Any]]:
+        if not 1 <= limit <= 100:
+            raise ValueError("invalid fill page limit")
+        params = {"instType": "SWAP", "limit": str(limit)}
+        for key, value in (("instId", symbol), ("after", after), ("before", before)):
+            if value:
+                params[key] = value
+        for key, timestamp in (("begin", begin), ("end", end)):
+            if timestamp is not None:
+                params[key] = str(timestamp)
+        return await self.request("GET", "/api/v5/trade/" + endpoint, params=params, private=True)
+
+    async def fills_history_window(
+        self, symbol: str, *, history_start_ms: int, history_end_ms: int,
+        max_pages: int = 50, max_records: int = 5000, page_size: int = 100,
+    ) -> list[dict[str, Any]]:
+        # OKX paginates by billId, NOT tradeId. begin/end filter the record timestamp ts.
+        if not (
+            symbol and 0 < history_start_ms <= history_end_ms
+            and 1 <= max_pages <= 100 and 1 <= max_records <= 10000
+            and 1 <= page_size <= 100
+        ):
+            raise OkxError("ledger repair evidence incomplete")
+        records: list[dict[str, Any]] = []
+        cursor = ""
+        cursors: set[str] = set()
+        for _ in range(max_pages):
+            page = await self.fills_history(
+                symbol, after=cursor, limit=page_size, begin=history_start_ms, end=history_end_ms,
+            )
+            if len(page) > page_size or len(records) + len(page) > max_records:
+                raise OkxError("ledger repair evidence incomplete")
+            records.extend(page)
+            if len(page) < page_size:
+                return records
+            cursor = str(page[-1].get("billId") or "")
+            if not cursor or cursor in cursors:
+                raise OkxError("ledger repair evidence incomplete")
+            cursors.add(cursor)
+        raise OkxError("ledger repair evidence incomplete")
+
+    async def order_by_id(self, symbol: str, order_id: str) -> list[dict[str, Any]]:
+        return await self.request(
+            "GET", "/api/v5/trade/order", params={"instId": symbol, "ordId": order_id}, private=True,
+        )
+
+    async def algo_order(self, client_algo_id: str) -> list[dict[str, Any]]:
+        return await self.request(
+            "GET", "/api/v5/trade/order-algo", params={"algoClOrdId": client_algo_id}, private=True,
+        )
+
+    def live_identity_verified(self) -> bool:
+        return self._verified_live_identity == self._live_identity()
+
     async def pending_algos(self) -> list[dict[str, Any]]:
         conditional = await self.request(
             "GET",

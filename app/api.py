@@ -73,6 +73,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "risk_state": runtime.governor.state,
             "reason": runtime.governor.reason,
             "synchronized": runtime.portfolio.synchronized,
+            "ledger_repair": {
+                "manual_resume_required": (
+                    runtime._ledger_repair_manual_hold or runtime._ledger_repair_attempted
+                ),
+                "last_attempt": (
+                    runtime.ledger_repair_result.report() if runtime.ledger_repair_result else None
+                ),
+            },
             "live_writer_lease": {
                 "required": settings.mode == Mode.LIVE,
                 "held": runtime.live_lease is not None and runtime.live_lease.held,

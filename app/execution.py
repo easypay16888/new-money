@@ -20,6 +20,7 @@ class OrderManager:
         self.store = store
         self.orders: dict[str, dict] = {}
         self.seen_trade_ids: set[str] = set()
+        self.ledger_lock = asyncio.Lock()
 
     async def create(self, request: ExecutionRequest) -> None:
         if request.client_order_id in self.orders:
@@ -95,6 +96,10 @@ class OrderManager:
         )
 
     async def ingest(self, event: dict) -> None:
+        async with self.ledger_lock:
+            await self._ingest(event)
+
+    async def _ingest(self, event: dict) -> None:
         client_id = str(event.get("clOrdId", ""))
         if client_id not in self.orders:
             algo_id = event.get("algoClOrdId") or event.get("attachAlgoClOrdId")

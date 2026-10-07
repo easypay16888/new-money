@@ -119,6 +119,10 @@ class Store:
                 "CREATE UNIQUE INDEX IF NOT EXISTS account_bindings_singleton "
                 "ON account_bindings ((1))"
             ))
+            await connection.execute(text(
+                "CREATE UNIQUE INDEX IF NOT EXISTS fills_reference_unique "
+                "ON fills (reference_id) WHERE reference_id IS NOT NULL"
+            ))
         self.healthy = True
 
     async def append(
@@ -239,6 +243,70 @@ class Store:
                 )
             ).all()
         return [row.payload for row in rows]
+
+    async def ledger_snapshot(self, table: str, symbols: set[str]) -> list[dict[str, Any]]:
+        if table not in {"orders", "order_events", "fills"}:
+            raise ValueError("invalid ledger table")
+        row_type = ROW_TYPES[table]
+        async with self.sessions() as session:
+            rows = (await session.scalars(select(row_type).where(
+                row_type.symbol.in_(symbols)
+            ).order_by(row_type.id).limit(100001))).all()
+        if len(rows) > 100000:
+            raise ValueError("ledger repair evidence incomplete")
+        return [row.payload for row in rows]
+
+    async def append_ledger_recovery(
+        self, records: list[tuple[str, dict[str, Any], str]],
+        snapshots: dict[str, list[dict[str, Any]]], symbols: set[str],
+    ) -> None:
+        """Append a proven recovery atomically; concurrent ledger changes abort the plan."""
+        async with self.sessions.begin() as session:
+            if self.engine.dialect.name == "postgresql":
+                await session.execute(text("SET LOCAL lock_timeout = '5s'"))
+                await session.execute(text("SET LOCAL statement_timeout = '15s'"))
+                await session.execute(text(
+                    "LOCK TABLE orders, order_events, fills IN SHARE ROW EXCLUSIVE MODE"
+                ))
+            elif self.engine.dialect.name == "sqlite":
+                await session.execute(text("BEGIN IMMEDIATE"))
+            else:
+                raise ValueError("ledger repair evidence incomplete")
+            for table, expected in snapshots.items():
+                row_type = ROW_TYPES[table]
+                actual = (await session.scalars(select(row_type).where(
+                    row_type.symbol.in_(symbols)
+                ).order_by(row_type.id).limit(100001))).all()
+                if [row.payload for row in actual] != expected:
+                    raise ValueError("ledger changed during repair; retry with fresh evidence")
+            for table, payload, reference in records:
+                if table not in {"orders", "order_events", "fills", "system_events"}:
+                    raise ValueError("invalid recovery record")
+                if table == "system_events" and payload.get("event") != "ledger_repair_manual_hold":
+                    raise ValueError("invalid recovery audit")
+                timestamp = datetime.now(UTC)
+                if table == "fills":
+                    # Reports use event timestamp: account for the fill on its actual trade day.
+                    timestamp = datetime.fromtimestamp(int(payload["fillTime"]) / 1000, UTC)
+                    existing = await session.scalar(select(ROW_TYPES["fills"].id).where(or_(
+                        ROW_TYPES["fills"].reference_id == reference,
+                        ROW_TYPES["fills"].payload["tradeId"].as_string() == reference,
+                    )).limit(1))
+                    if existing is not None:
+                        raise ValueError("ledger fill conflict")
+                session.add(ROW_TYPES[table](symbol=payload.get("symbol") or payload.get("instId"),
+                    reference_id=reference, payload=payload, timestamp=timestamp))
+        self.healthy = True
+
+    async def ledger_repair_hold(self) -> dict[str, Any] | None:
+        table = ROW_TYPES["system_events"]
+        async with self.sessions() as session:
+            row = await session.scalar(select(table).where(
+                table.payload["event"].as_string().in_(
+                    ["ledger_repair_manual_hold", "ledger_repair_manual_release"]
+                )
+            ).order_by(table.id.desc()).limit(1))
+        return row.payload if row and row.payload["event"] == "ledger_repair_manual_hold" else None
 
     async def latest_per_symbol(self, table: str) -> list[dict[str, Any]]:
         if table not in ROW_TYPES:

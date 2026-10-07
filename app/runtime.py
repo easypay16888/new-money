@@ -18,6 +18,7 @@ from app.decision import DecisionPipeline
 from app.execution import ExecutionEngine, OrderManager
 from app.features import compute_features
 from app.incidents import IncidentManager
+from app.ledger_repair import LedgerRepairResult, LedgerRepairService
 from app.live_lease import LiveLeaseError, LiveRuntimeLease
 from app.market import MarketDataEngine
 from app.models import (
@@ -109,6 +110,10 @@ class TradingRuntime:
         self._reconciliation_completed_at: float | None = None
         self._last_reconcile_safe = False
         self._reconcile_lock = asyncio.Lock()
+        self._ledger_repair_active = False
+        self._ledger_repair_attempted = False
+        self._ledger_repair_manual_hold = False
+        self.ledger_repair_result: LedgerRepairResult | None = None
         self.strategies = build_strategies(settings)
         self.decision_pipeline = DecisionPipeline(settings, self.strategies)
         self.metrics = Metrics()
@@ -408,6 +413,11 @@ class TradingRuntime:
         await self.order_manager.restore()
         await self.algo_manager.restore()
         await self.emergency.restore()
+        hold = await self.store.ledger_repair_hold()
+        if hold:
+            self._ledger_repair_manual_hold = True
+            await self.enter_halt("ledger repaired; manual resume required",
+                                  emergency=bool(hold.get("emergency")))
         if self.emergency.targets:
             await self.enter_halt("emergency recovery pending", emergency=True)
         if self.redis is not None:
@@ -785,6 +795,7 @@ class TradingRuntime:
                 expected_positions = {k: v for k, v in self._audited_positions().items() if v != 0}
                 if expected_positions != remote_positions:
                     await self.enter_halt("startup position mismatch")
+                    await self._repair_position_ledger("startup position mismatch", remote_positions)
                     return
             if not self.portfolio.synchronized and not remote_positions and derivatives_mode_eligible:
                 for symbol in self.settings.symbols:
@@ -809,6 +820,7 @@ class TradingRuntime:
                             "remote": {k: str(v) for k, v in remote_positions.items()},
                         },
                     )
+                    await self._repair_position_ledger("position mismatch", remote_positions)
                     return
             remote_algo_ids = {algo.get("algoClOrdId") for algo in algos}
             known_algos = {
@@ -937,6 +949,60 @@ class TradingRuntime:
         except Exception as exc:
             await self.enter_halt("reconciliation permanent failure")
             logger.error("reconciliation failure error_type=%s", type(exc).__name__)
+
+    async def _repair_position_ledger(
+        self, reason: str, remote_positions: dict[str, Decimal],
+    ) -> None:
+        # Already HALTed by the caller. Never retry indefinitely during the same incident.
+        if self._ledger_repair_active or self._ledger_repair_attempted:
+            return
+        local = {k: v for k, v in self._audited_positions().items() if v}
+        symbols = {s for s in set(local) | set(remote_positions)
+                   if local.get(s, Decimal(0)) != remote_positions.get(s, Decimal(0))}
+        if not symbols:
+            return  # A portfolio snapshot discrepancy is not evidence of a missing ledger fill.
+        self._ledger_repair_attempted = True
+        self._auto_recovery_forbidden = True
+        self._ledger_repair_active = True
+        try:
+            service = LedgerRepairService(self.client, self.order_manager, self.store)
+            result = await service.repair(
+                symbols, emergency=self.governor.state == GovernorState.EMERGENCY,
+            )
+            self._ledger_repair_manual_hold = bool(await self.store.ledger_repair_hold())
+            self.ledger_repair_result = result
+            if result.evidence_complete:
+                # Re-fetch account, positions, pending orders and algos; run all existing safety gates.
+                self.portfolio.synchronized = False
+                await self._reconcile_impl()
+                audited = {k: v for k, v in self._audited_positions().items() if v}
+                result.repaired = bool(
+                    self.reconciliation_healthy and self._last_reconcile_safe
+                    and self.portfolio.synchronized and audited == self.portfolio.positions
+                    and not self.emergency.targets and not self.order_manager.pending_entries()
+                )
+                if not result.repaired:
+                    result.reason = "ledger repair full reconciliation incomplete"
+                    result.unresolved.append(result.reason)
+            await self.enter_halt(
+                "ledger repaired; manual resume required" if result.repaired
+                else result.reason or "ledger repair evidence incomplete"
+            )
+            await self.store.append("system_events", {
+                "event": "ledger_repair_result", "trigger": reason, **result.report(),
+            })
+            title = "⚠️ 账本已从 OKX 成交记录修复" if result.repaired else "🚨 账本自动修复失败"
+            await self.alert(
+                "WARNING" if result.repaired else "ERROR", title,
+                (f"Symbols: {', '.join(sorted(symbols))}\n"
+                         f"Recovered fills: {result.fills_added}\n"
+                         f"Reason: {result.reason or 'full reconciliation verified'}\n"
+                         "New entries: blocked\nManual resume required"),
+                category=NotificationCategory.RISK, priority=NotificationPriority.TIME_SENSITIVE,
+                dedup_key="ledger-repair-result",
+            )
+        finally:
+            self._ledger_repair_active = False
 
     def _unprotected_startup_partials(
         self,
@@ -1864,11 +1930,17 @@ class TradingRuntime:
 
     async def resume(self) -> bool:
         healthy, _ = await self._reconcile_and_assess()
+        if self._ledger_repair_manual_hold:
+            if not healthy or not self.portfolio.synchronized:
+                return False
+            await self.store.append("system_events", {"event": "ledger_repair_manual_release"})
+            self._ledger_repair_manual_hold = False
         if not self.governor.resume(
             synchronized=self.portfolio.synchronized, healthy=healthy
         ):
             return False
         self._auto_recovery_forbidden = False
+        self._ledger_repair_attempted = False
         self._auto_recovery_circuit_breaker = False
         self._auto_recovery_reason = None
         self._auto_recovery_successes = 0

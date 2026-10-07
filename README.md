@@ -230,3 +230,21 @@ Bark 分别显示 **🚨 WebSocket 连接中断**、**⚠️ 市场数据过期*
 新增 Prometheus：`quant_ws_queue_depth`、`quant_ws_queue_wait_seconds`、`quant_ws_handler_latency_seconds`、`quant_ws_ping_rtt_seconds`、`quant_ws_transport_disconnects_total`、`quant_ws_market_stale_events_total`。标签只有稳定 socket name，不包含品种、订单或消息。同步 CPU 阻塞仍会阻塞同一 Python event loop；本轮隔离的是异步 handler 等待，队列/延迟观测会反映处理不足。
 
 本轮代码/模拟协议测试不能代替实际 443 接入、网络中断和 OKX 维护现场验收。默认仍 PAPER、LIVE 关闭，策略、风险额度及保证金目标不变。
+
+## Authoritative Fill Backfill & Ledger Repair V1
+
+启动或运行对账发现 **审计账本仓位与 OKX 当前仓位不一致**时，先 HALT，再由独立 `LedgerRepairService` 只读查询成交证据。交易所空仓只触发调查，不能直接覆盖本地仓位。服务无下单、撤单、平仓、策略修改或 resume 能力。
+
+- 查询官方 `GET /api/v5/trade/fills-history`，另提供 `fills`、按 ordId 查询 order detail 和按 algoClOrdId 查询 algo detail。以 **billId** 分页，按 `ts` 的 begin/end 限定窗口；逐条检查实际 `fillTime`、数值及必要字段。API 参数依据 [OKX 官方文档](https://www.okx.com/docs-v5/en/#order-book-trading-trade-get-transaction-details-last-3-months)。
+- 窗口覆盖受影响品种的已恢复本地订单，最早可证明的创建时间减 24 小时；V1 保守检查相关历史，不猜测未知时间。窗口超出保守 89 天保留范围则人工介入。每品种最多 50 页 / 5,000 条，整个计划最多 100 个订单，取证总时限 30 秒；满额但未证明查询完成、重复 cursor 或 malformed 数据都拒绝补录。已完整记录的历史订单无需再次依赖较短保留期的 order detail。
+- 归属只能通过精确已知 clOrdId / ordId，或 **已知保护 algoClOrdId + 官方 algo detail 中精确 spawned ordId / ordIdList** 证明。重建出口还须 order detail 证明 reduceOnly、品种、方向、最终状态及 accFillSz。一笔附近发生的外部成交不能按时间、价格、数量或空仓推断归属；未知归属保留 HALT。
+- 每个 tradeId 独立补录；同一订单多笔成交求和并验证官方 accFillSz。保留实际 fee、feeCcy、fillPnl、fillPx、fillSz、fillTime。WS 累计 fee 不代替 per-fill fillFee。原成交或历史订单行不 UPDATE / DELETE；tradeId 冲突、退出量超过已知敞口、终态冲突均 fail closed。
+- 仅追加恢复订单、订单事件和成交，在独立 durable transaction 内一起提交；不用 `market_batch()`。网络取证不持有成交入账锁，已知 algo 的读取复用本次取证缓存。PostgreSQL 表锁（锁等待最多 5 秒、单 SQL 最多 15 秒）/ SQLite `BEGIN IMMEDIATE` 检查取证期间账本是否变化，唯一 fills reference 防止重复 tradeId。数据库既有重复 reference 会拒绝初始化，不会自动删除历史。
+- 每次 attempt / result 都有 `system_events` 审计，记录补录数、冲突数和结果；恢复 payload 标记 `recovered=true` / `recovery_source=okx_fills_history`。成交的数据库事件时间采用原始 fillTime，因此自然进入对应历史交易日的日报，不重复计数。
+- 补录后重新 GET account / positions / pending orders / algos，执行原有完整 reconciliation。只有账本匹配、对账安全、没有未结 entry 或 Emergency target 才标记 `repaired=true`。**仍保持 HALT；既有 EMERGENCY 仍为 EMERGENCY。** Bark 通知修复结果及人工恢复要求，通知失败不影响对账。
+- 与补录事务一起持久化人工恢复标记，崩溃后再启动也不能自动交易；仅原有显式 resume 在全部健康门禁通过后解除。每次暂停事故最多尝试一次，人工成功 resume 后才允许下一事故尝试。`/status.ledger_repair` 提供安全计数和人工恢复标记，不暴露账户标识或凭据。
+- LIVE 补录在取证前及落库前均重新验证身份和当前 writer lease；不会重新抢 lease。默认仍 PAPER / LIVE disabled。策略、风险额度、CAA、WS 架构和自动恢复白名单不变。
+
+V1 未增加独立人工修账 endpoint / CLI。证据不足时修复根因，再由操作者安全重启触发新调查；禁止手改数据库、伪造归属或直接“相信远端”。代码测试不等于服务器已升级或现场验收完成。操作要求见 [LIVE 验收说明](docs/LIVE_ACCEPTANCE.md)。
+
+本补丁新增 71 项回归；本地 `uv run pytest -W error` 为 **674 passed / 0 skipped / 0 warnings**，真实隔离 PostgreSQL 并发、回滚及既有 LIVE/CAA 回归通过；`ruff check app tests` / `mypy app`（34 source files）通过。现场演练仍保持 UNVERIFIED，不因此启用 LIVE。
