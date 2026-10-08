@@ -8,6 +8,7 @@ from typing import Any
 
 from app.config import Mode, Settings
 from app.execution import OrderManager
+from app.fill_identity import FillKey, equivalent_fill, fill_key
 from app.storage import Store
 
 
@@ -28,7 +29,8 @@ def decimal_value(value: Any, *, positive: bool = False) -> Decimal:
 def parse_fill(row: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(row, dict):
         raise LedgerEvidenceError("ledger repair evidence incomplete")
-    for key in ("instId", "tradeId", "ordId"):
+    fill_key(row.get("instId"), row.get("tradeId"))
+    for key in ("ordId",):
         if not isinstance(row.get(key), str) or not row[key].strip():
             raise LedgerEvidenceError("ledger repair evidence incomplete")
     if row.get("side") not in {"buy", "sell"} or row.get("posSide") not in {None, "", "net"}:
@@ -48,23 +50,6 @@ def parse_fill(row: dict[str, Any]) -> dict[str, Any]:
             raise LedgerEvidenceError("ledger repair evidence incomplete") from exc
     return dict(row)
 
-
-def equivalent_fill(local: dict[str, Any], remote: dict[str, Any]) -> bool:
-    for key in ("instId", "tradeId", "ordId", "side", "fillTime"):
-        if str(local.get(key) or "") != str(remote.get(key) or ""):
-            return False
-    for key in ("clOrdId", "posSide", "feeCcy"):
-        if local.get(key) and remote.get(key) and local[key] != remote[key]:
-            return False
-    for key in ("fillSz", "fillPx", "fee", "fillPnl"):
-        a = (local.get("fillFee") or local.get("fee")) if key == "fee" else local.get(key)
-        b = remote.get(key)
-        if a in (None, "") and b in (None, ""):
-            continue
-        # Missing optional historical fields cannot justify modifying an existing fill.
-        if a in (None, "") or b in (None, "") or decimal_value(a) != decimal_value(b):
-            return False
-    return True
 
 
 @dataclass
@@ -211,7 +196,7 @@ class LedgerRepairService:
         if start < now - timedelta(days=89) or start > now:
             raise LedgerEvidenceError("ledger repair evidence incomplete")
         start_ms, end_ms = int(start.timestamp() * 1000), int(now.timestamp() * 1000)
-        remote: dict[str, dict[str, Any]] = {}
+        remote: dict[FillKey, dict[str, Any]] = {}
         for symbol in sorted(symbols):
             rows = await self.client.fills_history_window(
                 symbol,
@@ -229,16 +214,16 @@ class LedgerRepairService:
                     and start_ms <= int(row["fillTime"]) <= end_ms
                 ):
                     raise LedgerEvidenceError("ledger repair evidence incomplete")
-                tid = row["tradeId"]
+                tid = fill_key(row["instId"], row["tradeId"])
                 if tid in remote:
                     if not equivalent_fill(remote[tid], row):
                         raise LedgerEvidenceError("ledger fill conflict")
                     continue
                 remote[tid] = row
-        existing: dict[str, dict[str, Any]] = {}
+        existing: dict[FillKey, dict[str, Any]] = {}
         for row in snapshots["fills"]:
-            tid = str(row.get("tradeId") or "")
-            if not tid or tid in existing:
+            tid = fill_key(row.get("instId"), row.get("tradeId"))
+            if tid in existing:
                 raise LedgerEvidenceError("ledger fill conflict")
             existing[tid] = row
         for tid, row in remote.items():
@@ -284,7 +269,7 @@ class LedgerRepairService:
             ]
             if (
                 len(known) == 1
-                and all(r["tradeId"] in existing for r in fills)
+                and all(fill_key(r["instId"], r["tradeId"]) in existing for r in fills)
                 and decimal_value(known[0]["filled"]) == total
             ):
                 # Already-complete historical orders need no reconstruction. This also avoids
@@ -346,7 +331,7 @@ class LedgerRepairService:
                 }
                 records.append(("order_events", event, cid))
             for r in fills:
-                if r["tradeId"] not in existing:
+                if fill_key(r["instId"], r["tradeId"]) not in existing:
                     payload = {
                         **r,
                         "recovered": True,

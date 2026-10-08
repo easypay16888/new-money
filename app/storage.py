@@ -18,6 +18,7 @@ from sqlalchemy import (
     cast,
     func,
     insert,
+    inspect,
     or_,
     select,
     text,
@@ -29,6 +30,8 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+
+from app.fill_identity import FillKey, fill_key
 
 
 class Base(DeclarativeBase):
@@ -111,7 +114,16 @@ class Store:
         self.healthy = True
 
     async def initialize(self) -> None:
+        self.healthy = False
         async with self.engine.begin() as connection:
+            if self.engine.dialect.name == "postgresql":
+                await connection.execute(text("SET LOCAL lock_timeout = '5s'"))
+                await connection.execute(text("SET LOCAL statement_timeout = '15s'"))
+                # Serialize schema initialization across processes in this database.
+                await connection.execute(text("SELECT pg_advisory_xact_lock(7265636)"))
+            elif self.engine.dialect.name == "sqlite":
+                # Include DDL and validation in the same durable transaction.
+                await connection.execute(text("BEGIN IMMEDIATE"))
             await connection.run_sync(Base.metadata.create_all)
             # A constant unique expression enforces one record, including legacy tables.
             # Conflicting legacy bindings fail initialization instead of being discarded.
@@ -119,11 +131,71 @@ class Store:
                 "CREATE UNIQUE INDEX IF NOT EXISTS account_bindings_singleton "
                 "ON account_bindings ((1))"
             ))
+            if self.engine.dialect.name == "postgresql":
+                await connection.execute(text("LOCK TABLE fills IN SHARE ROW EXCLUSIVE MODE"))
+            fills = ROW_TYPES["fills"]
+            duplicate = await connection.scalar(select(func.count()).select_from(fills).where(
+                fills.reference_id.is_not(None)
+            ).group_by(fills.symbol, fills.reference_id).having(func.count() > 1).limit(1))
+            if duplicate is not None:
+                raise ValueError("ledger fill conflict")
+            # Bounded keyset batches under the write lock. A PostgreSQL streaming
+            # cursor would keep a portal open and prevent subsequent index DDL.
+            total = await connection.scalar(select(func.count()).select_from(fills)) or 0
+            last_id: int | None = None
+            for _ in range(0, total, 5000):
+                statement = select(
+                    fills.id, fills.symbol, fills.reference_id, fills.payload
+                ).order_by(fills.id).limit(5000)
+                if last_id is not None:
+                    statement = statement.where(fills.id > last_id)
+                rows = (await connection.execute(statement)).all()
+                for row in rows:
+                    last_id = row.id
+                    symbol, reference, payload = row.symbol, row.reference_id, row.payload
+                    if not isinstance(payload, dict):
+                        raise ValueError("invalid fill identity")
+                    if reference is None and not payload.get("tradeId"):
+                        continue  # A legacy non-fill audit record has no canonical identity.
+                    key = fill_key(symbol, reference)
+                    if (payload.get("instId", key[0]) != key[0]
+                            or payload.get("tradeId", key[1]) != key[1]):
+                        raise ValueError("ledger fill conflict")
             await connection.execute(text(
-                "CREATE UNIQUE INDEX IF NOT EXISTS fills_reference_unique "
-                "ON fills (reference_id) WHERE reference_id IS NOT NULL"
+                "CREATE UNIQUE INDEX IF NOT EXISTS fills_instrument_reference_unique "
+                "ON fills (symbol, reference_id) WHERE reference_id IS NOT NULL"
             ))
+            indexes = await connection.run_sync(lambda conn: inspect(conn).get_indexes("fills"))
+            index = next(i for i in indexes if i["name"] == "fills_instrument_reference_unique")
+            condition = index.get("dialect_options", {}).get(self.engine.dialect.name + "_where")
+            normalized = "".join(str(condition).lower().split()).replace("(", "").replace(")", "").replace('"', '')
+            if not index["unique"] or index["column_names"] != ["symbol", "reference_id"] or normalized != "reference_idisnotnull":
+                raise ValueError("invalid fill identity index")
+            await connection.execute(text("DROP INDEX IF EXISTS fills_reference_unique"))
         self.healthy = True
+
+    async def fill_for_key(self, key: FillKey) -> dict[str, Any] | None:
+        symbol, reference = fill_key(*key)
+        table = ROW_TYPES["fills"]
+        async with self.sessions() as session:
+            row = await session.scalar(select(table).where(
+                table.symbol == symbol, table.reference_id == reference
+            ))
+        return row.payload if row else None
+
+    async def fill_records(self) -> list[tuple[FillKey, dict[str, Any]]]:
+        table = ROW_TYPES["fills"]
+        async with self.sessions() as session:
+            rows = (await session.scalars(select(table).order_by(table.id).limit(100001))).all()
+        if len(rows) > 100000:
+            raise ValueError("ledger repair evidence incomplete")
+        result = []
+        for row in rows:
+            if row.reference_id is not None:
+                if row.symbol is None:
+                    raise ValueError("invalid fill identity")
+                result.append((fill_key(row.symbol, row.reference_id), row.payload))
+        return result
 
     async def append(
         self,
@@ -135,6 +207,13 @@ class Store:
     ) -> None:
         if table not in ROW_TYPES:
             raise ValueError(f"unknown table: {table}")
+        if table == "fills" and reference_id is not None:
+            if symbol is None:
+                raise ValueError("invalid fill identity")
+            key = fill_key(symbol, reference_id)
+            if (payload.get("instId", key[0]) != key[0]
+                    or payload.get("tradeId", key[1]) != key[1]):
+                raise ValueError("ledger fill conflict")
         market_rows = self._market_rows.get()
         if market_rows is not None:
             if table not in {"market_trades", "market_derivatives", "market_orderbook_snapshots"}:
@@ -288,7 +367,11 @@ class Store:
                 if table == "fills":
                     # Reports use event timestamp: account for the fill on its actual trade day.
                     timestamp = datetime.fromtimestamp(int(payload["fillTime"]) / 1000, UTC)
-                    existing = await session.scalar(select(ROW_TYPES["fills"].id).where(or_(
+                    symbol, reference = fill_key(payload["instId"], reference)
+                    if payload.get("tradeId") != reference or payload.get("symbol", symbol) != symbol:
+                        raise ValueError("ledger fill conflict")
+                    existing = await session.scalar(select(ROW_TYPES["fills"].id).where(
+                        ROW_TYPES["fills"].symbol == symbol, or_(
                         ROW_TYPES["fills"].reference_id == reference,
                         ROW_TYPES["fills"].payload["tradeId"].as_string() == reference,
                     )).limit(1))

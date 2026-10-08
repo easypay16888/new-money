@@ -111,6 +111,6 @@ reason_class 只用固定 machine code；close reason、UID、order ID 不进入
 
 新增 53 项测试，全部旧测试保留。本地完整 `uv run pytest -q -W error` 为 **727 passed / 0 skipped / 0 warnings**；真实 PostgreSQL 集成使用独立 `quant_live_acceptance_test` 数据库执行，既有 lease/binding/CAA/ledger 回归通过。Ruff PASS，mypy PASS（34 source files）。GitHub Actions 的结果须按补丁实际 commit 独立核验，不以本地结果代替。
 
-Existing unrelated composite fill identity P1 remains unresolved：当前 seen_trade_ids 与 fills unique reference 仍以全局 tradeId 去重，OKX tradeId 的唯一性范围是 instId。本次不改它；需独立审计与 commit 后，才能继续判断 Micro-Live readiness。
+WebSocket 补丁验收时曾保留的 composite fill identity P1 已由独立后续补丁修复：seen_trade_ids、数据库唯一约束和 repair 使用 `(instId, tradeId)`。迁移及验收边界见 [Fill Identity](FILL_IDENTITY.md)。该修复与 WS 修改保持独立 commit，10/6 事故根因仍未证实。
 
 生产 Demo 的 circuit breaker、未知协议错误、LIVE 与 EMERGENCY 的人工恢复规则均未扩大。此补丁只可以进入 controlled Demo acceptance，不声明 READY FOR LIVE。

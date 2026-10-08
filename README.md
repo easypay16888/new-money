@@ -257,4 +257,10 @@ private 重连不再无限等待业务队列排空，已接收事件保持有序
 
 `/status.websockets` 新增 phase、login/subscription、task liveness、关闭诊断、连接尝试年龄、backoff 与连续失败；Bark 区分连接中断、已重连等待对账与完整恢复。transport incident 可独立结束，交易仍 HALT 时不会宣称交易已经恢复。默认继续使用 443；自定义 8443 只警告而不改写。
 
-完整审计、状态示例、官方协议依据和现场验收边界见 [Private Algo Recovery](docs/PRIVATE_ALGO_RECOVERY.md)。已知全局 tradeId 去重 P1 本次保持未解决，必须另行修复；本补丁不启用 LIVE。
+完整审计、状态示例、官方协议依据和现场验收边界见 [Private Algo Recovery](docs/PRIVATE_ALGO_RECOVERY.md)。全局 tradeId 去重 P1 已由独立补丁修复，见下节；仍不启用 LIVE。
+
+### Instrument-scoped Fill Identity
+
+OKX 成交统一使用 `(instId, tradeId)`，覆盖 WS 去重、restore、数据库约束和账本修复。BTC/123 与 ETH/123 均可入账；同品种重复成交幂等，内容冲突仍 fail closed。
+
+初始化会在事务中验证历史记录并迁移 SQLite / PostgreSQL 的全局唯一索引为 `(symbol, reference_id)`；重复或冲突账本不自动清理。升级仍须安全停机与备份，迁移不会修改历史成交。详细设计、迁移回滚测试和验收边界见 [Fill Identity](docs/FILL_IDENTITY.md)。10/6 事故的具体根因仍未证实。

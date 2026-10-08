@@ -8,6 +8,7 @@ from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 from typing import Any
 from uuid import uuid4
 
+from app.fill_identity import FillKey, equivalent_fill, fill_key
 from app.models import ExecutionRequest, Instrument, OrderState, RiskDecision, Side
 from app.okx import OkxError, OkxOrderRejected, OkxRestClient
 from app.storage import Store
@@ -19,7 +20,7 @@ class OrderManager:
     def __init__(self, store: Store) -> None:
         self.store = store
         self.orders: dict[str, dict] = {}
-        self.seen_trade_ids: set[str] = set()
+        self.seen_trade_ids: set[FillKey] = set()
         self.ledger_lock = asyncio.Lock()
 
     async def create(self, request: ExecutionRequest) -> None:
@@ -71,11 +72,7 @@ class OrderManager:
                 self.orders[client_id].update(event)
         for row in self.orders.values():
             row["reconciled_filled"] = row.get("filled", "0")
-        self.seen_trade_ids = {
-            str(row["tradeId"])
-            for row in await self.store.latest("fills", limit=100000)
-            if row.get("tradeId")
-        }
+        self.seen_trade_ids = {key for key, _ in await self.store.fill_records()}
 
     async def transition(self, client_order_id: str, state: OrderState, **changes: str) -> None:
         row = self.orders[client_order_id]
@@ -100,7 +97,19 @@ class OrderManager:
             await self._ingest(event)
 
     async def _ingest(self, event: dict) -> None:
+        key = None
+        existing_fill = None
+        if event.get("fillSz") and Decimal(event["fillSz"]) > 0:
+            key = fill_key(event.get("instId"), event.get("tradeId"))
+            existing_fill = await self.store.fill_for_key(key)
+            if existing_fill is not None and not equivalent_fill(existing_fill, event):
+                # Validate immutable evidence before appending any order event.
+                raise OkxError("ledger fill conflict")
+            if key in self.seen_trade_ids and existing_fill is None:
+                raise OkxError("ledger fill conflict")
         client_id = str(event.get("clOrdId", ""))
+        if client_id in self.orders and key is not None and self.orders[client_id]["symbol"] != key[0]:
+            raise OkxError("ledger fill conflict")
         if client_id not in self.orders:
             algo_id = event.get("algoClOrdId") or event.get("attachAlgoClOrdId")
             parent = next(
@@ -114,6 +123,8 @@ class OrderManager:
             order_id = str(event.get("ordId", ""))
             if parent is None or not order_id:
                 raise OkxError("unexpected order event")
+            if key is not None and parent["symbol"] != key[0]:
+                raise OkxError("ledger fill conflict")
             client_id = "protective-" + order_id
             if client_id not in self.orders:
                 synthetic = {
@@ -148,13 +159,12 @@ class OrderManager:
             client_id, state, filled=event.get("accFillSz", "0"), order_id=event.get("ordId", "")
         )
 
-        if event.get("fillSz") and Decimal(event["fillSz"]) > 0:
-            trade_id = str(event.get("tradeId", ""))
-            if trade_id and trade_id not in self.seen_trade_ids:
+        if key is not None:
+            if existing_fill is None:
                 await self.store.append(
-                    "fills", event, symbol=event.get("instId"), reference_id=trade_id
+                    "fills", event, symbol=key[0], reference_id=key[1]
                 )
-                self.seen_trade_ids.add(trade_id)
+            self.seen_trade_ids.add(key)
 
     def expected_deltas(self) -> dict[str, Decimal]:
         deltas: dict[str, Decimal] = {}

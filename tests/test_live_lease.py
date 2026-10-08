@@ -117,11 +117,13 @@ async def test_postgres_binding_unique_constraint_prevents_conflicting_rows(post
 
 @pytest.mark.parametrize("table,payload", [
     ("system_events", {"event": "start", "mode": "PAPER"}),
-    ("orders", {"clOrdId": "demo"}), ("fills", {"tradeId": "demo"}),
+    ("orders", {"clOrdId": "demo"}), ("fills", {"tradeId": "demo", "instId": "BTC-USDT-SWAP"}),
     ("emergency_targets", {"target": "0"}), ("portfolio_snapshots", {"equity": "5000"}),
 ])
 async def test_postgres_demo_or_unbound_ledger_rejected(postgres_store, table, payload):
-    await postgres_store.append(table, payload)
+    await postgres_store.append(table, payload, **(
+        {"symbol": payload["instId"], "reference_id": payload["tradeId"]} if table == "fills" else {}
+    ))
     with pytest.raises(ValueError):
         await postgres_store.bind_live_account("account-A")
     assert not await postgres_store.latest("account_bindings")
