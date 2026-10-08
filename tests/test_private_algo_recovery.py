@@ -213,7 +213,7 @@ async def test_server_close_reconnects_authenticates_and_resubscribes(monkeypatc
     try:
         await asyncio.wait_for(ready.wait(), 2)
         assert ws.reconnects == 1 and ws.worker_alive
-        assert ws.reason_code == "ws_connection_closed"
+        assert ws.last_failure_reason_code == "ws_connection_closed"
         assert ws.last_close_code == code
         assert ws.last_close_side == ("server" if code else "unavailable")
         assert ws.is_transport_healthy() and ws.reconciliation_required and not ws.is_fresh()
@@ -270,7 +270,7 @@ async def test_one_virtual_hour_reconnects_continue_and_entries_remain_blocked(m
         assert rt.governor.state == GovernorState.HALT
         assert not rt._websockets_healthy()
         assert not rt.execution.entry_allowed()
-        assert ws.reason_code == "ws_connection_closed"
+        assert ws.last_failure_reason_code == "ws_connection_closed"
         assert ws.status()["last_disconnect_phase"] in {"RECONCILING", "ACTIVE"}
     finally:
         task.cancel()
@@ -441,7 +441,7 @@ def test_default_business_path_is_standard_tls(mode, host):
 def test_reconnect_stall_detection_is_bounded_and_not_an_auto_recovery_reason():
     now = [100.0]
     ws = make_socket(now)
-    ws.last_connect_attempt_at = 100
+    ws.last_connect_attempt_at = ws.last_reconnect_progress_at = 100
     now[0] += 69
     assert ws.reconnect_stalled()
     assert ws.status()["reconnect_stalled"]
@@ -572,7 +572,7 @@ async def test_real_server_close_after_healthy_pong_reconnects(code):
         task = asyncio.create_task(ws.run())
         try:
             await asyncio.wait_for(ready.wait(), 2)
-            assert ws.reconnects == 1 and ws.reason_code == "ws_connection_closed"
+            assert ws.reconnects == 1 and ws.last_failure_reason_code == "ws_connection_closed"
             assert ws.last_close_code == code
             assert ws.worker_alive and ws.is_transport_healthy() and ws.reconciliation_required
         finally:
@@ -600,7 +600,7 @@ async def test_liveness_failure_halts_and_emits_critical_without_auto_recovery(f
         ws._worker_task = done
         await rt._check_ws_liveness()
     else:
-        ws.last_connect_attempt_at = 100
+        ws.last_connect_attempt_at = ws.last_reconnect_progress_at = 100
         now[0] += 69
         await rt._check_ws_liveness()
     try:
@@ -650,7 +650,8 @@ async def test_connect_timeout_enters_backoff_and_continues_attempting(monkeypat
     try:
         await asyncio.wait_for(ready.wait(), 1)
         assert attempts == 3 and ws.reconnects == 2
-        assert ws.reason_code == "ws_connect_timeout"
+        assert ws.reason_code == "healthy"
+        assert ws.last_failure_reason_code == "ws_connect_timeout"
         assert ws.worker_alive and ws.reconciliation_required
     finally:
         task.cancel()

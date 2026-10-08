@@ -559,11 +559,13 @@ class OkxWebSocket:
         self.subscribe_sent_at: float | None = None
         self.subscriptions_completed_at: float | None = None
         self.last_connect_attempt_at: float | None = None
+        self.last_reconnect_progress_at: float | None = None
         self.last_disconnect_at: float | None = None
         self.current_backoff = 0.0
         self._next_retry_at: float | None = None
         self.consecutive_failures = 0
         self.reason_code = "ws_connection_unavailable"
+        self.last_failure_reason_code: str | None = None
         self.last_disconnect_phase: str | None = None
         self.last_close_side: str | None = None
         self._run_task: asyncio.Task[Any] | None = None
@@ -594,6 +596,7 @@ class OkxWebSocket:
         self.last_data_at.clear()
         self.last_rx_at = self.clock()
         self._connected_at = self.last_rx_at
+        self.last_reconnect_progress_at = self.clock()
         self.last_ping_at = self.last_pong_at = 0.0
         self.ping_pending = False
         self.ping_rtt = None
@@ -621,6 +624,7 @@ class OkxWebSocket:
             "business handler failed": "ws_worker_failed",
             "connection attempt timeout": "ws_connect_timeout",
         }.get(reason, "ws_protocol_error" if kind == "protocol" else "ws_connection_error")
+        self.last_failure_reason_code = self.reason_code
         if self.private:
             self.reconciliation_required = True
         if kind == "backlog":
@@ -659,13 +663,25 @@ class OkxWebSocket:
             self._worker_task.add_done_callback(self._worker_done)
 
     def reconnect_stalled(self) -> bool:
-        return bool(
-            self.private and not self.is_transport_healthy()
-            and self.last_connect_attempt_at is not None
-            and self.clock() - self.last_connect_attempt_at > (
-                2 * self.settings.ws_backoff_max_seconds + self.settings.ws_connect_timeout_seconds
-            )
-        )
+        if not self.private or self.is_transport_healthy() or self._stopping:
+            return False
+        now = self.clock()
+        tolerance = 1.0  # Scheduling tolerance, not a heartbeat/handshake extension.
+        if self._next_retry_at is not None and now <= self._next_retry_at + tolerance:
+            return False
+        deadline = None
+        if self._phase == "CONNECTING" and self.last_connect_attempt_at is not None:
+            deadline = self.last_connect_attempt_at + self.settings.ws_connect_timeout_seconds
+        elif self._phase == "AUTHENTICATING" and self.login_started_at is not None:
+            deadline = self.login_started_at + self.settings.request_timeout_seconds
+        elif self._phase == "SUBSCRIBING" and self.subscribe_sent_at is not None:
+            deadline = self.subscribe_sent_at + self.settings.request_timeout_seconds
+        if deadline is not None and now <= deadline + tolerance:
+            return False
+        anchor = self.last_reconnect_progress_at
+        return bool(anchor is not None and now - anchor > (
+            2 * self.settings.ws_backoff_max_seconds + self.settings.ws_connect_timeout_seconds
+        ))
 
     def endpoint_log(self) -> None:
         try:
@@ -722,9 +738,11 @@ class OkxWebSocket:
                 raise WebSocketFault("login failed", kind="protocol")
             self.login_ok = True
             self.last_rx_at = self.login_completed_at = self.clock()
+            self.last_reconnect_progress_at = self.clock()
         self._phase = "SUBSCRIBING"
         # A full independent budget begins here, after successful authentication.
         self.subscribe_sent_at = self.clock()
+        self.last_reconnect_progress_at = self.clock()
         try:
             async with asyncio.timeout(self.settings.request_timeout_seconds):
                 await ws.send(json.dumps({"op": "subscribe", "args": self.subscriptions}))
@@ -750,6 +768,7 @@ class OkxWebSocket:
                 self.subscribed.clear()
                 self.current_backoff = 0.0
                 self.last_connect_attempt_at = self.clock()
+                self.last_reconnect_progress_at = self.clock()
                 self._next_retry_at = None
                 if self.metrics is not None:
                     self.metrics.ws_connect_attempts.labels(socket=self.name).inc()
@@ -776,6 +795,7 @@ class OkxWebSocket:
                 except Exception as exc:
                     self.last_disconnect_phase = self.phase
                     self.last_disconnect_at = self.clock()
+                    self.last_reconnect_progress_at = self.clock()
                     self.connected = False
                     self.reconnects += 1
                     reason = exc.message if isinstance(exc, WebSocketFault) else "connection error"
@@ -805,6 +825,7 @@ class OkxWebSocket:
                         delay + random.uniform(0, 0.5), self.settings.ws_backoff_max_seconds
                     )
                     self._next_retry_at = self.clock() + self.current_backoff
+                    self.last_reconnect_progress_at = self.clock()
                     self._fault(reason, kind=kind)
                     if self.metrics is not None:
                         self.metrics.ws_transport_disconnects.labels(socket=self.name).inc()
@@ -913,6 +934,8 @@ class OkxWebSocket:
                 awaiting_ack.clear()
                 ready_announced = True
                 self.subscriptions_completed_at = self.clock()
+                self.last_reconnect_progress_at = self.clock()
+                self.reason_code = "healthy"
                 self._phase = "RECONCILING" if self.private else "ACTIVE"
                 if self.on_ready is not None:
                     self.on_ready(self)
@@ -1109,6 +1132,11 @@ class OkxWebSocket:
             "subscriptions_completed_at": self.subscriptions_completed_at,
             "last_disconnect_at": self.last_disconnect_at,
             "last_connect_attempt_at": self.last_connect_attempt_at,
+            "last_reconnect_progress_at": self.last_reconnect_progress_at,
+            "last_reconnect_progress_age_seconds": (
+                max(0, self.clock() - self.last_reconnect_progress_at)
+                if self.last_reconnect_progress_at is not None else None
+            ),
             "last_connect_attempt_age_seconds": attempt_age,
             "next_retry_in": max(0, self._next_retry_at - self.clock()) if self._next_retry_at is not None else None,
             "current_backoff": self.current_backoff,
@@ -1118,6 +1146,7 @@ class OkxWebSocket:
             "worker_exception_type": self.worker_exception_type,
             "reconnect_stalled": self.reconnect_stalled(),
             "reason_code": self.reason_code,
+            "last_failure_reason_code": self.last_failure_reason_code,
             "last_disconnect_phase": self.last_disconnect_phase,
             "close_code": self.last_close_code, "close_reason": self.last_close_reason,
             "close_side": self.last_close_side,

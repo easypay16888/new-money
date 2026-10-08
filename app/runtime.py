@@ -1483,6 +1483,7 @@ class TradingRuntime:
         if not task.cancelled():
             task.exception()  # Retrieve, never format potentially sensitive exceptions.
         ws.reason_code = "ws_run_task_failed"
+        ws.last_failure_reason_code = ws.reason_code
         self._on_ws_fault(ws, "WebSocket run task stopped")
         notice = asyncio.create_task(self._report_ws_task_failure(ws))
         self.tasks.append(notice)
@@ -1811,6 +1812,7 @@ class TradingRuntime:
             f"\nFailure phase: {ws.last_disconnect_phase or 'unavailable'}"
             f"\nReason: {'ws_reconciliation_pending' if ws.is_transport_healthy() and ws.reconciliation_required else 'healthy' if ws.is_fresh() else ws.reason_code}"
             f"\nReason code: {ws.reason_code}"
+            f"\nLast failure reason code: {ws.last_failure_reason_code or 'unavailable'}"
             f"\nClose code: {ws.last_close_code if ws.last_close_code is not None else 'unavailable'}"
             f"\nClose reason: {ws.last_close_reason or 'unavailable'}"
             f"\nClose side: {ws.last_close_side or 'unavailable'}"
@@ -2156,6 +2158,7 @@ class TradingRuntime:
                           "WebSocket reconnect loop stalled")
                 ws.reason_code = ("ws_run_task_failed" if dead_run else
                                   "ws_worker_failed" if dead_worker else "ws_reconnect_stalled")
+                ws.last_failure_reason_code = ws.reason_code
                 self._on_ws_fault(ws, reason)
                 await self._report_ws_task_failure(ws)
 

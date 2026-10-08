@@ -36,6 +36,14 @@ private worker 跨连接保持有序处理。private 重连不等待 queue drain
 
 run task 的 done callback 只在 runtime 仍运行时 fence，正常 shutdown 的取消不告警。reconnect watchdog 阈值为 `2 * WS_BACKOFF_MAX_SECONDS + WS_CONNECT_TIMEOUT_SECONDS`（默认 68s）；它不能重新启动交易、放宽健康门禁或绕过 circuit breaker。
 
+### Reconnect progress 修复
+
+stall age 使用 `last_reconnect_progress_at`，而非上一段健康 session 的建连时间。断线检测、退避安排、开始建连、连接建立、login 完成、subscribe 发送、ACK 完成都刷新锚点；status 读取不会刷新它。未到期 backoff，以及 CONNECTING / AUTHENTICATING / SUBSCRIBING 的独立期限都免于 stall 判定（1 秒调度容差只用于此 watchdog，不延长协议期限）。超过期限后仍必须无进展超过 68 秒才判 stalled。
+
+ACK 完成后当前 `reason_code=healthy`，历史根因单独保留为 `last_failure_reason_code`，关闭代码、原因与断线时间继续可查。worker/run 的真实故障仍 fence，故障码不会因 status 读取消失。
+
+该修复新增 8 项测试；完整本地验证 **735 passed / 0 skipped / 0 warnings**，真实 PostgreSQL 执行，Ruff / mypy PASS。一小时健康 session 后普通 close 的 watchdog 采样不会使 transient HALT 变成不可自动恢复；真实无进展 stalled 仍为 SAFETY_OR_MANUAL。
+
 ## /status 与日志
 
 下面是协议 fixture 示例，不是新版本服务器已部署的证明：

@@ -141,6 +141,7 @@ TITLES = {
 LABELS = {
     "Phase": "阶段", "Failure phase": "故障阶段",
     "Reason code": "reason_code", "Close code": "关闭代码", "Close reason": "关闭原因",
+    "Last failure reason code": "最近故障 reason_code",
     "Close side": "关闭方向", "Last Pong": "最近 Pong", "Next retry": "下次重试（秒）",
     "Transport": "连接状态", "Login": "登录", "Subscription": "订阅", "Worker": "处理任务",
     "Socket": "连接",
