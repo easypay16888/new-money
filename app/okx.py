@@ -15,7 +15,7 @@ from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
 
 import httpx
 import websockets
@@ -553,6 +553,23 @@ class OkxWebSocket:
         self._queued_at: deque[float] = deque()
         self._handler_started_at: float | None = None
         self._stale_keys: set[str] = set()
+        self._phase = "DISCONNECTED"
+        self.login_started_at: float | None = None
+        self.login_completed_at: float | None = None
+        self.subscribe_sent_at: float | None = None
+        self.subscriptions_completed_at: float | None = None
+        self.last_connect_attempt_at: float | None = None
+        self.last_disconnect_at: float | None = None
+        self.current_backoff = 0.0
+        self._next_retry_at: float | None = None
+        self.consecutive_failures = 0
+        self.reason_code = "ws_connection_unavailable"
+        self.last_disconnect_phase: str | None = None
+        self.last_close_side: str | None = None
+        self._run_task: asyncio.Task[Any] | None = None
+        self._worker_task: asyncio.Task[None] | None = None
+        self.worker_exception_type: str | None = None
+        self._stopping = False
         self._queue_metric()
 
     @staticmethod
@@ -581,13 +598,29 @@ class OkxWebSocket:
         self.ping_pending = False
         self.ping_rtt = None
         self._stale_keys.clear()
-        self.last_close_code, self.last_close_reason = None, ""
+        self.login_started_at = self.login_completed_at = None
+        self.subscribe_sent_at = self.subscriptions_completed_at = None
+        self._phase = "AUTHENTICATING" if self.private else "SUBSCRIBING"
         self.reconciliation_required = self.private
         if not self.private:
             self.processing_unsafe = False
 
     def _fault(self, reason: str, *, kind: str = "transport") -> None:
         self.disconnect_reason, self.disconnect_kind = reason, kind
+        self.reason_code = {
+            "connection closed": "ws_connection_closed",
+            "heartbeat timeout": "ws_heartbeat_timeout",
+            "login failed": "ws_login_failed",
+            "login credentials missing": "ws_login_failed",
+            "login timeout": "ws_login_timeout",
+            "subscription rejected": "ws_subscription_rejected",
+            "subscription acknowledgement timeout": "ws_subscription_timeout",
+            "server maintenance notice 64008": "ws_server_maintenance",
+            "processing queue full": "ws_processing_backlog",
+            "business worker terminated": "ws_worker_failed",
+            "business handler failed": "ws_worker_failed",
+            "connection attempt timeout": "ws_connect_timeout",
+        }.get(reason, "ws_protocol_error" if kind == "protocol" else "ws_connection_error")
         if self.private:
             self.reconciliation_required = True
         if kind == "backlog":
@@ -598,52 +631,165 @@ class OkxWebSocket:
                                 "handler": "WebSocket processing failed"}.get(
                                     kind, "WebSocket transport unavailable"))
 
+    @property
+    def phase(self) -> str:
+        if self.is_transport_healthy():
+            return "RECONCILING" if self.reconciliation_required else "ACTIVE"
+        return self._phase
+
+    @property
+    def worker_alive(self) -> bool:
+        return self._worker_task is not None and not self._worker_task.done()
+
+    def _worker_done(self, task: asyncio.Task[None]) -> None:
+        if self._stopping:
+            return
+        error = None if task.cancelled() else task.exception()
+        self.worker_exception_type = type(error).__name__ if error else (
+            "CancelledError" if task.cancelled() else "UnexpectedWorkerExit"
+        )
+        self.processing_unsafe = True
+        self._fault("business worker terminated", kind="handler")
+
+    def _ensure_worker(self) -> None:
+        if not self.worker_alive:
+            self._worker_task = asyncio.create_task(
+                self._business_worker(), name=f"{self.name}-handler"
+            )
+            self._worker_task.add_done_callback(self._worker_done)
+
+    def reconnect_stalled(self) -> bool:
+        return bool(
+            self.private and not self.is_transport_healthy()
+            and self.last_connect_attempt_at is not None
+            and self.clock() - self.last_connect_attempt_at > (
+                2 * self.settings.ws_backoff_max_seconds + self.settings.ws_connect_timeout_seconds
+            )
+        )
+
+    def endpoint_log(self) -> None:
+        try:
+            endpoint = urlsplit(self.url)
+            port = endpoint.port or (443 if endpoint.scheme == "wss" else 80)
+        except ValueError:
+            # Parsing errors can include the invalid port or URL. Leave rejection
+            # to the bounded connection loop; never format that exception here.
+            logger.warning("invalid WebSocket endpoint configured", extra={"socket_name": self.name})
+            return
+        # Never emit userinfo, query strings, or arbitrary path components.
+        path = endpoint.path.rsplit("/", 1)[-1]
+        path = path if path in {"public", "private", "business"} else "custom"
+        logger.info("websocket endpoint", extra={"socket_name": self.name,
+                    "endpoint_host": self._safe_close_reason(endpoint.hostname or "unavailable"),
+                    "endpoint_port": port, "endpoint_path": path})
+        if port == 8443:
+            logger.warning("legacy OKX WebSocket port configured", extra={"socket_name": self.name,
+                           "endpoint_port": port})
+
+    async def _handshake(self, ws: Any) -> None:
+        if self.private:
+            self._phase = "AUTHENTICATING"
+            self.login_started_at = self.clock()
+            if not self.settings.has_credentials:
+                raise WebSocketFault("login credentials missing", kind="protocol")
+            timestamp = str(int(time.time()))
+            try:
+                async with asyncio.timeout(self.settings.request_timeout_seconds):
+                    await ws.send(json.dumps({"op": "login", "args": [{
+                        "apiKey": self.settings.okx_api_key,
+                        "passphrase": self.settings.okx_passphrase,
+                        "timestamp": timestamp,
+                        "sign": signature(self.settings.okx_secret_key,
+                                          timestamp + "GET/users/self/verify"),
+                    }]}))
+                    while True:
+                        raw = await ws.recv()
+                        self.last_rx_at = self.clock()
+                        if raw == "pong":
+                            self.last_pong_at = self.last_rx_at
+                            continue
+                        login = json.loads(raw)
+                        if isinstance(login, dict) and login.get("event") == "notice":
+                            if str(login.get("code")) == "64008":
+                                raise WebSocketFault("server maintenance notice 64008", kind="maintenance")
+                            raise WebSocketFault("unknown server notice", kind="protocol")
+                        break
+            except TimeoutError:
+                raise WebSocketFault("login timeout") from None
+            if self.clock() - self.login_started_at >= self.settings.request_timeout_seconds:
+                raise WebSocketFault("login timeout")
+            if not isinstance(login, dict) or login.get("event") != "login" or login.get("code") != "0":
+                raise WebSocketFault("login failed", kind="protocol")
+            self.login_ok = True
+            self.last_rx_at = self.login_completed_at = self.clock()
+        self._phase = "SUBSCRIBING"
+        # A full independent budget begins here, after successful authentication.
+        self.subscribe_sent_at = self.clock()
+        try:
+            async with asyncio.timeout(self.settings.request_timeout_seconds):
+                await ws.send(json.dumps({"op": "subscribe", "args": self.subscriptions}))
+        except TimeoutError:
+            raise WebSocketFault("subscription acknowledgement timeout") from None
+
+    async def _sleep_backoff(self) -> None:
+        await asyncio.sleep(self.current_backoff)
+
     async def run(self) -> None:
-        # A single ordered worker persists across sessions. Accepted private events
-        # are drained before reconnect/reconciliation; never cancelled on reconnect.
-        worker = asyncio.create_task(self._business_worker(), name=f"{self.name}-handler")
+        self._run_task = asyncio.current_task()
+        self._stopping = False
+        self.endpoint_log()
+        self._ensure_worker()
         delay = min(1.0, self.settings.ws_backoff_max_seconds)
         try:
             while True:
+                self._ensure_worker()
+                self._phase = "CONNECTING"
+                self._connected_at = 0.0
+                self.subscriptions_completed_at = None
+                self.login_ok = not self.private
+                self.subscribed.clear()
+                self.current_backoff = 0.0
+                self.last_connect_attempt_at = self.clock()
+                self._next_retry_at = None
+                if self.metrics is not None:
+                    self.metrics.ws_connect_attempts.labels(socket=self.name).inc()
                 try:
-                    await self.queue.join()
+                    if not self.private:
+                        try:
+                            async with asyncio.timeout(self.settings.stale_timeout_seconds):
+                                await self.queue.join()
+                        except TimeoutError:
+                            raise WebSocketFault("processing queue full", kind="backlog") from None
+                    # Keep accepted events in their ordered worker across sessions.
+                    # Private reconnect never waits on a handler; full reconciliation cannot
+                    # clear its gate until that worker is idle in the same generation.
                     async with websockets.connect(
-                        self.url, ping_interval=20, ping_timeout=10, close_timeout=5,
+                        self.url, open_timeout=self.settings.ws_connect_timeout_seconds,
+                        ping_interval=20, ping_timeout=10, close_timeout=5,
                         max_queue=16, max_size=2**20,
                     ) as ws:
                         self._reset_transport()
-                        if self.private:
-                            if not self.settings.has_credentials:
-                                raise WebSocketFault("login credentials missing", kind="protocol")
-                            timestamp = str(int(time.time()))
-                            await ws.send(json.dumps({"op": "login", "args": [{
-                                "apiKey": self.settings.okx_api_key,
-                                "passphrase": self.settings.okx_passphrase,
-                                "timestamp": timestamp,
-                                "sign": signature(self.settings.okx_secret_key,
-                                                  timestamp + "GET/users/self/verify"),
-                            }]}))
-                            login = json.loads(await asyncio.wait_for(
-                                ws.recv(), timeout=self.settings.request_timeout_seconds
-                            ))
-                            if login.get("event") != "login" or login.get("code") != "0":
-                                raise WebSocketFault("login failed", kind="protocol")
-                            self.login_ok = True
-                            self.last_rx_at = self.clock()
-                        await ws.send(json.dumps({"op": "subscribe", "args": self.subscriptions}))
+                        await self._handshake(ws)
                         await self._receive(ws)
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
+                    self.last_disconnect_phase = self.phase
+                    self.last_disconnect_at = self.clock()
                     self.connected = False
                     self.reconnects += 1
                     reason = exc.message if isinstance(exc, WebSocketFault) else "connection error"
+                    self.last_close_code, self.last_close_reason, self.last_close_side = None, "", None
                     if isinstance(exc, websockets.exceptions.ConnectionClosed):
                         reason = "connection closed"
                         self.last_close_code = exc.rcvd.code if exc.rcvd else None
-                        self.last_close_reason = self._safe_close_reason(
-                            exc.rcvd.reason if exc.rcvd else ""
+                        self.last_close_reason = self._safe_close_reason(exc.rcvd.reason if exc.rcvd else "")
+                        self.last_close_side = (
+                            "server" if exc.rcvd_then_sent is True else "client"
+                            if exc.rcvd_then_sent is False else "unavailable"
                         )
+                    elif isinstance(exc, TimeoutError) and self._phase == "CONNECTING":
+                        reason = "connection attempt timeout"
                     kind = (exc.kind if isinstance(exc, WebSocketFault) else "transport"
                             if isinstance(exc, (OSError, TimeoutError, websockets.exceptions.ConnectionClosed))
                             else "protocol")
@@ -651,28 +797,48 @@ class OkxWebSocket:
                         reason = "invalid protocol or configuration"
                     if kind == "maintenance":
                         self.maintenance_reconnects += 1
+                    if self.subscriptions_completed_at is not None and self.clock() - self.subscriptions_completed_at >= 30:
+                        delay = min(1.0, self.settings.ws_backoff_max_seconds)
+                        self.consecutive_failures = 0
+                    self.consecutive_failures += 1
+                    self.current_backoff = min(
+                        delay + random.uniform(0, 0.5), self.settings.ws_backoff_max_seconds
+                    )
+                    self._next_retry_at = self.clock() + self.current_backoff
                     self._fault(reason, kind=kind)
                     if self.metrics is not None:
                         self.metrics.ws_transport_disconnects.labels(socket=self.name).inc()
+                        self.metrics.ws_connect_failures.labels(socket=self.name, reason_class=self.reason_code).inc()
+                        if self._connected_at > 0:
+                            self.metrics.ws_session_duration.labels(socket=self.name).observe(
+                                max(0, self.clock() - self._connected_at)
+                            )
                     logger.log(logging.INFO if kind == "maintenance" else logging.ERROR,
                                "websocket session ended", extra={
                         "socket_name": self.name, "exception_type": type(exc).__name__,
                         "close_code": self.last_close_code, "close_reason": self.last_close_reason,
-                        "ws_reason": reason, "last_rx_age": self._age(self.last_rx_at),
-                        "last_pong_age": self._age(self.last_pong_at),
+                        "close_side": self.last_close_side, "phase": self.last_disconnect_phase,
+                        "ws_reason": reason, "reason_class": self.reason_code,
+                        "session_age": self._age(self._connected_at),
+                        "last_rx_age": self._age(self.last_rx_at),
+                        "last_pong_age": self._age(self.last_pong_at), "ping_pending": self.ping_pending,
+                        "login_ok": self.login_ok, "subscriptions_acked": len(self.subscribed),
+                        "reconciliation_required": self.reconciliation_required,
                         "reconnect_count": self.reconnects, "queue_depth": self.queue.qsize(),
+                        "backoff_seconds": self.current_backoff,
                     })
-                    # Healthy sessions reset the exponential delay; failed handshakes do not.
-                    if self.subscribed and self.clock() - self._connected_at >= 30:
-                        delay = 1.0
-                    await asyncio.sleep(delay + random.uniform(0, 0.5))
+                    self._phase = "BACKOFF"
+                    await self._sleep_backoff()
                     delay = min(delay * 2, self.settings.ws_backoff_max_seconds)
                 finally:
                     self.connected = False
         finally:
+            self._stopping = True
             self.connected = False
-            worker.cancel()
-            await asyncio.gather(worker, return_exceptions=True)
+            self._phase = "DISCONNECTED"
+            if self._worker_task is not None:
+                self._worker_task.cancel()
+                await asyncio.gather(self._worker_task, return_exceptions=True)
 
     async def _receive(self, ws: Any) -> None:
         wanted = {self.feed_key(arg) for arg in self.subscriptions}
@@ -681,7 +847,10 @@ class OkxWebSocket:
         # transport readiness nor applied-data freshness is granted early.
         awaiting_ack: list[tuple[dict[str, Any], float]] = []
         ready_announced = False
+        subscribe_started = self.subscribe_sent_at if self.subscribe_sent_at is not None else self._connected_at
         while True:
+            if self._worker_task is not None and self._worker_task.done():
+                raise WebSocketFault("business worker terminated", kind="handler")
             now = self.clock()
             if self.ping_pending:
                 timeout = self.settings.ws_pong_timeout_seconds - (now - self.last_ping_at)
@@ -694,10 +863,10 @@ class OkxWebSocket:
                     self.last_ping_at = self.clock()
                     self.ping_pending = True
                     continue
-            if not wanted <= self.subscribed and now - self._connected_at > self.settings.request_timeout_seconds:
+            if not wanted <= self.subscribed and now - subscribe_started > self.settings.request_timeout_seconds:
                 raise WebSocketFault("subscription acknowledgement timeout")
             timeout = min(timeout, max(0.001, self.settings.request_timeout_seconds -
-                          (now - self._connected_at))) if not wanted <= self.subscribed else timeout
+                          (now - subscribe_started))) if not wanted <= self.subscribed else timeout
             try:
                 raw = await asyncio.wait_for(ws.recv(), timeout=timeout)
             except TimeoutError:
@@ -707,7 +876,7 @@ class OkxWebSocket:
             # deadline, even if wait_for raced with task completion.
             if self.ping_pending and received_at - self.last_ping_at >= self.settings.ws_pong_timeout_seconds:
                 raise WebSocketFault("heartbeat timeout")
-            if not wanted <= self.subscribed and received_at - self._connected_at >= self.settings.request_timeout_seconds:
+            if not wanted <= self.subscribed and received_at - subscribe_started >= self.settings.request_timeout_seconds:
                 raise WebSocketFault("subscription acknowledgement timeout")
             self.last_rx_at = received_at
             if raw == "pong":
@@ -728,11 +897,14 @@ class OkxWebSocket:
                     raise WebSocketFault("server maintenance notice 64008", kind="maintenance")
                 # Unknown notices are never guessed to be harmless.
                 raise WebSocketFault("unknown server notice", kind="protocol")
-            if event == "error":
+            if event in {"error", "channel-conn-count-error", "unsubscribe"}:
                 raise WebSocketFault("subscription rejected", kind="protocol")
             if event == "subscribe":
                 key = self.feed_key(message.get("arg", {}))
-                if key not in wanted or str(message.get("code", "0")) != "0":
+                arg = message.get("arg", {})
+                exact = any(all(arg.get(k) == v for k, v in requested.items())
+                            for requested in self.subscriptions)
+                if key not in wanted or not exact or str(message.get("code", "0")) != "0":
                     raise WebSocketFault("invalid subscription acknowledgement", kind="protocol")
                 self.subscribed.add(key)
             if not ready_announced and wanted <= self.subscribed:
@@ -740,6 +912,8 @@ class OkxWebSocket:
                     self._enqueue_message(buffered, arrival)
                 awaiting_ack.clear()
                 ready_announced = True
+                self.subscriptions_completed_at = self.clock()
+                self._phase = "RECONCILING" if self.private else "ACTIVE"
                 if self.on_ready is not None:
                     self.on_ready(self)
             if "data" not in message:
@@ -770,27 +944,24 @@ class OkxWebSocket:
         while True:
             message, received_at = await self.queue.get()
             batch = [(message, received_at)]
-            if self.batch_handler is not None:
-                # Consume only already queued frames, never wait to build a batch.
-                # Private/candle handlers keep their original per-event semantics.
-                while len(batch) < 64 and not self.queue.empty():
-                    batch.append(self.queue.get_nowait())
-            for _ in batch:
-                if self._queued_at:
-                    self._queued_at.popleft()
-            self._queue_metric()
-            self._handler_started_at = self.clock()
-            if self.metrics is not None:
-                self.metrics.ws_queue_wait.labels(socket=self.name).observe(
-                    max(0, self.clock() - received_at)
-                )
+            # Every successful get is covered, including metrics/batch failures.
             try:
+                if self.batch_handler is not None:
+                    while len(batch) < 64 and not self.queue.empty():
+                        batch.append(self.queue.get_nowait())
+                for _ in batch:
+                    if self._queued_at:
+                        self._queued_at.popleft()
+                self._queue_metric()
+                self._handler_started_at = self.clock()
+                if self.metrics is not None:
+                    self.metrics.ws_queue_wait.labels(socket=self.name).observe(
+                        max(0, self.clock() - received_at)
+                    )
                 if self.batch_handler is None:
                     await self.handler(message)
                 else:
                     await self.batch_handler([item for item, _ in batch])
-                # Freshness credits only successfully applied data, using arrival time
-                # rather than completion time (a slow handler cannot make old data fresh).
                 for item, arrival in batch:
                     if item.get("data"):
                         self.last_data_at[self.feed_key(item.get("arg", {}))] = arrival
@@ -804,13 +975,15 @@ class OkxWebSocket:
                     "queue_depth": self.queue.qsize(),
                 })
             finally:
-                if self.metrics is not None:
-                    self.metrics.ws_handler_latency.labels(socket=self.name).observe(
-                        max(0, self.clock() - self._handler_started_at)
-                    )
+                # Complete the queue accounting even if an observer fails.
+                started_at = self._handler_started_at
                 self._handler_started_at = None
                 for _ in batch:
                     self.queue.task_done()
+                if self.metrics is not None:
+                    self.metrics.ws_handler_latency.labels(socket=self.name).observe(
+                        max(0, self.clock() - started_at) if started_at is not None else 0
+                    )
 
     def _queue_metric(self) -> None:
         if self.metrics is not None:
@@ -823,6 +996,7 @@ class OkxWebSocket:
                        self.settings.confirm_live_account_id):
             if secret:
                 value = value.replace(secret, "[redacted]")
+        value = re.sub(r"[\x00-\x1f\x7f]", " ", value)
         value = re.sub(r"(?:https?|wss?)://\S+", "[endpoint redacted]", value)
         return re.sub(r"(?i)(?:token|key|secret|passphrase|authorization)\s*[:=]\s*\S+",
                       "[redacted]", value)[:200]
@@ -870,9 +1044,12 @@ class OkxWebSocket:
         starts = [t for t in (self._queued_at[0] if self._queued_at else None,
                                self._handler_started_at) if t is not None]
         oldest = min(starts) if starts else None
-        return not self.processing_unsafe and (
+        return (not self.processing_unsafe
+                and (self._run_task is None or self.worker_alive)
+                and (self._run_task is None or not self._run_task.done())
+                and (
             oldest is None or self.clock() - oldest < self.settings.stale_timeout_seconds
-        )
+        ))
 
     def stale_feeds(self) -> list[dict[str, Any]]:
         if self.private:
@@ -910,8 +1087,41 @@ class OkxWebSocket:
                 and self.is_processing_healthy() and not self.reconciliation_required)
 
     def status(self) -> dict[str, Any]:
+        if (self.is_transport_healthy() and self.subscriptions_completed_at is not None
+                and self.clock() - self.subscriptions_completed_at >= 30):
+            self.consecutive_failures = 0
+        attempt_age = (max(0, self.clock() - self.last_connect_attempt_at)
+                       if self.last_connect_attempt_at is not None else None)
+        if self.metrics is not None:
+            self.metrics.ws_consecutive_failures.labels(socket=self.name).set(self.consecutive_failures)
+            self.metrics.ws_reconnect_backoff.labels(socket=self.name).set(self.current_backoff)
+            self.metrics.ws_attempt_age.labels(socket=self.name).set(attempt_age or 0)
+            self.metrics.ws_worker_alive.labels(socket=self.name).set(self.worker_alive)
         return {
-            "name": self.name, "connected": self.connected,
+            "name": self.name, "connected": self.connected, "phase": self.phase,
+            "generation": self.generation,
+            "time_basis": "monotonic_seconds",
+            "login_ok": self.login_ok,
+            "subscriptions_ok": {self.feed_key(arg) for arg in self.subscriptions} <= self.subscribed,
+            "subscriptions_acked": len(self.subscribed),
+            "login_started_at": self.login_started_at, "login_completed_at": self.login_completed_at,
+            "subscribe_sent_at": self.subscribe_sent_at,
+            "subscriptions_completed_at": self.subscriptions_completed_at,
+            "last_disconnect_at": self.last_disconnect_at,
+            "last_connect_attempt_at": self.last_connect_attempt_at,
+            "last_connect_attempt_age_seconds": attempt_age,
+            "next_retry_in": max(0, self._next_retry_at - self.clock()) if self._next_retry_at is not None else None,
+            "current_backoff": self.current_backoff,
+            "consecutive_failures": self.consecutive_failures,
+            "run_task_alive": self._run_task is not None and not self._run_task.done(),
+            "worker_task_alive": self.worker_alive, "worker_alive": self.worker_alive,
+            "worker_exception_type": self.worker_exception_type,
+            "reconnect_stalled": self.reconnect_stalled(),
+            "reason_code": self.reason_code,
+            "last_disconnect_phase": self.last_disconnect_phase,
+            "close_code": self.last_close_code, "close_reason": self.last_close_reason,
+            "close_side": self.last_close_side,
+            "last_ping_age_seconds": self._age(self.last_ping_at),
             "transport_healthy": self.is_transport_healthy(),
             "critical_data_fresh": self.is_data_fresh(),
             "processing_healthy": self.is_processing_healthy(),

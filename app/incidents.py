@@ -152,6 +152,9 @@ class IncidentManager:
             return []
         if event_code(event) == "RISK_HALT":
             reason = NotificationPolicy.halt_reason(event)
+            if reason == "WebSocket transport unavailable" and event.metadata.get("ws_incident_managed"):
+                # Socket observers track transport separately from trading recovery.
+                return []
             if reason in AUTO_RECOVERABLE_REASONS:
                 halt_component = {
                     "reconciliation failed": "reconciliation",
@@ -187,6 +190,27 @@ class IncidentManager:
             return []
         if event.category == NotificationCategory.INFRASTRUCTURE:
             component = self._component(event)
+            ws_key = event.metadata.get("ws_incident_key")
+            if (component in {"websocket", "ws_recovery"} and isinstance(ws_key, str)
+                    and ws_key.startswith(("ws:transport:", "ws:recovery:"))):
+                detail = event.metadata.get("ws_details")
+                if event.metadata.get("recovery"):
+                    ws_incident = self.active.get(ws_key)
+                    if ws_incident is not None:
+                        ws_incident.risk_state = str(event.metadata.get("risk_state", ws_incident.risk_state))
+                        ws_incident.recovered_components.add(component)
+                        ws_incident.components_recovered_tick = self.clock()
+                        if isinstance(detail, str):
+                            ws_incident.ws_details[component] = detail
+                        return self._resolve(ws_key)
+                else:
+                    incident = self._open_or_update(
+                        ws_key, component, component + " unavailable", halt=False,
+                        risk_state=str(event.metadata.get("risk_state", "UNKNOWN")),
+                    )
+                    if isinstance(detail, str):
+                        incident.ws_details[component] = detail
+                return []
             if component:
                 if event.metadata.get("recovery"):
                     active_infra = self.active.get("infra:trading")
@@ -256,6 +280,8 @@ class IncidentManager:
         code = "INCIDENT_OPEN"
         if incident.ws_details:
             message += "\n" + "\n".join(incident.ws_details.values())
+            if incident.components == {"ws_recovery"}:
+                code, title = "WS_RECOVERY_PENDING", "🚨 WebSocket 重连后对账未完成"
             if incident.components <= {"websocket", "market_data", "ws_backlog"}:
                 if "ws_backlog" in incident.components:
                     code, title = "WS_BACKLOG", "🚨 WebSocket 消息处理积压"
@@ -322,7 +348,7 @@ class IncidentManager:
 
     def _resolved_notification(self, incident: Incident) -> NotificationEvent:
         retrospective = not incident.notified_open and incident.alert_threshold_met
-        component_only = incident.key == "infra:trading" and incident.risk_state != "NORMAL"
+        component_only = (incident.key == "infra:trading" or incident.key.startswith("ws:")) and incident.risk_state != "NORMAL"
         if retrospective:
             if incident.key == "risk:emergency":
                 title = "🚨 Emergency Incident Resolved"
@@ -366,6 +392,13 @@ class IncidentManager:
                 ws_recovery_code, title = "WS_RECOVERED", "✅ WebSocket 已恢复"
             else:
                 ws_recovery_code, title = "WS_MARKET_RECOVERED", "✅ 市场数据已恢复"
+        if incident.key.startswith("ws:"):
+            details = "\n".join(incident.ws_details.values())
+            message += "\n" + details
+            if "Reconciliation: pending" in details or "Worker: unavailable" in details:
+                ws_recovery_code, title = "WS_TRANSPORT_RECOVERED", "⚠️ WebSocket 已重连，等待安全对账"
+            else:
+                ws_recovery_code, title = "WS_RECOVERED", "✅ WebSocket 已恢复"
         return NotificationEvent(
             event_code=(ws_recovery_code or (
                 "INFRASTRUCTURE_RECOVERED" if component_only

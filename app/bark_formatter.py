@@ -9,6 +9,23 @@ from app.models import NotificationEvent, NotificationPriority
 from app.notification_events import event_code, normalize_event, reason_code
 
 REASONS = {
+    "ws_connection_closed": "连接关闭；收到关闭帧时见关闭代码与原因",
+    "ws_heartbeat_timeout": "应用层心跳 Pong 超时",
+    "ws_login_failed": "登录认证失败",
+    "ws_login_timeout": "登录认证超时",
+    "ws_subscription_rejected": "订阅被拒绝或已撤销",
+    "ws_subscription_timeout": "等待订阅确认超时",
+    "ws_server_maintenance": "OKX 服务端维护，要求重连",
+    "ws_protocol_error": "WebSocket 协议异常",
+    "ws_processing_backlog": "WebSocket 消息处理积压",
+    "ws_reconciliation_pending": "连接已恢复，等待完整安全对账",
+    "ws_worker_failed": "WebSocket 业务处理任务退出",
+    "ws_run_task_failed": "WebSocket 连接任务退出",
+    "ws_reconnect_stalled": "WebSocket 重连任务停止响应",
+    "ws_connect_timeout": "TCP/TLS/WebSocket 握手超时",
+    "ws_connection_error": "连接失败，未收到明确关闭帧",
+    "healthy": "连接健康",
+    "ws_recovery unavailable": "WebSocket 重连后对账未完成",
     "LIVE writer lease lost": "LIVE 单写权限已丢失，需要人工检查并重启",
     "reconciliation failed": "OKX 对账暂时失败",
     "reconciliation permanent failure": "OKX 对账发生不可自动恢复的错误",
@@ -80,6 +97,9 @@ COMPONENT_NAMES = {
     "auto_recovery": "自动恢复",
 }
 TITLES = {
+    "WS_TRANSPORT_RECOVERED": "⚠️ WebSocket 已重连，等待安全对账",
+    "WS_RECOVERY_PENDING": "🚨 WebSocket 重连后对账未完成",
+    "WS_TASK_STALLED": "🚨 WebSocket 重连任务停止响应",
     "WS_MARKET_STALE": "⚠️ 市场数据过期",
     "WS_MARKET_RECOVERED": "✅ 市场数据已恢复",
     "WS_BACKLOG": "🚨 WebSocket 消息处理积压",
@@ -119,6 +139,10 @@ TITLES = {
     "UNSAFE_SHUTDOWN": "🚨 安全停机尚未完成",
 }
 LABELS = {
+    "Phase": "阶段", "Failure phase": "故障阶段",
+    "Reason code": "reason_code", "Close code": "关闭代码", "Close reason": "关闭原因",
+    "Close side": "关闭方向", "Last Pong": "最近 Pong", "Next retry": "下次重试（秒）",
+    "Transport": "连接状态", "Login": "登录", "Subscription": "订阅", "Worker": "处理任务",
     "Socket": "连接",
     "Feed": "频道",
     "Symbol": "品种",
@@ -255,6 +279,8 @@ def _body_line(line: str, event: NotificationEvent) -> str:
         return localized_reason(line)
     if label == "Reason":
         value = ", ".join(localized_reason(part) for part in value.split(", "))
+    elif label == "Reconciliation" and value == "pending":
+        value = "等待安全对账"
     elif label in {"Duration", "Downtime", "Uptime"}:
         value = duration_text(value)
     elif label in {"Components", "Component"}:

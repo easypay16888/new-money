@@ -283,7 +283,8 @@ async def test_manual_resume_requires_full_health_after_block_release(tmp_path):
         runtime.redis = AsyncMock()
         runtime.redis.get.return_value = "1"
         runtime.dead_man_healthy = True
-        runtime.sockets = [SimpleNamespace(connected=True, private=False, reconciliation_required=False,
+        runtime.sockets = [SimpleNamespace(_run_task=None, reconnect_stalled=lambda: False,
+                                           connected=True, private=False, reconciliation_required=False,
             is_fresh=lambda: True, is_transport_healthy=lambda: True,
             is_data_fresh=lambda: True, is_processing_healthy=lambda: True)]
         assert await runtime.resume()

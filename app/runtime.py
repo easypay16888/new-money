@@ -7,6 +7,7 @@ from collections import deque
 from collections.abc import Awaitable
 from datetime import datetime, timedelta
 from decimal import Decimal
+from functools import partial
 from time import monotonic
 from typing import Any
 
@@ -98,6 +99,7 @@ class TradingRuntime:
         self.portfolio = PortfolioState(equity=Decimal(0), available_balance=Decimal(0))
         self._notification_remote_exposure = False
         self.sockets: list[OkxWebSocket] = []
+        self._ws_diagnostic_state: dict[str, tuple[Any, ...]] = {}
         self.tasks: list[asyncio.Task[Any]] = []
         self.running = False
         self.evaluated_candles: dict[str, int] = {}
@@ -332,7 +334,7 @@ class TradingRuntime:
             priority=NotificationPriority.CRITICAL if critical else NotificationPriority.TIME_SENSITIVE,
             symbol=symbol,
             dedup_key=f"risk-state:{symbol or 'all'}",
-            metadata={"transition": True},
+            metadata={"transition": True, "ws_incident_managed": bool(self.sockets)},
         )
 
     def _lease_lost(self) -> None:
@@ -1204,6 +1206,8 @@ class TradingRuntime:
             )
         self.running = True
         self.tasks = [asyncio.create_task(ws.run()) for ws in self.sockets]
+        for ws, task in zip(self.sockets, self.tasks, strict=True):
+            task.add_done_callback(partial(self._on_ws_run_done, ws))
         self.tasks += [
             asyncio.create_task(self._watchdog()),
             asyncio.create_task(self._auto_recovery_loop()),
@@ -1442,6 +1446,10 @@ class TradingRuntime:
         )
 
     def _ws_health_reason(self) -> str | None:
+        if any(ws._run_task is not None and ws._run_task.done() for ws in self.sockets):
+            return "WebSocket run task stopped"
+        if any(ws.reconnect_stalled() for ws in self.sockets):
+            return "WebSocket reconnect loop stalled"
         if any(not ws.is_processing_healthy() for ws in self.sockets):
             return "WebSocket processing backlog"
         if any(not ws.is_transport_healthy() for ws in self.sockets):
@@ -1469,6 +1477,25 @@ class TradingRuntime:
         if ws.private:
             self._schedule_ws_reconciliation(ws)
 
+    def _on_ws_run_done(self, ws: OkxWebSocket, task: asyncio.Task[Any]) -> None:
+        if not self.running:
+            return  # Expected cancellation during safe shutdown.
+        if not task.cancelled():
+            task.exception()  # Retrieve, never format potentially sensitive exceptions.
+        ws.reason_code = "ws_run_task_failed"
+        self._on_ws_fault(ws, "WebSocket run task stopped")
+        notice = asyncio.create_task(self._report_ws_task_failure(ws))
+        self.tasks.append(notice)
+
+    async def _report_ws_task_failure(self, ws: OkxWebSocket) -> None:
+        await self.alert(
+            "CRITICAL", "🚨 WebSocket 重连任务停止响应", self._ws_details(ws),
+            category=NotificationCategory.INFRASTRUCTURE,
+            priority=NotificationPriority.CRITICAL,
+            dedup_key=f"ws-liveness:{ws.name}:{ws.reason_code}",
+            metadata={"transition": True, "reason": ws.reason_code},
+        )
+
     def _schedule_ws_reconciliation(self, ws: OkxWebSocket, reason: str | None = None) -> None:
         self._ws_reconcile_requested.add(ws.name)
         current = self._ws_safety_tasks.get(ws.name)
@@ -1490,7 +1517,17 @@ class TradingRuntime:
                 while ws.name in self._ws_reconcile_requested:
                     self._ws_reconcile_requested.discard(ws.name)
                     if ws.is_transport_healthy():
-                        await ws.queue.join()
+                        try:
+                            async with asyncio.timeout(self.settings.stale_timeout_seconds):
+                                await ws.queue.join()
+                        except TimeoutError:
+                            # Cancel only this join waiter, never an accepted handler/write.
+                            # The normal reconciliation loop retries; its idle/generation gate
+                            # cannot clear recovery while processing remains outstanding.
+                            logger.warning("WS recovery waiting for business worker", extra={
+                                "socket_name": ws.name, "phase": ws.phase,
+                                "queue_depth": ws.queue.qsize(),
+                            })
                     if self.settings.has_credentials:
                         await self.reconcile()
                     await self._send_observation(self._observe_infrastructure())
@@ -1728,7 +1765,8 @@ class TradingRuntime:
 
     async def _observe_component(
         self, name: str, healthy: bool, *, outage: str, recovery: str, threshold: int = 1,
-        details: str = "", component: str | None = None,
+        details: str = "", component: str | None = None, incident_key: str | None = None,
+        update_details: bool = False,
     ) -> None:
         previous = self._component_health.get(name)
         if previous is None:
@@ -1736,6 +1774,14 @@ class TradingRuntime:
             return
         if healthy == previous:
             self._component_pending.pop(name, None)
+            if not healthy and incident_key and update_details:
+                # Update incident evidence before manager dedup, without another phone alert.
+                await self.alert(
+                    "WARNING", outage, details, category=NotificationCategory.INFRASTRUCTURE,
+                    dedup_key=f"infrastructure:{name}",
+                    metadata={"component": component, "ws_details": details,
+                              "ws_incident_key": incident_key},
+                )
             return
         pending_state, count = self._component_pending.get(name, (healthy, 0))
         count = count + 1 if pending_state == healthy else 1
@@ -1748,15 +1794,62 @@ class TradingRuntime:
             "INFO" if healthy else "WARNING",
             recovery if healthy else outage,
             f"Component: {name}\nStatus: {'recovered' if healthy else 'unavailable'}"
-            + ("\n" + details if details and not healthy else ""),
+            + ("\n" + details if details else ""),
             category=NotificationCategory.INFRASTRUCTURE,
             dedup_key=f"infrastructure:{name}",
             metadata={"recovery": healthy, **({"component": component, "ws_details": details}
-                                           if component else {})},
+                                           if component else {}),
+                      **({"ws_incident_key": incident_key} if incident_key else {})},
         )
 
+    @staticmethod
+    def _ws_details(ws: OkxWebSocket) -> str:
+        data = ws.status()
+        pong = data["last_pong_age_seconds"]
+        return (
+            f"Socket: {ws.name}\nPhase: {ws.phase}"
+            f"\nFailure phase: {ws.last_disconnect_phase or 'unavailable'}"
+            f"\nReason: {'ws_reconciliation_pending' if ws.is_transport_healthy() and ws.reconciliation_required else 'healthy' if ws.is_fresh() else ws.reason_code}"
+            f"\nReason code: {ws.reason_code}"
+            f"\nClose code: {ws.last_close_code if ws.last_close_code is not None else 'unavailable'}"
+            f"\nClose reason: {ws.last_close_reason or 'unavailable'}"
+            f"\nClose side: {ws.last_close_side or 'unavailable'}"
+            f"\nLast Pong: {f'{pong:.1f}s' if pong is not None else 'unavailable'}"
+            f"\nFailures: {ws.consecutive_failures}\nReconnects: {ws.reconnects}"
+            f"\nNext retry: {data['next_retry_in'] if data['next_retry_in'] is not None else 'unavailable'}"
+            f"\nTransport: {'healthy' if ws.is_transport_healthy() else 'unavailable'}"
+            f"\nLogin: {'healthy' if ws.login_ok else 'unavailable'}"
+            f"\nSubscription: {'healthy' if data['subscriptions_ok'] else 'unavailable'}"
+            f"\nWorker: {'healthy' if ws.worker_alive else 'unavailable'}"
+            f"\nReconciliation: {'pending' if ws.reconciliation_required else 'healthy'}"
+        )
+
+    async def _observe_private_ws(self, ws: OkxWebSocket) -> None:
+        transport = ws.is_transport_healthy()
+        fingerprint = (ws.phase, ws.reason_code, ws.reconnects, ws.worker_alive, ws.reconciliation_required)
+        update = self._ws_diagnostic_state.get(ws.name) != fingerprint
+        self._ws_diagnostic_state[ws.name] = fingerprint
+        name = f"{ws.name}:Transport"
+        self._component_health.setdefault(name, True)
+        await self._observe_component(
+            name, transport, outage="🚨 WebSocket 连接中断", recovery="⚠️ WebSocket 已重连，等待安全对账",
+            component="websocket", details=self._ws_details(ws),
+            incident_key=f"ws:transport:{ws.name}", update_details=update,
+        )
+        if transport:
+            name = f"{ws.name}:Recovery"
+            self._component_health.setdefault(name, True)
+            await self._observe_component(
+                name, ws.is_fresh(), outage="🚨 WebSocket 重连后对账未完成", recovery="✅ WebSocket 已恢复",
+                component="ws_recovery", details=self._ws_details(ws),
+                incident_key=f"ws:recovery:{ws.name}", update_details=update,
+            )
+
     async def _observe_infrastructure(self) -> None:
-        disconnected = [ws for ws in self.sockets if not ws.is_transport_healthy()]
+        for ws in self.sockets:
+            if ws.private:
+                await self._observe_private_ws(ws)
+        disconnected = [ws for ws in self.sockets if not ws.private and not ws.is_transport_healthy()]
         stale = [(ws, feed) for ws in self.sockets for feed in ws.stale_feeds()]
         backlog = [ws for ws in self.sockets if not ws.is_processing_healthy()]
         for component in ("WebSocket", "MarketData", "WSProcessing"):
@@ -2052,10 +2145,25 @@ class TradingRuntime:
                 ).inc()
                 logger.error("auto_recovery check error_type=%s", type(exc).__name__)
 
+    async def _check_ws_liveness(self) -> None:
+        for ws in self.sockets:
+            ws.status()  # Refresh bounded socket metrics independently of /status requests.
+            dead_run = ws._run_task is not None and ws._run_task.done()
+            dead_worker = ws._run_task is not None and not ws.worker_alive
+            if dead_run or dead_worker or ws.reconnect_stalled():
+                reason = ("WebSocket run task stopped" if dead_run else
+                          "WebSocket processing failed" if dead_worker else
+                          "WebSocket reconnect loop stalled")
+                ws.reason_code = ("ws_run_task_failed" if dead_run else
+                                  "ws_worker_failed" if dead_worker else "ws_reconnect_stalled")
+                self._on_ws_fault(ws, reason)
+                await self._report_ws_task_failure(ws)
+
     async def _watchdog(self) -> None:
         while self.running:
             await asyncio.sleep(5)
             await self._refresh_redis()
+            await self._check_ws_liveness()
             self.metrics.update(
                 self.portfolio,
                 self.governor.state,

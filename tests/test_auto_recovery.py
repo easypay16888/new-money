@@ -310,6 +310,11 @@ async def test_full_resume_health_gate_checks_redis_ws_caa_and_blocked_symbols(
             return self.value
 
     class Socket:
+        _run_task = None
+
+        def reconnect_stalled(self):
+            return False
+
         connected = True
 
         private = False
@@ -363,6 +368,11 @@ async def test_auto_recovery_requires_recent_caa_refresh(recovery_runtime):
             return "1"
 
     class FreshSocket:
+        _run_task = None
+
+        def reconnect_stalled(self):
+            return False
+
         connected = True
 
         private = False
@@ -423,6 +433,11 @@ async def test_reconciliation_endpoint_transient_fault_then_auto_recovers(
             return "1"
 
     class FreshSocket:
+        _run_task = None
+
+        def reconnect_stalled(self):
+            return False
+
         connected = True
 
         private = False

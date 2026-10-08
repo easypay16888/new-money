@@ -29,6 +29,9 @@ class JsonFormatter(logging.Formatter):
             "socket_name", "exception_type", "close_code", "close_reason", "ws_reason",
             "last_rx_age", "last_pong_age", "reconnect_count", "queue_depth",
             "channel", "expected", "actual",
+            "phase", "close_side", "reason_class", "session_age", "ping_pending",
+            "login_ok", "subscriptions_acked", "reconciliation_required", "backoff_seconds",
+            "endpoint_host", "endpoint_port", "endpoint_path",
         ):
             value = getattr(record, key, None)
             payload[key] = value

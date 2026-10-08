@@ -86,6 +86,13 @@ class Metrics:
         self.ws_market_stale_events = Counter(
             "quant_ws_market_stale_events_total", "Critical feed freshness failures", ["socket"], registry=self.registry
         )
+        self.ws_connect_attempts = Counter("quant_ws_connect_attempts_total", "WS connection attempts", ["socket"], registry=self.registry)
+        self.ws_connect_failures = Counter("quant_ws_connect_failures_total", "WS session failures", ["socket", "reason_class"], registry=self.registry)
+        self.ws_consecutive_failures = Gauge("quant_ws_consecutive_failures", "Consecutive WS failures", ["socket"], registry=self.registry)
+        self.ws_session_duration = Histogram("quant_ws_session_duration_seconds", "Ended WS session duration", ["socket"], registry=self.registry)
+        self.ws_reconnect_backoff = Gauge("quant_ws_reconnect_backoff_seconds", "WS reconnect backoff", ["socket"], registry=self.registry)
+        self.ws_attempt_age = Gauge("quant_ws_last_connect_attempt_age_seconds", "Age of WS connection attempt", ["socket"], registry=self.registry)
+        self.ws_worker_alive = Gauge("quant_ws_worker_alive", "WS business worker alive", ["socket"], registry=self.registry)
         self.orders = Counter("quant_orders_total", "Order submissions", registry=self.registry)
         self.order_errors = Counter(
             "quant_order_errors_total", "Order submission errors", registry=self.registry

@@ -541,6 +541,11 @@ async def test_system_start_waits_for_reconciliation(tmp_path):
     runtime.dead_man_healthy = True
 
     class HealthySocket:
+        _run_task = None
+
+        def reconnect_stalled(self):
+            return False
+
         private = False
         reconciliation_required = False
 
