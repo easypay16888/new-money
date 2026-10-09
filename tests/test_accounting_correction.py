@@ -344,3 +344,38 @@ async def test_service_rechecks_safety_after_history_before_commit(correction_st
     with pytest.raises(ValueError):
         await service.correct(local['symbol'], local['clOrdId'], apply=True)
     assert not await correction_store.latest('fill_accounting_corrections')
+
+
+@pytest.mark.parametrize('token', ['', 'test-control-token-only'])
+async def test_cli_status_header_supports_optional_paper_token(correction_store, monkeypatch, token):
+    import httpx
+
+    from app import accounting_correction
+    from app.config import Settings
+
+    local, detail, rows, _ = await seed(correction_store)
+    settings = Settings(_env_file=None, api_token=token,
+                        database_url=str(correction_store.engine.url))
+    client = AsyncMock()
+    client.order.return_value = [detail]
+    client.fills_history.side_effect = [rows, []]
+    requests = []
+
+    def status_response(request):
+        requests.append(request)
+        assert request.method == 'GET' and str(request.url) == 'http://127.0.0.1:8000/status'
+        assert request.headers.get('Authorization') == ('Bearer ' + token if token else None)
+        return httpx.Response(200, json={'mode': 'PAPER', 'running': False,
+                                         'risk_state': 'EMERGENCY'})
+
+    original_client = httpx.AsyncClient
+    monkeypatch.setattr(accounting_correction, 'Settings', lambda: settings)
+    monkeypatch.setattr(accounting_correction, 'Store', lambda _: correction_store)
+    monkeypatch.setattr(accounting_correction, 'OkxRestClient', lambda _: client)
+    monkeypatch.setattr(accounting_correction.httpx, 'AsyncClient',
+                        lambda **kwargs: original_client(transport=httpx.MockTransport(status_response),
+                                                         **kwargs))
+    report = await accounting_correction.run(local['symbol'], local['clOrdId'], apply=False)
+    assert len(requests) == 3 and report['corrections_proposed'] == 1
+    assert report['corrections_added'] == 0
+    assert not await correction_store.latest('fill_accounting_corrections')

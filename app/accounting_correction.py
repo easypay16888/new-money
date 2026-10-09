@@ -53,7 +53,8 @@ async def run(symbol: str, client_id: str, *, apply: bool) -> dict:
             async def status() -> dict:
                 response = await status_client.get(
                     'http://127.0.0.1:8000/status',
-                    headers={'Authorization': 'Bearer ' + settings.api_token},
+                    headers=({'Authorization': 'Bearer ' + settings.api_token}
+                             if settings.api_token else {}),
                 )
                 response.raise_for_status()
                 return response.json()
