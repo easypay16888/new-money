@@ -132,3 +132,21 @@ async def test_history_http_timeout_propagates_without_trading_request():
         with pytest.raises(OkxError):
             await client.fills_history("BTC-USDT-SWAP")
     assert [r.method for r in requests] == ["GET"]
+
+
+async def test_order_scoped_history_uses_inst_id_ord_id_and_bill_cursor():
+    requests = []
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda r: requests.append(r) or httpx.Response(
+            200, json={'code': '0', 'data': []}
+        )), base_url='https://openapi.okx.com',
+    ) as http:
+        client = OkxRestClient(Settings(
+            _env_file=None, okx_api_key='demo', okx_secret_key='demo', okx_passphrase='demo',
+        ), http)
+        await client.fills_history('BTC-USDT-SWAP', order_id='owned-order', after='200', limit=100)
+    assert len(requests) == 1 and requests[0].method == 'GET'
+    assert dict(requests[0].url.params) == {
+        'instType': 'SWAP', 'instId': 'BTC-USDT-SWAP', 'ordId': 'owned-order',
+        'after': '200', 'limit': '100',
+    }

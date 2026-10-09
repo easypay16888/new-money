@@ -329,20 +329,21 @@ class OkxRestClient:
 
     async def fills_history(
         self, symbol: str | None = None, *, after: str = "", before: str = "", limit: int = 100,
-        begin: int | None = None, end: int | None = None,
+        begin: int | None = None, end: int | None = None, order_id: str = "",
     ) -> list[dict[str, Any]]:
         return await self._fills_page(
             "fills-history", symbol, after=after, before=before, limit=limit, begin=begin, end=end,
+            order_id=order_id,
         )
 
     async def _fills_page(
         self, endpoint: str, symbol: str | None, *, after: str, before: str, limit: int,
-        begin: int | None = None, end: int | None = None,
+        begin: int | None = None, end: int | None = None, order_id: str = "",
     ) -> list[dict[str, Any]]:
         if not 1 <= limit <= 100:
             raise ValueError("invalid fill page limit")
         params = {"instType": "SWAP", "limit": str(limit)}
-        for key, value in (("instId", symbol), ("after", after), ("before", before)):
+        for key, value in (("instId", symbol), ("ordId", order_id), ("after", after), ("before", before)):
             if value:
                 params[key] = value
         for key, timestamp in (("begin", begin), ("end", end)):

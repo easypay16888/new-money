@@ -1,3 +1,4 @@
+from decimal import Decimal
 from unittest.mock import AsyncMock
 
 import pytest
@@ -25,10 +26,10 @@ async def snapshot_runtime(tmp_path):
                   tradeId="last-fill", fillSz="3.79", fillPx="110", fillTime=fill()["fillTime"],
                   fee="-0.200696454", feeCcy="USDT")
     canonical = {**fill("last-fill", "3.79", "entry-order", "buy", "entry"),
-                 "fee": "-0.193546962", "fillPnl": "0"}
+                 "fee": "-0.193546962", "fillPnl": "0", "billId": "200"}
     client = AsyncMock()
     client.order.return_value = [detail]
-    client.fills_history.return_value = [canonical]
+    client.fills_history.side_effect = [[canonical, earlier_fill(canonical)], []]
     for name in ("account", "positions", "pending_orders", "pending_algos"):
         getattr(client, name).return_value = []
     original = runtime.client
@@ -41,6 +42,11 @@ async def snapshot_runtime(tmp_path):
         await runtime.store.close()
 
 
+def earlier_fill(canonical):
+    return {**canonical, "tradeId": "earlier-fill", "fillSz": "0.14",
+            "fee": "-0.007149492", "billId": "100"}
+
+
 async def snapshot(runtime):
     return await runtime._refresh_terminal_order_snapshot([], [], [], [])
 
@@ -49,12 +55,14 @@ async def test_rest_cumulative_fee_is_not_written_as_individual_fill_fee(snapsho
     runtime, client, detail, canonical = snapshot_runtime
     await snapshot(runtime)
     rows = await runtime.store.latest("fills")
-    assert len(rows) == 1
-    assert rows[0]["fee"] == canonical["fee"] != detail["fee"]
-    assert rows[0]["fillPnl"] == "0"
-    assert rows[0]["fill_evidence_source"] == "okx_fills_history"
-    assert rows[0]["order_fee"] == detail["fee"]
-    client.fills_history.assert_awaited_once_with(detail["instId"], limit=100)
+    assert len(rows) == 2
+    assert sum(Decimal(r["fillSz"]) for r in rows) == Decimal("3.93")
+    assert {r["fee"] for r in rows} == {canonical["fee"], "-0.007149492"}
+    assert all(r["fillPnl"] == "0" for r in rows)
+    assert all(r["fill_evidence_source"] == "okx_fills_history" for r in rows)
+    assert runtime.order_manager.orders["entry"]["order_fee"] == detail["fee"]
+    assert all("order_fee" not in r for r in rows)
+    assert client.fills_history.await_args_list[0].kwargs["order_id"] == detail["ordId"]
 
 
 async def test_rest_then_ws_fill_with_individual_fee_is_idempotent(snapshot_runtime):
@@ -64,7 +72,7 @@ async def test_rest_then_ws_fill_with_individual_fee_is_idempotent(snapshot_runt
     await runtime.order_manager.ingest({**detail, "fillFee": canonical["fee"], "fillPnl": "0"})
     assert await runtime.store.latest("fills") == before
     assert runtime.order_manager.orders["entry"]["filled"] == "3.93"
-    assert runtime.order_manager.seen_trade_ids == {(detail["instId"], "last-fill")}
+    assert runtime.order_manager.seen_trade_ids == {(detail["instId"], "last-fill"), (detail["instId"], "earlier-fill")}
 
 
 async def test_late_earlier_partial_fill_keeps_terminal_size_and_its_own_fee(snapshot_runtime):
@@ -86,6 +94,7 @@ async def test_late_earlier_partial_fill_keeps_terminal_size_and_its_own_fee(sna
                                    {"fillTime": "1"}, {"fee": "NaN"}])
 async def test_unverified_terminal_fill_evidence_never_mutates_ledger(snapshot_runtime, change):
     runtime, client, _, canonical = snapshot_runtime
+    client.fills_history.side_effect = None
     client.fills_history.return_value = [{**canonical, **change}]
     with pytest.raises((OkxError, ValueError)):
         await snapshot(runtime)
@@ -106,6 +115,7 @@ async def test_history_unavailable_keeps_owned_order_unmodified(snapshot_runtime
 @pytest.mark.parametrize("rows", [[], "malformed", [None]])
 async def test_missing_or_malformed_history_fails_closed(snapshot_runtime, rows):
     runtime, client, _, _ = snapshot_runtime
+    client.fills_history.side_effect = None
     client.fills_history.return_value = rows
     with pytest.raises((OkxError, ValueError)):
         await snapshot(runtime)
@@ -118,7 +128,7 @@ async def test_existing_fill_conflict_is_still_rejected_and_never_overwritten(sn
              "fee": "-0.01"}
     await runtime.order_manager.ingest(event)
     before = await runtime.store.latest("fills")
-    with pytest.raises(OkxError, match="ledger fill conflict"):
+    with pytest.raises(OkxError, match="terminal_fill_evidence_conflict"):
         await snapshot(runtime)
     assert await runtime.store.latest("fills") == before
 
@@ -138,16 +148,18 @@ async def test_private_order_failure_logs_type_and_stable_code_not_payload(snaps
 
 async def test_duplicate_history_identity_is_ambiguous_and_not_ingested(snapshot_runtime):
     runtime, client, _, canonical = snapshot_runtime
+    client.fills_history.side_effect = None
     client.fills_history.return_value = [canonical, canonical]
-    with pytest.raises(OkxError, match="evidence incomplete"):
+    with pytest.raises(OkxError, match="terminal_fill_evidence_"):
         await snapshot(runtime)
     assert await runtime.store.latest("fills") == []
 
 
-async def test_terminal_history_read_is_bounded_to_one_page(snapshot_runtime):
+async def test_terminal_oversized_page_fails_closed(snapshot_runtime):
     runtime, client, _, canonical = snapshot_runtime
+    client.fills_history.side_effect = None
     client.fills_history.return_value = [canonical] * 101
-    with pytest.raises(OkxError, match="evidence incomplete"):
+    with pytest.raises(OkxError, match="terminal_fill_evidence_"):
         await snapshot(runtime)
     assert client.fills_history.await_count == 1
     assert await runtime.store.latest("fills") == []

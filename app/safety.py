@@ -68,6 +68,20 @@ class EntryOrderController:
         if detail:
             remote = detail[0]
             state = remote.get("state")
+            if (state in {"filled", "canceled", "mmp_canceled"}
+                    and Decimal(str(remote.get("accFillSz") or "0")) > 0
+                    and self.manager.terminal_fill_recovery is not None):
+                try:
+                    await self.manager.terminal_fill_recovery(row, remote)
+                except Exception as exc:
+                    self.blocked.add(symbol)
+                    logger.warning("terminal fill reconstruction deferred", extra={
+                        "exception_type": type(exc).__name__,
+                    })
+                    return False
+                if Decimal(str(remote.get("accFillSz") or "0")) > 0:
+                    self.blocked.add(symbol)
+                    return False
             if state == "filled":
                 await self.manager.transition(
                     client_id, OrderState.FILLED, filled=remote.get("accFillSz", row["filled"])

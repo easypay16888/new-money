@@ -55,6 +55,7 @@ async def exit_reconciliation_runtime(tmp_path):
         "reduce_only": True, "protective_algo_id": "", "direction": "SHORT",
         "approved_contracts": "1", "filled": "0", "reconciled_filled": "0",
     }
+    await runtime.store.append("orders", exit_row.copy(), symbol=SYMBOL, reference_id=exit_row["clOrdId"])
     runtime.order_manager.orders[exit_row["clOrdId"]] = exit_row
     runtime.portfolio.synchronized = True
     runtime.portfolio.positions = {SYMBOL: Decimal(1)}
@@ -66,6 +67,12 @@ async def exit_reconciliation_runtime(tmp_path):
         "side": "sell", "reduceOnly": "true", "sz": "1", "accFillSz": "1",
         "state": "filled",
     }
+    from tests.test_ledger_repair import fill
+
+    canonical = {**fill("exit-history", "1", "exit-id", "sell", exit_row["clOrdId"]), "billId": "100"}
+    detail.update(tradeId=canonical["tradeId"], fillSz="1", fillPx=canonical["fillPx"],
+                  fillTime=canonical["fillTime"])
+    exchange.fills_history = AsyncMock(side_effect=[[canonical], []])
     exchange.order_state[exit_row["clOrdId"]] = detail
     return runtime, exchange, exit_row, detail
 

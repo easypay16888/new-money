@@ -18,9 +18,9 @@ from app.daily_review import save_daily_review
 from app.decision import DecisionPipeline
 from app.execution import ExecutionEngine, OrderManager
 from app.features import compute_features
-from app.fill_identity import fill_key
+from app.fill_identity import equivalent_fill, fill_key
 from app.incidents import IncidentManager
-from app.ledger_repair import LedgerRepairResult, LedgerRepairService, parse_fill
+from app.ledger_repair import LedgerRepairResult, LedgerRepairService
 from app.live_lease import LiveLeaseError, LiveRuntimeLease
 from app.market import MarketDataEngine
 from app.models import (
@@ -58,6 +58,12 @@ from app.safety import (
 )
 from app.storage import Store
 from app.strategies import build_strategies
+from app.terminal_fills import (
+    TerminalFillError,
+    read_terminal_fills,
+    validate_fill,
+    validate_fill_set,
+)
 
 logger = logging.getLogger("runtime")
 
@@ -78,6 +84,7 @@ class TradingRuntime:
         self.client.live_writer_guard = self._live_writer_guard
         self.risk = RiskEngine(settings, self.governor)
         self.order_manager = OrderManager(self.store)
+        self.order_manager.terminal_fill_recovery = self._recover_terminal_order
         self.entry_action_lock = asyncio.Lock()
         self.execution = ExecutionEngine(
             self.client,
@@ -608,11 +615,7 @@ class TradingRuntime:
             local = self.order_manager.orders[detail["clOrdId"]]
             if not self._verified_terminal_order(local, detail):
                 return snapshot
-            evidence = await self._terminal_fill_evidence(detail)
-            # The history GET can overlap WS ingestion; recheck ownership/size.
-            if not self._verified_terminal_order(local, detail):
-                return snapshot
-            await self.order_manager.ingest(evidence)
+            await self._recover_terminal_order(local, detail)
         # Fills may have changed positions and protection since the initial parallel reads.
         # One bounded refresh; the usual identity, position and protection gates still run.
         refreshed = await asyncio.gather(
@@ -621,46 +624,68 @@ class TradingRuntime:
         )
         return refreshed[0], refreshed[1], refreshed[2], refreshed[3]
 
-    async def _terminal_fill_evidence(self, detail: dict[str, Any]) -> dict[str, Any]:
-        """Order fee is cumulative. Only trade history supplies per-fill accounting."""
-        if detail.get("fillSz") in (None, "", "0") and not detail.get("tradeId"):
-            return detail  # Snapshot has no individual fill evidence to append.
-        size = self._positive_decimal(detail.get("fillSz"))
-        if size is None:
-            raise OkxError("terminal fill evidence incomplete")
-        key = fill_key(detail.get("instId"), detail.get("tradeId"))
-        # One read, at most 100 rows. If the exact last fill is absent, halt;
-        # never guess a fee, scan indefinitely or retry a trading write.
-        history = await self.client.fills_history(key[0], limit=100)
-        if not isinstance(history, list) or len(history) > 100 or any(
-            not isinstance(row, dict) for row in history
-        ):
-            raise OkxError("terminal fill evidence incomplete")
-        candidates = [row for row in history if (
-            row.get("instId"), row.get("tradeId")
-        ) == key]
-        if len(candidates) != 1:
-            raise OkxError("terminal fill evidence incomplete")
-        canonical = parse_fill(candidates[0])
-        if (
-            canonical["ordId"] != detail["ordId"]
-            or canonical["side"] != detail["side"]
-            or (canonical.get("clOrdId") and canonical["clOrdId"] != detail["clOrdId"])
-            or str(canonical["fillTime"]) != str(detail.get("fillTime"))
-            or self._positive_decimal(canonical["fillSz"]) != size
-            or self._positive_decimal(canonical["fillPx"]) != self._positive_decimal(detail.get("fillPx"))
-        ):
-            raise OkxError("terminal fill evidence mismatch")
-        evidence = dict(detail)
-        # Keep the original order aggregate for audit, outside per-fill fields.
-        for field in ("fee", "fillFee", "fillPnl"):
-            evidence.pop(field, None)
-        evidence.update(canonical)
-        evidence.update(
-            clOrdId=detail["clOrdId"], state=detail["state"], accFillSz=detail["accFillSz"],
-            order_fee=detail.get("fee", ""), fill_evidence_source="okx_fills_history",
-        )
-        return evidence
+    async def _recover_terminal_order(self, local: dict, detail: dict) -> None:
+        if not self._verified_terminal_order(local, detail):
+            raise TerminalFillError("terminal_fill_identity_mismatch")
+        evidence = await read_terminal_fills(self.client, detail)
+        await self._append_terminal_fills(detail, evidence)
+
+    async def _append_terminal_fills(
+        self, detail: dict[str, Any], evidence: list[dict[str, Any]],
+    ) -> None:
+        evidence = [validate_fill(row, detail) for row in evidence]
+        validate_fill_set(evidence, detail)
+        manager = self.order_manager
+        async with manager.ledger_lock:
+            client_id, symbol = detail["clOrdId"], detail["instId"]
+            local = manager.orders.get(client_id)
+            if local is None or not self._verified_terminal_order(local, detail):
+                raise TerminalFillError("terminal_fill_identity_mismatch")
+            terminal_state = "FILLED" if detail["state"] == "filled" else "CANCELLED"
+            if local["state"] in {"FILLED", "CANCELLED", "REJECTED"} and local["state"] != terminal_state:
+                raise TerminalFillError("terminal_fill_evidence_conflict")
+            snapshots = {
+                table: await self.store.ledger_snapshot(table, {symbol})
+                for table in ("orders", "order_events", "fills")
+            }
+            if len([row for row in snapshots["orders"] if row.get("clOrdId") == client_id]) != 1:
+                raise TerminalFillError("terminal_fill_identity_mismatch")
+            remote = {fill_key(row["instId"], row["tradeId"]): row for row in evidence}
+            existing = {
+                fill_key(row.get("instId"), row.get("tradeId")): row
+                for row in snapshots["fills"]
+                if row.get("ordId") == detail["ordId"] or row.get("clOrdId") == client_id
+            }
+            if not existing.keys() <= remote.keys():
+                raise TerminalFillError("terminal_fill_evidence_conflict")
+            records: list[tuple[str, dict[str, Any], str]] = []
+            for key, canonical in remote.items():
+                stored = await self.store.fill_for_key(key)
+                if stored is not None:
+                    if not equivalent_fill(stored, canonical):
+                        raise TerminalFillError("terminal_fill_evidence_conflict")
+                else:
+                    if key in manager.seen_trade_ids:
+                        raise TerminalFillError("terminal_fill_evidence_conflict")
+                    payload = {**canonical, "fill_evidence_source": "okx_fills_history"}
+                    records.append(("fills", payload, key[1]))
+            terminal = {
+                **local,
+                "state": terminal_state,
+                "filled": detail["accFillSz"], "order_id": detail["ordId"],
+                "order_fee": detail.get("fee", ""),
+                "fill_evidence_source": "okx_fills_history",
+            }
+            if terminal != local:
+                records.append(("order_events", terminal, client_id))
+            if records:
+                # Existing durable ledger transaction: all missing fills and the
+                # terminal event commit together; never use public market_batch.
+                await self.store.append_ledger_recovery(records, snapshots, {symbol})
+            # No in-memory advance before durable success. Preserve reconciled_filled
+            # so the existing position delta reconciliation still sees new fills.
+            local.update(terminal)
+            manager.seen_trade_ids.update(remote)
 
     async def _reconcile_impl(self) -> None:
         self.entry_controller.client = self.client
@@ -985,6 +1010,7 @@ class TradingRuntime:
                 "reconciliation OKX failure operation=%s endpoint=%s code=%s "
                 "http_status=%s retryable=%s error_type=%s",
                 operation, endpoint, code, status, exc.retryable, error_type,
+                extra={"error_code": exc.reason_code if isinstance(exc, TerminalFillError) else None},
             )
         except (TimeoutError, ConnectionError, OSError) as exc:
             await self.enter_halt(

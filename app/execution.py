@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 from typing import Any
@@ -22,6 +22,7 @@ class OrderManager:
         self.orders: dict[str, dict] = {}
         self.seen_trade_ids: set[FillKey] = set()
         self.ledger_lock = asyncio.Lock()
+        self.terminal_fill_recovery: Callable[[dict, dict], Awaitable[None]] | None = None
 
     async def create(self, request: ExecutionRequest) -> None:
         if request.client_order_id in self.orders:
@@ -297,6 +298,7 @@ class ExecutionEngine:
         if not request.reduce_only and self.entry_allowed and not self.entry_allowed():
             await self.manager.transition(request.client_order_id, OrderState.CANCELLED)
             raise OkxError("risk-increasing order blocked")
+        queried_order = False
         try:
             result = await self.client.place_order(body)
         except OkxOrderRejected:
@@ -306,6 +308,7 @@ class ExecutionEngine:
             # An HTTP timeout does not prove rejection. Query by the same clOrdId, never retry placement.
             try:
                 result = await self.client.order(request.symbol, request.client_order_id)
+                queried_order = True
             except OkxError:
                 await self.manager.transition(request.client_order_id, OrderState.UNKNOWN)
                 raise
@@ -313,6 +316,14 @@ class ExecutionEngine:
             await self.manager.transition(request.client_order_id, OrderState.UNKNOWN)
             raise OkxError("order state unconfirmed")
         remote_state = result[0].get("state")
+        if (queried_order and remote_state in {"filled", "canceled", "mmp_canceled"}
+                and self.manager.terminal_fill_recovery is not None):
+            await self.manager.terminal_fill_recovery(
+                self.manager.orders[request.client_order_id], result[0]
+            )
+            if remote_state in {"canceled", "mmp_canceled"}:
+                raise OkxError("order rejected or canceled by exchange")
+            return
         if remote_state in {"rejected", "canceled"}:
             await self.manager.transition(
                 request.client_order_id,

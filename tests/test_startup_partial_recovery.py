@@ -1,4 +1,5 @@
 from decimal import Decimal
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -28,6 +29,23 @@ async def test_startup_partially_filled_pending_entry_with_valid_stop(tmp_path):
     exchange.pending[0]["accFillSz"] = "0.5"
     exchange.position = Decimal("0.5")
     exchange.algos = [protective_algo(runtime, request)]
+    from tests.test_ledger_repair import fill
+
+    canonical = {**fill("startup-fill", "0.5", "startup-order", "buy", request.client_order_id), "billId": "100"}
+    cancel = exchange.cancel_order
+
+    async def cancel_with_terminal_evidence(symbol, **kwargs):
+        result = await cancel(symbol, **kwargs)
+        exchange.order_state[request.client_order_id].update(
+            instId=SYMBOL, clOrdId=request.client_order_id, ordId="startup-order",
+            side="buy", reduceOnly="false", sz=str(request.risk_decision.approved_contracts),
+            tradeId=canonical["tradeId"], fillSz=canonical["fillSz"],
+            fillPx=canonical["fillPx"], fillTime=canonical["fillTime"],
+        )
+        return result
+
+    exchange.cancel_order = cancel_with_terminal_evidence
+    exchange.fills_history = AsyncMock(side_effect=[[canonical], []])
     await runtime.reconcile()
     assert runtime.reconciliation_healthy
     assert runtime.portfolio.positions[SYMBOL] == Decimal("0.5")

@@ -271,8 +271,16 @@ OKX 成交统一使用 `(instId, tradeId)`，覆盖 WS 去重、restore、数据
 
 队列上限、心跳、freshness 和积压 fencing 不放宽。DB/Redis/解析失败仍阻止本批次取得 freshness；Redis 失败时已提交的公共行情记录保留，交易继续 fail closed。该补丁新增 10 项回归，完整验证为 786 passed / 0 skipped / 0 warnings，真实 PostgreSQL 集成、Ruff 和 mypy（35 source files）通过；实际吞吐改善需部署后观察，不代表 LIVE 验收通过。
 
-### REST terminal snapshot / per-fill accounting
+### Complete terminal order fill reconstruction
 
-OKX 订单详情的 `fee` 是订单累计手续费，不能直接写作最后一个 tradeId 的逐笔手续费。已核验的 terminal order 若包含成交信息，对账会只读查询一页（最多 100 条）`fills-history`，精确核对 `(instId, tradeId)`、ordId、clOrdId（若提供）、方向、数量、价格和成交时间，再用官方逐笔 fee / fillPnl 入账；原订单累计手续费单独保留为 `order_fee`，标记 `fill_evidence_source=okx_fills_history`。缺失、冲突、歧义、认证或网络失败仍 fail closed，不猜测、不无限扫描、不重试交易写入。
+REST `/order` 的 `fee` 是订单累计手续费，`accFillSz` 是累计成交量。terminal snapshot 恢复不能只核验最后一笔成交，然后直接让本地订单代表全部成交量。现在先按 `instType=SWAP + instId + ordId` 查询 `fills-history` 的完整成交集合；使用官方 `billId` 的 `after` 向更旧记录分页，直到空页，即使途中数量已达到 `accFillSz` 也继续核验。每页最多 100 条、最多 51 次 GET（含结束探测）、最多 5,000 条记录、总时限 30 秒；不无限扫描、不重试交易写入。记录超过保留期、历史延迟不可见、边界耗尽或网络/认证失败均保持 fail closed。
 
-历史 fill 不覆盖；已有内容冲突仍拒绝修复。旧版本已记录的订单累计手续费需单独审计，本补丁不会静默改写旧账。private order handler 的错误日志新增安全 exception type / machine error code，不输出订单 payload、凭据或任意异常文本。新增 21 项回归；完整验证为 807 passed / 0 skipped / 0 warnings，真实 PostgreSQL、Ruff、mypy（35 source files）通过。策略、风险硬上限、CAA ownership、Emergency 人工恢复和 LIVE 默认关闭保持不变。
+每笔成交使用既有 `parse_fill()` / `fill_key()` 校验 `(instId, tradeId)`、订单归属、方向、net position side、正且 finite 的数量/价格、有效成交时间、finite 的逐笔 fee/fillPnl 和 feeCcy。重复 canonical key、重复/非递减/非法 bill cursor、外来订单或冲突证据均拒绝。只有历史分页结束且 **`sum(authoritative fillSz) == terminal accFillSz`**，并且 REST 提供的最后一笔成交身份/数量/价格/时间与该集合一致，才进入持久化。
+
+网络查询不持有 `ledger_lock`。提交时加锁，重新验证当前 owned order 与全部已记录 fills；等价记录幂等，冲突及集合外的旧成交拒绝覆盖。复用原有 durable ledger transaction，将所有缺失 fills 与 terminal order event 原子追加，提交后才更新内存订单/seen keys；`reconciled_filled` 保留供原有完整仓位对账使用。没有伪造单笔 WS event 的 `accFillSz`，没有复用 public `market_batch`，没有改变 LedgerRepairService 架构。HALT 撤单确认发现非零 terminal fill 时，以及下单结果不明确后同一 clOrdId 的终态 GET，也复用该纯取证/入账回调，防止第二条 REST 路径绕过完整性验证；撤单请求、只减仓能力、取消确认后的阻断规则及禁止盲目重试均保留。
+
+部分成交后 cancelled / mmp_canceled 按 `accFillSz` 而非原请求数量核验；零成交取消不制造 fills。每笔保留官方自己的 fee/fillPnl/feeCcy，以真实 fillTime 写入报告时间；订单累计 `order_fee` 只保留在 order event。日报自然读取完整 fills，避免缺笔或重复计算。历史成交从不覆盖，旧版累计手续费冲突仍需独立人工审计。稳定诊断码为 `terminal_fill_evidence_incomplete/conflict`、`terminal_fill_size_mismatch`、`terminal_fill_identity_mismatch`、`terminal_fill_history_unavailable`，不记录原始 private payload 或任意远端异常正文。
+
+本轮仅代码、测试、CI、commit 和 GitHub push，不部署服务器、不恢复 Demo、不启用 LIVE。完整成交集合不替代最终 account / position / pending order / algo reconciliation，失败仍禁止新 entry；策略、风险上限、CAA、Emergency、WS 架构和 LIVE fencing 均不变。官方契约与验证边界见 [Terminal Fill Reconstruction](docs/TERMINAL_FILL_RECONSTRUCTION.md)。
+
+验证结果：新增 77 项回归，全部 884 passed / 0 failed / 0 skipped / 0 warnings（`-W error`）；真实隔离 PostgreSQL、Ruff 和 mypy（36 source files）通过。代码通过不代表已经部署或完成独立审计。
