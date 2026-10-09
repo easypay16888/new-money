@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from collections import defaultdict, deque
+from contextvars import ContextVar
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
@@ -48,6 +49,44 @@ class MarketDataEngine:
             )
         )
         self.latest_trades: dict[str, deque[Trade]] = defaultdict(lambda: deque(maxlen=100))
+        self._batch_cache: ContextVar[dict[str, str] | None] = ContextVar(
+            "public_batch_cache", default=None
+        )
+        self._batch_derivatives: ContextVar[set[str] | None] = ContextVar(
+            "public_batch_derivatives", default=None
+        )
+
+    async def handle_batch(self, messages: list[dict[str, Any]]) -> None:
+        """Persist every public observation; pipeline only the latest Redis cache values."""
+        if len(messages) > 64 or any(message.get("arg", {}).get("channel") not in {
+            "tickers", "trades", "books5", "mark-price", "index-tickers",
+            "funding-rate", "open-interest",
+        } for message in messages):
+            raise ValueError("batch only supports bounded public market messages")
+        if self._batch_cache.get() is not None:
+            raise ValueError("nested public market batch")
+        cache: dict[str, str] = {}
+        dirty: set[str] = set()
+        cache_token = self._batch_cache.set(cache)
+        derivative_token = self._batch_derivatives.set(dirty)
+        try:
+            async with self.store.market_batch():
+                for message in messages:
+                    await self.handle(message)
+                # Same timestamped reconstruction and all observations retained;
+                # avoid replaying the bounded history for every frame in this batch.
+                for symbol in sorted(dirty):
+                    await self._refresh_derivative_cache(symbol)
+            # Redis I/O is outside the durable market transaction. Failure still
+            # propagates to the WS worker, fencing freshness and new entries.
+            if self.redis is not None and cache:
+                async with self.redis.pipeline(transaction=False) as pipeline:
+                    for key, value in cache.items():
+                        pipeline.set(key, value, ex=120)
+                    await pipeline.execute()
+        finally:
+            self._batch_derivatives.reset(derivative_token)
+            self._batch_cache.reset(cache_token)
 
     async def handle(self, message: dict[str, Any], *, historical: bool = False) -> None:
         arg = message.get("arg", {})
@@ -146,14 +185,21 @@ class MarketDataEngine:
                     await self.store.append(
                         "market_derivatives", observation.model_dump(mode="json"), symbol=symbol
                     )
-                    self.latest_derivatives[symbol] = {
-                        key: Decimal(str(item))
-                        for key, item in self.derivative_context(symbol, datetime.now(UTC)).items()
-                    }
-                    await self._cache(
-                        f"derivatives:{symbol}",
-                        {k: str(v) for k, v in self.latest_derivatives[symbol].items()},
-                    )
+                    dirty = self._batch_derivatives.get()
+                    if dirty is not None:
+                        dirty.add(symbol)
+                    else:
+                        await self._refresh_derivative_cache(symbol)
+
+    async def _refresh_derivative_cache(self, symbol: str) -> None:
+        self.latest_derivatives[symbol] = {
+            key: Decimal(str(item))
+            for key, item in self.derivative_context(symbol, datetime.now(UTC)).items()
+        }
+        await self._cache(
+            f"derivatives:{symbol}",
+            {k: str(v) for k, v in self.latest_derivatives[symbol].items()},
+        )
 
     def derivative_context(self, symbol: str, as_of: datetime) -> dict[str, float]:
         observations = [
@@ -165,4 +211,8 @@ class MarketDataEngine:
 
     async def _cache(self, key: str, value: dict[str, Any]) -> None:
         if self.redis is not None:
+            cache = self._batch_cache.get()
+            if cache is not None:
+                cache[key] = json.dumps(value)
+                return
             await self.redis.set(key, json.dumps(value), ex=120)

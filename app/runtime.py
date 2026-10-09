@@ -1543,9 +1543,7 @@ class TradingRuntime:
     async def _on_public_market_batch(self, messages: list[dict[str, Any]]) -> None:
         # This callback is used only by public market subscriptions, never by
         # candles/decisions, orders, protection, emergency or reconciliation.
-        async with self.store.market_batch():
-            for message in messages:
-                await self.market.handle(message)
+        await self.market.handle_batch(messages)
 
     async def _on_market(self, message: dict[str, Any]) -> None:
         try:

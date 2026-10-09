@@ -194,3 +194,218 @@ async def test_runtime_market_batch_preserves_trade_data_and_fails_atomic_on_inv
         assert len(await runtime.store.latest("market_trades")) == 3
     finally:
         await runtime.close()
+
+
+class CachePipeline:
+    def __init__(self):
+        self.writes = []
+        self.execute = AsyncMock()
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        pass
+
+    def set(self, key, value, *, ex):
+        self.writes.append((key, value, ex))
+
+
+def ticker_message(n=0):
+    return dict(arg=dict(channel="tickers", instId=BTC), data=[dict(
+        ts=str(int(utcnow().timestamp() * 1000)), last=str(100 + n), bidPx="99", askPx="101"
+    )])
+
+
+async def test_public_batch_pipelines_latest_cache_once_after_durable_commit(tmp_path):
+    from types import SimpleNamespace
+
+    runtime = TradingRuntime(Settings(
+        _env_file=None, database_url=f"sqlite+aiosqlite:///{tmp_path}/cache.db"
+    ))
+    await runtime.store.initialize()
+    pipeline = CachePipeline()
+    cache = SimpleNamespace(set=AsyncMock(), pipeline=lambda **kw: pipeline)
+    runtime.market.redis = cache
+    commits = []
+    event.listen(runtime.store.engine.sync_engine, "commit", lambda _: commits.append(True))
+
+    async def execute():
+        assert commits  # Cache I/O never holds the durable database transaction.
+
+    pipeline.execute.side_effect = execute
+    try:
+        trade = dict(arg=dict(channel="trades", instId=BTC), data=[dict(
+            ts=str(int(utcnow().timestamp() * 1000)), tradeId="durable", px="100", sz="1", side="buy"
+        )])
+        await runtime._on_public_market_batch([ticker_message(n) for n in range(1, 64)] + [trade])
+        cache.set.assert_not_awaited()
+        pipeline.execute.assert_awaited_once()
+        assert len(pipeline.writes) == 1 and pipeline.writes[0][2] == 120
+        import json
+        assert json.loads(pipeline.writes[0][1])["last"] == "163"
+        assert runtime.market.latest_ticks[BTC].last == 163
+    finally:
+        await runtime.close()
+
+
+async def test_derivative_context_rebuilt_once_per_symbol_per_public_batch(tmp_path):
+    from unittest.mock import Mock
+
+    runtime = TradingRuntime(Settings(
+        _env_file=None, database_url=f"sqlite+aiosqlite:///{tmp_path}/derivative-batch.db"
+    ))
+    await runtime.store.initialize()
+    ts = str(int(utcnow().timestamp() * 1000))
+    context = Mock(wraps=runtime.market.derivative_context)
+    runtime.market.derivative_context = context
+    messages = [dict(arg=dict(channel="open-interest", instId=BTC), data=[dict(
+        ts=ts, oi=str(100 + n)
+    )]) for n in range(64)]
+    try:
+        await runtime._on_public_market_batch(messages)
+        assert context.call_count == 1
+        assert len(await runtime.store.latest("market_derivatives")) == 64
+        assert runtime.market.latest_derivatives[BTC]["oi"] == 163
+        assert float(runtime.market.latest_derivatives[BTC]["oi_change"]) == pytest.approx(1 / 162)
+    finally:
+        await runtime.close()
+
+
+async def test_invalid_batch_does_not_publish_cache_and_context_resets(tmp_path):
+    from types import SimpleNamespace
+
+    runtime = TradingRuntime(Settings(
+        _env_file=None, database_url=f"sqlite+aiosqlite:///{tmp_path}/bad-batch.db"
+    ))
+    await runtime.store.initialize()
+    pipeline = CachePipeline()
+    cache = SimpleNamespace(set=AsyncMock(), pipeline=lambda **kw: pipeline)
+    runtime.market.redis = cache
+    try:
+        with pytest.raises(KeyError):
+            await runtime._on_public_market_batch([ticker_message(), dict(
+                arg=dict(channel="trades", instId=BTC), data=[{}]
+            )])
+        pipeline.execute.assert_not_awaited()
+        assert not pipeline.writes
+        await runtime.market.handle(ticker_message())
+        cache.set.assert_awaited_once()  # Other workers retain their independent cache path.
+    finally:
+        await runtime.close()
+
+
+async def test_public_cache_failure_fences_worker_without_losing_committed_trades(tmp_path):
+    from types import SimpleNamespace
+
+    runtime = TradingRuntime(Settings(
+        _env_file=None, database_url=f"sqlite+aiosqlite:///{tmp_path}/cache-fault.db"
+    ))
+    await runtime.store.initialize()
+    pipeline = CachePipeline()
+    pipeline.execute.side_effect = ConnectionError("cache unavailable")
+    runtime.market.redis = SimpleNamespace(pipeline=lambda **kw: pipeline)
+    ws, _ = ready_socket(channels=("tickers", "trades"))
+    faults = []
+    ws.on_fault = lambda _, reason: faults.append(reason)
+    ws.batch_handler = runtime._on_public_market_batch
+    trade = dict(arg=dict(channel="trades", instId=BTC), data=[dict(
+        ts=str(int(utcnow().timestamp() * 1000)), tradeId="batch-trade", px="100", sz="1", side="buy"
+    )])
+    for message in (ticker_message(), trade):
+        ws._enqueue_message(message, 100)
+    worker = asyncio.create_task(ws._business_worker())
+    try:
+        await asyncio.wait_for(ws.queue.join(), 2)
+        assert faults == ["WebSocket processing failed"]
+        assert not ws.is_processing_healthy() and not ws.last_data_at
+        assert len(await runtime.store.latest("market_trades")) == 1
+    finally:
+        worker.cancel()
+        await asyncio.gather(worker, return_exceptions=True)
+        await runtime.close()
+
+
+async def test_batched_derivatives_preserve_sequential_decision_context(tmp_path):
+    from app.market import MarketDataEngine
+
+    stores = [Store(f"sqlite+aiosqlite:///{tmp_path}/{name}.db") for name in ("batch", "single")]
+    for store in stores:
+        await store.initialize()
+    batch, single = [MarketDataEngine(store) for store in stores]
+    ts = int(utcnow().timestamp() * 1000) - 1000
+    messages = []
+    for n in range(16):
+        for channel, field, symbol, value in (
+            ("mark-price", "markPx", BTC, str(101 + n)),
+            ("index-tickers", "idxPx", "BTC-USDT", str(100 + n)),
+            ("funding-rate", "fundingRate", BTC, str(n / 10000)),
+            ("open-interest", "oi", BTC, str(100 + n)),
+        ):
+            messages.append(dict(arg=dict(channel=channel, instId=symbol), data=[{
+                "ts": str(ts + n), field: value
+            }]))
+    try:
+        for message in messages:
+            await single.handle(message)
+        await batch.handle_batch(messages)
+        assert batch.latest_derivatives == single.latest_derivatives
+        for n in (0, 7, 15):
+            from datetime import UTC, datetime
+            at = datetime.fromtimestamp((ts + n) / 1000, UTC)
+            assert batch.derivative_context(BTC, at) == single.derivative_context(BTC, at)
+        assert await stores[0].all_for_symbol("market_derivatives", BTC) == await stores[1].all_for_symbol("market_derivatives", BTC)
+    finally:
+        for store in stores:
+            await store.close()
+
+
+@pytest.mark.parametrize("channel", ["orders", "positions", "candle15m", "books"])
+async def test_public_cache_batch_cannot_capture_private_decision_or_sequence_feed(tmp_path, channel):
+    from app.market import MarketDataEngine
+
+    store = Store(f"sqlite+aiosqlite:///{tmp_path}/restricted.db")
+    market = MarketDataEngine(store)
+    try:
+        with pytest.raises(ValueError, match="bounded public"):
+            await market.handle_batch([dict(arg=dict(channel=channel, instId=BTC), data=[])])
+        with pytest.raises(ValueError, match="bounded public"):
+            await market.handle_batch([ticker_message()] * 65)
+    finally:
+        await store.close()
+
+
+async def test_cancelled_public_cache_batch_does_not_capture_concurrent_worker(tmp_path):
+    from types import SimpleNamespace
+
+    from app.market import MarketDataEngine
+
+    store = Store(f"sqlite+aiosqlite:///{tmp_path}/cancel.db")
+    await store.initialize()
+    entered, release = asyncio.Event(), asyncio.Event()
+    pipeline = CachePipeline()
+
+    async def stalled_cache():
+        entered.set()
+        await release.wait()
+
+    pipeline.execute.side_effect = stalled_cache
+    cache = SimpleNamespace(set=AsyncMock(), pipeline=lambda **kw: pipeline)
+    market = MarketDataEngine(store, cache)
+    task = asyncio.create_task(market.handle_batch([ticker_message()]))
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        await market.handle(ticker_message(1))
+        cache.set.assert_awaited_once()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        release.set()
+        await market.handle_batch([ticker_message(2)])
+        assert pipeline.execute.await_count == 2
+        assert market._batch_cache.get() is None and market._batch_derivatives.get() is None
+    finally:
+        release.set()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await store.close()

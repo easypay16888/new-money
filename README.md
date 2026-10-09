@@ -264,3 +264,9 @@ private 重连不再无限等待业务队列排空，已接收事件保持有序
 OKX 成交统一使用 `(instId, tradeId)`，覆盖 WS 去重、restore、数据库约束和账本修复。BTC/123 与 ETH/123 均可入账；同品种重复成交幂等，内容冲突仍 fail closed。
 
 初始化会在事务中验证历史记录并迁移 SQLite / PostgreSQL 的全局唯一索引为 `(symbol, reference_id)`；重复或冲突账本不自动清理。升级仍须安全停机与备份，迁移不会修改历史成交。详细设计、迁移回滚测试和验收边界见 [Fill Identity](docs/FILL_IDENTITY.md)。10/6 事故的具体根因仍未证实。
+
+### Bounded public market cache pipeline
+
+公共行情批次仍最多 64 帧，逐条验证并保留所有成交、衍生观测与原有订单簿采样。每个批次按 symbol 重建一次原有 timestamped derivative context；Redis 仅保留各缓存 key 的最后一个值，通过一次非事务 pipeline 在数据库提交后写入，避免逐条网络等待占用数据库事务。订单、成交账本、保护单、Emergency 和决策 K 线不进入此批次。
+
+队列上限、心跳、freshness 和积压 fencing 不放宽。DB/Redis/解析失败仍阻止本批次取得 freshness；Redis 失败时已提交的公共行情记录保留，交易继续 fail closed。该补丁新增 10 项回归，完整验证为 786 passed / 0 skipped / 0 warnings，真实 PostgreSQL 集成、Ruff 和 mypy（35 source files）通过；实际吞吐改善需部署后观察，不代表 LIVE 验收通过。
