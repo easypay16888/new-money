@@ -221,7 +221,7 @@ class LedgerRepairService:
                     continue
                 remote[tid] = row
         existing: dict[FillKey, dict[str, Any]] = {}
-        for row in snapshots["fills"]:
+        for row in await self.store.effective_fill_payloads(snapshots["fills"]):
             tid = fill_key(row.get("instId"), row.get("tradeId"))
             if tid in existing:
                 raise LedgerEvidenceError("ledger fill conflict")

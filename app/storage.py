@@ -8,6 +8,7 @@ from decimal import Decimal
 from hashlib import sha256
 from pathlib import Path
 from typing import Any
+from typing import cast as typing_cast
 
 from sqlalchemy import (
     JSON,
@@ -22,6 +23,7 @@ from sqlalchemy import (
     or_,
     select,
     text,
+    tuple_,
 )
 from sqlalchemy.engine.url import make_url
 from sqlalchemy.ext.asyncio import (
@@ -72,6 +74,7 @@ TABLES = (
     "daily_reports",
     "notification_events",
     "account_bindings",
+    "fill_accounting_corrections",
 )
 ROW_TYPES: dict[str, type[EventRow]] = {}
 for table in TABLES:
@@ -172,7 +175,33 @@ class Store:
             if not index["unique"] or index["column_names"] != ["symbol", "reference_id"] or normalized != "reference_idisnotnull":
                 raise ValueError("invalid fill identity index")
             await connection.execute(text("DROP INDEX IF EXISTS fills_reference_unique"))
+            await connection.execute(text(
+                "CREATE UNIQUE INDEX IF NOT EXISTS fill_accounting_corrections_unique "
+                "ON fill_accounting_corrections (symbol, reference_id)"
+            ))
+        await self.validate_accounting_corrections()
         self.healthy = True
+
+    async def validate_accounting_corrections(self) -> None:
+        from app.fill_accounting import corrected_fill
+
+        corrections, fills = ROW_TYPES['fill_accounting_corrections'], ROW_TYPES['fills']
+        async with self.sessions() as session:
+            rows = (await session.execute(select(corrections, fills.id, fills.payload).outerjoin(
+                fills, (fills.symbol == corrections.symbol)
+                & (fills.reference_id == corrections.reference_id)
+            ).limit(100001))).all()
+            if len(rows) > 100000:
+                raise ValueError('accounting correction audit incomplete')
+            seen: set[FillKey] = set()
+            for data in rows:
+                receipt = typing_cast(Any, data[0])
+                key = fill_key(receipt.symbol, receipt.reference_id)
+                if key in seen or data[1] is None or data[2] is None:
+                    raise ValueError('accounting correction audit conflict')
+                seen.add(key)
+                corrected_fill(typing_cast(dict[str, Any], data[2]),
+                               typing_cast(int, data[1]), receipt.payload)
 
     async def fill_for_key(self, key: FillKey) -> dict[str, Any] | None:
         symbol, reference = fill_key(*key)
@@ -181,7 +210,115 @@ class Store:
             row = await session.scalar(select(table).where(
                 table.symbol == symbol, table.reference_id == reference
             ))
-        return row.payload if row else None
+        if row is None:
+            return None
+        return (await self.effective_fill_payloads([row.payload]))[0]
+
+    async def effective_fill_payloads(self, payloads: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        # Local import avoids the storage -> terminal proof -> ledger storage dependency cycle.
+        from app.fill_accounting import corrected_fill, digest
+
+        keys = {fill_key(r['instId'], r['tradeId']) for r in payloads
+                if r.get('instId') and r.get('tradeId')}
+        corrections, fills = ROW_TYPES['fill_accounting_corrections'], ROW_TYPES['fills']
+        overlays: dict[FillKey, dict[str, Any]] = {}
+        originals: dict[FillKey, str] = {}
+        async with self.sessions() as session:
+            ordered = sorted(keys)
+            for offset in range(0, len(ordered), 400):
+                rows = await session.execute(select(corrections, fills.id, fills.payload).outerjoin(
+                    fills, (fills.symbol == corrections.symbol)
+                    & (fills.reference_id == corrections.reference_id)
+                ).where(tuple_(corrections.symbol, corrections.reference_id).in_(ordered[offset:offset + 400])))
+                for data in rows:
+                    receipt = typing_cast(Any, data[0])
+                    original_id = typing_cast(int, data[1])
+                    original = typing_cast(dict[str, Any] | None, data[2])
+                    key = fill_key(receipt.symbol, receipt.reference_id)
+                    if key in overlays or original is None:
+                        raise ValueError('accounting correction audit conflict')
+                    overlays[key] = corrected_fill(original, original_id, receipt.payload)
+                    originals[key] = receipt.payload['original_digest']
+        result = []
+        for payload in payloads:
+            payload_key = fill_key(payload['instId'], payload['tradeId']) if payload.get('instId') and payload.get('tradeId') else None
+            if payload_key is not None and payload_key in overlays:
+                # A concurrent/foreign snapshot cannot silently acquire another fill's receipt.
+                if originals[payload_key] != digest(payload):
+                    raise ValueError('accounting correction audit conflict')
+                result.append(dict(overlays[payload_key]))
+            else:
+                result.append(dict(payload))
+        return result
+
+    async def append_accounting_corrections(
+        self, detail: dict[str, Any], evidence: list[dict[str, Any]], *, apply: bool = True,
+    ) -> int:
+        from app.fill_accounting import corrected_fill, make_receipt, proof, verify_owned_order
+        from app.fill_identity import equivalent_fill
+
+        canonical = proof(detail, evidence)
+        symbol, client_id = detail['instId'], detail['clOrdId']
+        orders, events, fills = (ROW_TYPES[t] for t in ('orders', 'order_events', 'fills'))
+        corrections = ROW_TYPES['fill_accounting_corrections']
+        async with self.sessions.begin() as session:
+            if self.engine.dialect.name == 'postgresql':
+                await session.execute(text("SET LOCAL lock_timeout = '5s'"))
+                await session.execute(text("SET LOCAL statement_timeout = '15s'"))
+                await session.execute(text(
+                    "LOCK TABLE orders, order_events, fills, fill_accounting_corrections IN SHARE ROW EXCLUSIVE MODE"
+                ))
+            elif self.engine.dialect.name == 'sqlite':
+                await session.execute(text('BEGIN IMMEDIATE'))
+            else:
+                raise ValueError('accounting correction backend unsupported')
+            owned = (await session.scalars(select(orders).where(
+                orders.payload['clOrdId'].as_string() == client_id
+            ).limit(2))).all()
+            if len(owned) != 1:
+                raise ValueError('accounting correction ownership unverified')
+            local = dict(owned[0].payload)
+            history = (await session.scalars(select(events).where(
+                events.payload['clOrdId'].as_string() == client_id
+            ).order_by(events.id).limit(100001))).all()
+            if len(history) > 100000:
+                raise ValueError('accounting correction evidence invalid')
+            for row in history:
+                local.update(row.payload)
+            verify_owned_order(local, detail)
+            records = (await session.scalars(select(fills).where(
+                fills.symbol == symbol, or_(fills.payload['ordId'].as_string() == detail['ordId'],
+                                            fills.payload['clOrdId'].as_string() == client_id)
+            ).limit(5001))).all()
+            by_key = {fill_key(r.payload.get('instId'), r.payload.get('tradeId')): r for r in records}
+            remote = {fill_key(r['instId'], r['tradeId']): r for r in canonical}
+            if len(by_key) != len(records) or by_key.keys() != remote.keys():
+                raise ValueError('accounting correction complete fill set required')
+            planned = []
+            for key, row in by_key.items():
+                existing = await session.scalar(select(corrections).where(
+                    corrections.symbol == key[0], corrections.reference_id == key[1]
+                ))
+                effective = corrected_fill(row.payload, row.id, existing.payload) if existing else row.payload
+                if equivalent_fill(effective, remote[key]):
+                    continue
+                if existing:
+                    raise ValueError('accounting correction audit conflict')
+                receipt = make_receipt(row.payload, row.id, detail, canonical)
+                planned.append((key, receipt))
+            if apply and planned:
+                for key, receipt in planned:
+                    session.add(corrections(symbol=key[0], reference_id=key[1], payload=receipt))
+                session.add(ROW_TYPES['system_events'](payload={
+                    'event': 'ledger_repair_manual_hold', 'emergency': True,
+                    'reason': 'accounting corrected; manual resume required',
+                }))
+                session.add(ROW_TYPES['system_events'](symbol=symbol, reference_id=client_id, payload={
+                    'event': 'fill_accounting_correction_applied', 'symbol': symbol,
+                    'clOrdId': client_id, 'corrections_added': len(planned),
+                    'source': 'okx_fills_history', 'manual_resume_required': True,
+                }))
+            return len(planned)
 
     async def fill_records(self) -> list[tuple[FillKey, dict[str, Any]]]:
         table = ROW_TYPES["fills"]
@@ -195,7 +332,8 @@ class Store:
                 if row.symbol is None:
                     raise ValueError("invalid fill identity")
                 result.append((fill_key(row.symbol, row.reference_id), row.payload))
-        return result
+        effective = await self.effective_fill_payloads([payload for _, payload in result])
+        return [(key, payload) for (key, _), payload in zip(result, effective, strict=True)]
 
     async def append(
         self,
@@ -207,6 +345,8 @@ class Store:
     ) -> None:
         if table not in ROW_TYPES:
             raise ValueError(f"unknown table: {table}")
+        if table == 'fill_accounting_corrections':
+            raise ValueError('accounting corrections require verified evidence transaction')
         if table == "fills" and reference_id is not None:
             if symbol is None:
                 raise ValueError("invalid fill identity")
@@ -235,7 +375,8 @@ class Store:
             rows = (
                 await session.scalars(select(row_type).order_by(row_type.id.desc()).limit(limit))
             ).all()
-        return [row.payload for row in rows]
+        payloads = [row.payload for row in rows]
+        return await self.effective_fill_payloads(payloads) if table == 'fills' else payloads
 
     async def since(
         self, table: str, timestamp: datetime, limit: int = 10000
@@ -252,7 +393,8 @@ class Store:
                     .limit(limit)
                 )
             ).all()
-        return [row.payload for row in rows]
+        payloads = [row.payload for row in rows]
+        return await self.effective_fill_payloads(payloads) if table == 'fills' else payloads
 
     async def between(
         self, table: str, start: datetime, end: datetime, limit: int = 10000
@@ -269,7 +411,8 @@ class Store:
                     .limit(limit)
                 )
             ).all()
-        return [row.payload for row in rows]
+        payloads = [row.payload for row in rows]
+        return await self.effective_fill_payloads(payloads) if table == 'fills' else payloads
 
     async def max_equity_since(self, timestamp: datetime) -> Decimal | None:
         row_type = ROW_TYPES["portfolio_snapshots"]
