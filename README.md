@@ -270,3 +270,9 @@ OKX 成交统一使用 `(instId, tradeId)`，覆盖 WS 去重、restore、数据
 公共行情批次仍最多 64 帧，逐条验证并保留所有成交、衍生观测与原有订单簿采样。每个批次按 symbol 重建一次原有 timestamped derivative context；Redis 仅保留各缓存 key 的最后一个值，通过一次非事务 pipeline 在数据库提交后写入，避免逐条网络等待占用数据库事务。订单、成交账本、保护单、Emergency 和决策 K 线不进入此批次。
 
 队列上限、心跳、freshness 和积压 fencing 不放宽。DB/Redis/解析失败仍阻止本批次取得 freshness；Redis 失败时已提交的公共行情记录保留，交易继续 fail closed。该补丁新增 10 项回归，完整验证为 786 passed / 0 skipped / 0 warnings，真实 PostgreSQL 集成、Ruff 和 mypy（35 source files）通过；实际吞吐改善需部署后观察，不代表 LIVE 验收通过。
+
+### REST terminal snapshot / per-fill accounting
+
+OKX 订单详情的 `fee` 是订单累计手续费，不能直接写作最后一个 tradeId 的逐笔手续费。已核验的 terminal order 若包含成交信息，对账会只读查询一页（最多 100 条）`fills-history`，精确核对 `(instId, tradeId)`、ordId、clOrdId（若提供）、方向、数量、价格和成交时间，再用官方逐笔 fee / fillPnl 入账；原订单累计手续费单独保留为 `order_fee`，标记 `fill_evidence_source=okx_fills_history`。缺失、冲突、歧义、认证或网络失败仍 fail closed，不猜测、不无限扫描、不重试交易写入。
+
+历史 fill 不覆盖；已有内容冲突仍拒绝修复。旧版本已记录的订单累计手续费需单独审计，本补丁不会静默改写旧账。private order handler 的错误日志新增安全 exception type / machine error code，不输出订单 payload、凭据或任意异常文本。新增 21 项回归；完整验证为 807 passed / 0 skipped / 0 warnings，真实 PostgreSQL、Ruff、mypy（35 source files）通过。策略、风险硬上限、CAA ownership、Emergency 人工恢复和 LIVE 默认关闭保持不变。

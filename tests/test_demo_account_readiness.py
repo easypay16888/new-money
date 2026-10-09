@@ -30,6 +30,7 @@ async def test_reconcile_uses_usdt_equity_for_usdt_swaps(tmp_path):
     assert runtime.portfolio.equity == Decimal("5000")
     assert runtime.portfolio.available_balance == Decimal("5000")
     assert runtime.portfolio.daily_pnl == Decimal(0)
+    await runtime.notifications.close()
     await runtime.store.close()
 
 
@@ -47,4 +48,5 @@ async def test_reconcile_halts_when_demo_account_is_spot_only(tmp_path):
     assert runtime.reconciliation_healthy
     assert runtime.governor.state == GovernorState.HALT
     assert runtime.governor.reason == "derivatives account mode required"
+    await runtime.notifications.close()
     await runtime.store.close()

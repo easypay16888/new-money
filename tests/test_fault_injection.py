@@ -181,6 +181,7 @@ async def test_partial_fill_triggers_reduce_only_emergency(tmp_path):
     assert "attachAlgoOrds" not in client.reduce_orders[0]
     await runtime._on_private({"arg": {"channel": "orders"}, "data": [event]})
     assert len(client.reduce_orders) == 1
+    await runtime.notifications.close()
     await runtime.store.close()
 
 

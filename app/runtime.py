@@ -18,8 +18,9 @@ from app.daily_review import save_daily_review
 from app.decision import DecisionPipeline
 from app.execution import ExecutionEngine, OrderManager
 from app.features import compute_features
+from app.fill_identity import fill_key
 from app.incidents import IncidentManager
-from app.ledger_repair import LedgerRepairResult, LedgerRepairService
+from app.ledger_repair import LedgerRepairResult, LedgerRepairService, parse_fill
 from app.live_lease import LiveLeaseError, LiveRuntimeLease
 from app.market import MarketDataEngine
 from app.models import (
@@ -607,7 +608,11 @@ class TradingRuntime:
             local = self.order_manager.orders[detail["clOrdId"]]
             if not self._verified_terminal_order(local, detail):
                 return snapshot
-            await self.order_manager.ingest(detail)
+            evidence = await self._terminal_fill_evidence(detail)
+            # The history GET can overlap WS ingestion; recheck ownership/size.
+            if not self._verified_terminal_order(local, detail):
+                return snapshot
+            await self.order_manager.ingest(evidence)
         # Fills may have changed positions and protection since the initial parallel reads.
         # One bounded refresh; the usual identity, position and protection gates still run.
         refreshed = await asyncio.gather(
@@ -615,6 +620,47 @@ class TradingRuntime:
             self.client.pending_orders(), self.client.pending_algos(),
         )
         return refreshed[0], refreshed[1], refreshed[2], refreshed[3]
+
+    async def _terminal_fill_evidence(self, detail: dict[str, Any]) -> dict[str, Any]:
+        """Order fee is cumulative. Only trade history supplies per-fill accounting."""
+        if detail.get("fillSz") in (None, "", "0") and not detail.get("tradeId"):
+            return detail  # Snapshot has no individual fill evidence to append.
+        size = self._positive_decimal(detail.get("fillSz"))
+        if size is None:
+            raise OkxError("terminal fill evidence incomplete")
+        key = fill_key(detail.get("instId"), detail.get("tradeId"))
+        # One read, at most 100 rows. If the exact last fill is absent, halt;
+        # never guess a fee, scan indefinitely or retry a trading write.
+        history = await self.client.fills_history(key[0], limit=100)
+        if not isinstance(history, list) or len(history) > 100 or any(
+            not isinstance(row, dict) for row in history
+        ):
+            raise OkxError("terminal fill evidence incomplete")
+        candidates = [row for row in history if (
+            row.get("instId"), row.get("tradeId")
+        ) == key]
+        if len(candidates) != 1:
+            raise OkxError("terminal fill evidence incomplete")
+        canonical = parse_fill(candidates[0])
+        if (
+            canonical["ordId"] != detail["ordId"]
+            or canonical["side"] != detail["side"]
+            or (canonical.get("clOrdId") and canonical["clOrdId"] != detail["clOrdId"])
+            or str(canonical["fillTime"]) != str(detail.get("fillTime"))
+            or self._positive_decimal(canonical["fillSz"]) != size
+            or self._positive_decimal(canonical["fillPx"]) != self._positive_decimal(detail.get("fillPx"))
+        ):
+            raise OkxError("terminal fill evidence mismatch")
+        evidence = dict(detail)
+        # Keep the original order aggregate for audit, outside per-fill fields.
+        for field in ("fee", "fillFee", "fillPnl"):
+            evidence.pop(field, None)
+        evidence.update(canonical)
+        evidence.update(
+            clOrdId=detail["clOrdId"], state=detail["state"], accFillSz=detail["accFillSz"],
+            order_fee=detail.get("fee", ""), fill_evidence_source="okx_fills_history",
+        )
+        return evidence
 
     async def _reconcile_impl(self) -> None:
         self.entry_controller.client = self.client
@@ -1735,7 +1781,14 @@ class TradingRuntime:
                                 self._notify_entry_filled(local_after, row)
                             )
                         await self.reconcile()
-                except Exception:
+                except Exception as exc:
+                    codes = {"ledger fill conflict": "ledger_fill_conflict",
+                             "unexpected order event": "unexpected_order_event"}
+                    logger.error("private order processing failed", extra={
+                        "exception_type": type(exc).__name__,
+                        "error_code": codes.get(str(exc), "order_processing_failed"),
+                        "socket_name": "private-account",
+                    })
                     await self.enter_halt("unexpected order", emergency=True)
                     await self.reconcile()
         elif channel in {"positions", "account"}:

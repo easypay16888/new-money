@@ -269,6 +269,7 @@ async def test_status_exposes_auto_recovery_without_removing_existing_fields(tmp
         "required": 3, "circuit_breaker": False,
     }
     assert "websockets" in body and "protective_algos" in body
+    await runtime.notifications.close()
     await runtime.client.close()
     await runtime.store.close()
 
