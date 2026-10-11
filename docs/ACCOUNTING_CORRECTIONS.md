@@ -33,8 +33,8 @@ fill count and audited positions never change.
 
 ## Controlled maintenance
 
-Use an exclusive operator window: nobody may start/resume another engine or
-mutate the ledger while this tool runs. Preserve the verified consistent backup.
+Preserve the verified consistent backup. The database now enforces the exclusive
+maintenance window; an operator promise is insufficient to protect the commit.
 Call existing `POST /system/stop`, require HTTP 200/running=false, and pause
 watchdog for planned maintenance. Keep the app container/API available, with its
 trading runtime stopped and HALT/EMERGENCY. Never start a second engine.
@@ -53,10 +53,36 @@ Default is dry run. Review complete evidence and proposed receipts, then apply:
   --symbol ETH-USDT-SWAP --client-order-id OWNED_CLIENT_ORDER_ID --apply
 ```
 
-Both steps check local `/status` before history reads and immediately before the
-transaction. Running=true, NORMAL, non-PAPER, LIVE enabled, endpoint failure or
+Both steps check local `/status`, acquire the persistent `maintenance_locks`
+lease, then re-read `/status` before collecting evidence. Running=true, NORMAL,
+non-PAPER, LIVE enabled, endpoint failure or
 unproven evidence rejects maintenance. No trust flag, SQL, alternate status URL
 or caller-supplied authoritative fill payload is accepted by the CLI.
+
+The same lease serializes PAPER start/resume transitions, including process
+lifespan startup. Start holds it until startup completes; maintenance losing that
+race must fail or observe running=true on its second check. Maintenance holds it
+through the entire proof and correction transaction. Start/resume return HTTP 409
+while maintenance owns it; lifespan can expose diagnostic `/status` with the
+trading runtime stopped. Status exposes only maintenance active/type, never owner.
+
+SQLite uses short BEGIN IMMEDIATE coordination transactions; PostgreSQL uses a
+separate transaction advisory key. The singleton named row records random owner,
+operation and database UTC epoch timestamps. It expires after **15 minutes**, with
+a **15-second heartbeat**, including during history reads. No database ledger lock
+is held while awaiting OKX. The correction transaction revalidates owner/expiry
+under the same coordinator lock, keeping receipts, manual hold and audit atomic.
+Apply, including an idempotent re-application after a prior manual release,
+persists a manual hold before release. Dry-run writes neither receipt nor hold.
+
+A crashed CLI leaves its fence until its database timestamp expires; no immediate
+takeover or force-unlock flag exists. A subsequent operation may atomically replace
+only a validated expired row. A paused old owner cannot renew, commit or delete a
+new owner's row. Clock regression, malformed or ambiguous state fails closed;
+initialization validates legacy rows without deleting ledger data. Normal errors
+release only the caller's fence; database failures leave the bounded lease intact.
+This is an operation fence for one shared ledger, not a PAPER account singleton
+across different databases or a replacement for LIVE ownership.
 
 Restart the existing app with its manual EMERGENCY hold and restart watchdog.
 Compare original ledger rows to backup, prove effective evidence matches OKX,

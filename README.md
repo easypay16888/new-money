@@ -157,6 +157,8 @@ ssh -N -L 18000:127.0.0.1:18000 -L 13300:127.0.0.1:13300 your-server
 必须备份、完整验证订单归属及成交集合，重启并完整对账后才人工恢复 Demo。
 操作和限制见 [追加式账务纠正](docs/ACCOUNTING_CORRECTIONS.md)。
 
+持久化 `maintenance_locks` 租约覆盖证据读取及提交窗口，阻止并发 PAPER start/resume（含进程 lifespan）；15 分钟租约、15 秒心跳，崩溃后仅到期才允许接替。纠正事务原子核验 owner，并在释放租约前持久化 manual hold；dry-run 不写纠正或 hold。
+
 ## 切换到 LIVE
 
 **当前版本尚未完成全部现场验收，不得启用 LIVE。** 原有 `MODE=LIVE`、`LIVE_TRADING_ENABLED=true` 和 `CONFIRM_LIVE_ACCOUNT_ID` 三项门禁保留。LIVE 配置还必须包含完整 OKX 凭据和至少 32 字符的 `API_TOKEN`；配置校验错误不展示输入凭据。启动时先读取账户配置，验证 UID、合约账户模式、单向持仓、恰好 Read/Trade 权限、无 Withdraw 权限及 API IP 绑定，然后才恢复订单及 Emergency 目标。字段依据 [OKX 账户配置 API](https://app.okx.com/docs-v5/en/#trading-account-rest-api-get-account-configuration)。

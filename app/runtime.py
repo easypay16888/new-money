@@ -12,6 +12,7 @@ from time import monotonic
 from typing import Any
 
 from redis.asyncio import Redis
+from sqlalchemy.exc import SQLAlchemyError
 
 from app.config import Mode, Settings
 from app.daily_review import save_daily_review
@@ -46,6 +47,7 @@ from app.okx import (
     public_subscriptions,
     safe_reconciliation_diagnostics,
 )
+from app.paper_maintenance import MaintenanceBusy, MaintenanceError, PaperMaintenanceFence
 from app.portfolio import summarize_positions
 from app.recovery import HaltClass, classify_halt_reason
 from app.regime import classify
@@ -1219,6 +1221,21 @@ class TradingRuntime:
     async def start(self) -> None:
         if self.running:
             return
+        if self.settings.mode != Mode.PAPER:
+            await self._start()
+            return
+        try:
+            async with PaperMaintenanceFence(self.store, 'start', self._paper_fence_lost).hold() as fence:
+                await self._start(fence)
+        except MaintenanceError:
+            self._paper_fence_lost()
+            raise
+
+    def _paper_fence_lost(self) -> None:
+        self.governor.halt('PAPER maintenance ownership unavailable')
+        self._auto_recovery_forbidden = True
+
+    async def _start(self, fence: PaperMaintenanceFence | None = None) -> None:
         if self.settings.mode == Mode.PAPER:
             try:
                 self.notifications.start()
@@ -1276,6 +1293,8 @@ class TradingRuntime:
                     on_fault=self._on_ws_fault, on_ready=self._on_ws_ready,
                 )
             )
+        if fence is not None:
+            await fence.renew()  # A paused/expired starter must never activate.
         self.running = True
         self.tasks = [asyncio.create_task(ws.run()) for ws in self.sockets]
         for ws, task in zip(self.sockets, self.tasks, strict=True):
@@ -2101,7 +2120,23 @@ class TradingRuntime:
         return not issues, issues
 
     async def resume(self) -> bool:
+        if self.settings.mode != Mode.PAPER:
+            return await self._resume()
+        try:
+            async with PaperMaintenanceFence(self.store, 'resume', self._paper_fence_lost).hold() as fence:
+                if await self.store.ledger_repair_hold():
+                    self._ledger_repair_manual_hold = True
+                return await self._resume(fence)
+        except MaintenanceBusy:
+            return False
+        except (MaintenanceError, SQLAlchemyError):
+            self._paper_fence_lost()
+            return False
+
+    async def _resume(self, fence: PaperMaintenanceFence | None = None) -> bool:
         healthy, _ = await self._reconcile_and_assess()
+        if fence is not None:
+            await fence.renew()
         if self._ledger_repair_manual_hold:
             if not healthy or not self.portfolio.synchronized:
                 return False

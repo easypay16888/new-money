@@ -11,6 +11,7 @@ import httpx
 
 from app.config import Mode, Settings
 from app.okx import OkxRestClient
+from app.paper_maintenance import PaperMaintenanceFence
 from app.storage import Store
 from app.terminal_fills import read_terminal_fills
 
@@ -21,6 +22,8 @@ class AccountingCorrectionService:
         self.settings, self.client, self.store, self.status = settings, client, store, status
 
     async def _guard(self) -> None:
+        if self.settings.mode != Mode.PAPER or self.settings.live_trading_enabled:
+            raise ValueError('accounting correction is PAPER only')
         state = await self.status()
         if (self.settings.mode != Mode.PAPER or self.settings.live_trading_enabled
                 or state.get('mode') != 'PAPER' or state.get('running') is not False
@@ -31,12 +34,23 @@ class AccountingCorrectionService:
         await self._guard()
         if symbol not in self.settings.symbols:
             raise ValueError('accounting correction ownership unverified')
+        async with PaperMaintenanceFence(self.store, 'maintenance').hold() as fence:
+            await self._guard()
+            await self.store.initialize()
+            return await self._correct_fenced(symbol, client_id, apply=apply, fence=fence)
+
+    async def _correct_fenced(
+        self, symbol: str, client_id: str, *, apply: bool, fence: PaperMaintenanceFence,
+    ) -> dict:
         detail = await self.client.order(symbol, client_id)
         if len(detail) != 1 or detail[0].get('clOrdId') != client_id or detail[0].get('instId') != symbol:
             raise ValueError('accounting correction ownership unverified')
         rows = await read_terminal_fills(self.client, detail[0])
         await self._guard()
-        count = await self.store.append_accounting_corrections(detail[0], rows, apply=apply)
+        await fence.renew()
+        count = await self.store.append_accounting_corrections(
+            detail[0], rows, apply=apply, maintenance_owner=fence.owner,
+        )
         return {'evidence_complete': True, 'fills_checked': len(rows),
                 'corrections_added': count if apply else 0,
                 'corrections_proposed': count, 'applied': apply,
@@ -60,8 +74,6 @@ async def run(symbol: str, client_id: str, *, apply: bool) -> dict:
                 return response.json()
 
             service = AccountingCorrectionService(settings, client, store, status)
-            await service._guard()  # Never initialize/migrate while the engine is trading.
-            await store.initialize()
             return await service.correct(symbol, client_id, apply=apply)
     finally:
         await client.close()

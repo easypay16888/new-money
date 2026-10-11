@@ -13,6 +13,7 @@ from typing import cast as typing_cast
 from sqlalchemy import (
     JSON,
     DateTime,
+    Float,
     Integer,
     Numeric,
     String,
@@ -49,6 +50,15 @@ class EventRow(Base):
     symbol: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     reference_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
     payload: Mapped[dict[str, Any]] = mapped_column(JSON)
+
+
+class MaintenanceLock(Base):
+    __tablename__ = 'maintenance_locks'
+    name: Mapped[str] = mapped_column(String(64), primary_key=True)
+    owner_id: Mapped[str] = mapped_column(String(32))
+    kind: Mapped[str] = mapped_column(String(16))
+    acquired_at: Mapped[float] = mapped_column(Float)
+    expires_at: Mapped[float] = mapped_column(Float)
 
 
 TABLES = (
@@ -124,10 +134,18 @@ class Store:
                 await connection.execute(text("SET LOCAL statement_timeout = '15s'"))
                 # Serialize schema initialization across processes in this database.
                 await connection.execute(text("SELECT pg_advisory_xact_lock(7265636)"))
+                # Coordinate maintenance table migration with independent CLI/start sessions.
+                from app.paper_maintenance import COORDINATOR_KEY
+
+                await connection.execute(text('SELECT pg_advisory_xact_lock(:key)'),
+                                         {'key': COORDINATOR_KEY})
             elif self.engine.dialect.name == "sqlite":
                 # Include DDL and validation in the same durable transaction.
                 await connection.execute(text("BEGIN IMMEDIATE"))
             await connection.run_sync(Base.metadata.create_all)
+            from app.paper_maintenance import read_lock
+
+            await read_lock(connection)
             # A constant unique expression enforces one record, including legacy tables.
             # Conflicting legacy bindings fail initialization instead of being discarded.
             await connection.execute(text(
@@ -253,6 +271,7 @@ class Store:
 
     async def append_accounting_corrections(
         self, detail: dict[str, Any], evidence: list[dict[str, Any]], *, apply: bool = True,
+        maintenance_owner: str | None = None,
     ) -> int:
         from app.fill_accounting import corrected_fill, make_receipt, proof, verify_owned_order
         from app.fill_identity import equivalent_fill
@@ -272,6 +291,16 @@ class Store:
                 await session.execute(text('BEGIN IMMEDIATE'))
             else:
                 raise ValueError('accounting correction backend unsupported')
+            if maintenance_owner is not None:
+                from app.paper_maintenance import require_owner
+
+                connection = await session.connection()
+                if self.engine.dialect.name == 'postgresql':
+                    from app.paper_maintenance import COORDINATOR_KEY
+
+                    await connection.execute(text('SELECT pg_advisory_xact_lock(:key)'),
+                                             {'key': COORDINATOR_KEY})
+                await require_owner(connection, maintenance_owner, 'maintenance')
             owned = (await session.scalars(select(orders).where(
                 orders.payload['clOrdId'].as_string() == client_id
             ).limit(2))).all()
@@ -306,7 +335,16 @@ class Store:
                     raise ValueError('accounting correction audit conflict')
                 receipt = make_receipt(row.payload, row.id, detail, canonical)
                 planned.append((key, receipt))
-            if apply and planned:
+            needs_hold = bool(planned)
+            if apply and maintenance_owner is not None and not planned:
+                system = ROW_TYPES['system_events']
+                last_hold = await session.scalar(select(system).where(
+                    system.payload['event'].as_string().in_(
+                        ['ledger_repair_manual_hold', 'ledger_repair_manual_release']
+                    )
+                ).order_by(system.id.desc()).limit(1))
+                needs_hold = last_hold is None or last_hold.payload['event'] != 'ledger_repair_manual_hold'
+            if apply and (planned or needs_hold):
                 for key, receipt in planned:
                     session.add(corrections(symbol=key[0], reference_id=key[1], payload=receipt))
                 session.add(ROW_TYPES['system_events'](payload={

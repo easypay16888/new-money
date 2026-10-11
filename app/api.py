@@ -4,9 +4,11 @@ from contextlib import asynccontextmanager
 from secrets import compare_digest
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Response
+from sqlalchemy.exc import SQLAlchemyError
 
 from app.config import Mode, Settings
 from app.models import GovernorState
+from app.paper_maintenance import MaintenanceBusy, MaintenanceError, maintenance_status
 from app.runtime import TradingRuntime
 
 
@@ -16,7 +18,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
-        await runtime.start()
+        try:
+            await runtime.start()
+        except MaintenanceBusy:
+            pass  # Expose diagnostics; the trading runtime remains stopped.
         try:
             yield
         finally:
@@ -67,7 +72,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/status", dependencies=[Depends(authorize_status)])
     async def status() -> dict:
+        try:
+            maintenance = (await maintenance_status(runtime.store) if settings.mode == Mode.PAPER
+                           else {'active': False, 'type': None})
+        except (MaintenanceError, SQLAlchemyError):
+            raise HTTPException(status_code=503, detail='PAPER maintenance state invalid') from None
         return {
+            'maintenance': maintenance,
             "mode": settings.mode,
             "running": runtime.running,
             "risk_state": runtime.governor.state,
@@ -136,7 +147,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.post("/system/start", dependencies=[Depends(authorize)])
     async def start() -> dict:
-        await runtime.start()
+        try:
+            await runtime.start()
+        except MaintenanceError:
+            raise HTTPException(status_code=409, detail='PAPER maintenance blocks startup') from None
         return {"running": runtime.running}
 
     @app.post("/system/stop", dependencies=[Depends(authorize)])
