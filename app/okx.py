@@ -680,6 +680,16 @@ class OkxWebSocket:
         if deadline is not None and now <= deadline + tolerance:
             return False
         anchor = self.last_reconnect_progress_at
+        if self._phase in {"ACTIVE", "RECONCILING"}:
+            # A long-lived session's handshake age is not a reconnect stall.
+            # Receive timeout and bounded socket close may still be unwinding.
+            # Start the stall budget at transport expiry; ordinary health gates
+            # still fence entries immediately. A truly stuck receiver remains
+            # detectable, and unrelated frames cannot extend a pending pong.
+            anchor = (self.last_rx_at + self.settings.ws_idle_ping_seconds
+                      + self.settings.ws_pong_timeout_seconds)
+            if self.ping_pending:
+                anchor = min(anchor, self.last_ping_at + self.settings.ws_pong_timeout_seconds)
         return bool(anchor is not None and now - anchor > (
             2 * self.settings.ws_backoff_max_seconds + self.settings.ws_connect_timeout_seconds
         ))

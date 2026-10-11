@@ -264,6 +264,8 @@ private-algo 保留 `/business` 上的 `orders-algo + instType=ANY` 订阅。登
 
 private 重连不再无限等待业务队列排空，已接收事件保持有序处理；只有同一代际、业务空闲且完整对账通过才能清除恢复门禁。worker 退出可独立重启，run task 退出或重连任务停止响应会 HALT 并发 CRITICAL，不能自动绕过人工恢复规则。
 
+长期连接出现心跳超时时，ACTIVE / RECONCILING 的停滞预算从实际 transport 失效期限开始，覆盖 receive 超时与有界关闭等待；不能用数小时前的握手进度将其立即判成重连任务卡死。心跳故障仍立即阻止新开仓，原有 10 秒 idle / 5 秒 pong 超时不变；超出有界停滞预算仍未退出或重连的 receiver、死亡 run/worker、过期 backoff 均保持安全性 HALT。其他消息不延长已发 ping 的 pong 期限，恢复仍须完整对账与既有健康门禁。
+
 `/status.websockets` 新增 phase、login/subscription、task liveness、关闭诊断、连接尝试年龄、backoff 与连续失败；Bark 区分连接中断、已重连等待对账与完整恢复。transport incident 可独立结束，交易仍 HALT 时不会宣称交易已经恢复。默认继续使用 443；自定义 8443 只警告而不改写。
 
 完整审计、状态示例、官方协议依据和现场验收边界见 [Private Algo Recovery](docs/PRIVATE_ALGO_RECOVERY.md)。全局 tradeId 去重 P1 已由独立补丁修复，见下节；仍不启用 LIVE。
