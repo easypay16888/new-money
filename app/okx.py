@@ -48,6 +48,23 @@ class OkxOrderRejected(OkxError):
     pass
 
 
+class FillHistoryLimiter:
+    """Per-client GET fills-history pacing, below OKX's 10 requests / 2s UID limit."""
+    def __init__(
+        self, *, clock: Callable[[], float] = time.monotonic,
+        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+    ) -> None:
+        self.clock, self.sleep = clock, sleep
+        self._lock = asyncio.Lock()
+        self._next_at: float | None = None
+
+    async def wait(self) -> None:
+        async with self._lock:
+            while self._next_at is not None and self.clock() < self._next_at:
+                await self.sleep(self._next_at - self.clock())
+            self._next_at = self.clock() + 0.25
+
+
 RETRYABLE_OKX_CODES = frozenset({"50004", "50011", "50026", "50061"})
 PERMANENT_OKX_CODES = frozenset({
     "50102", "50103", "50104", "50105", "50106", "50107",
@@ -105,6 +122,7 @@ class OkxRestClient:
         self._verified_live_identity: bytes | None = None
         self._live_account_anchor: bytes | None = None
         self.live_writer_guard: Callable[[bool], Awaitable[bool]] | None = None
+        self._fills_history_limiter = FillHistoryLimiter()
 
     def _live_identity(self) -> bytes:
         # Invalidate the grant if account, credentials or endpoint changes in memory.
@@ -169,6 +187,9 @@ class OkxRestClient:
                 # Recheck identity after the asynchronous lease probe.
                 if not allowed or self._verified_live_identity != self._live_identity():
                     raise OkxError("LIVE write blocked: writer ownership or entry permission missing")
+        if method == 'GET' and path == '/api/v5/trade/fills-history':
+            # Pace before signing. Waiting consumes the existing caller deadline.
+            await self._fills_history_limiter.wait()
         query = "?" + urlencode(params) if params else ""
         request_path = path + query
         body_text = json.dumps(body, separators=(",", ":")) if body is not None else ""

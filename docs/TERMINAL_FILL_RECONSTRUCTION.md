@@ -22,6 +22,29 @@ Sources: [OKX fills-history](https://my.okx.com/docs-v5/en/#order-book-trading-t
 
 ## Completeness and persistence
 
+### Endpoint pacing verified on 2026-10-11
+
+[Official endpoint](https://www.okx.com/docs-v5/en/#order-book-trading-trade-get-transaction-details-last-3-months)
+and [rate-limit rules](https://www.okx.com/docs-v5/en/#overview-rate-limits):
+GET fills-history permits **10 requests per 2 seconds**, keyed by **User ID**
+(including across API keys of that user); default/max limit 100. `after` selects
+older billIds, `before` newer billIds; begin/end filter `ts`. No separate Demo
+limit is published in the endpoint/Demo sections inspected; PAPER uses the same
+conservative pacing and simulated-trading header.
+
+Each OkxRestClient spaces this exact GET endpoint by at least **250ms** using an
+async lock and monotonic clock. Concurrent symbols/callers share its limiter;
+unrelated reads and every trading write are unaffected. Wait before signing,
+outside ledger transactions. Waiting consumes the existing **30-second** total
+deadline; 51 instantaneous reads require 12.5 seconds of spacing, leaving bounded
+time for transport. Network latency/contention may exhaust the deadline, which
+still fails closed. No deadline enlargement or completeness shortcut exists.
+
+OKX **50011** means rate limit reached. Preserve existing single-attempt error
+handling: rate-limit/auth failures do not retry or accept partial evidence.
+Independent clients/processes are not coordinated by this local limiter; other
+consumers of the same UID quota can still cause 50011, handled as unavailable.
+
 1. Existing exact owned terminal order verification remains required.
 2. Query only that instrument/order; validate every returned fill.
 3. Exhaust the cursor stream to an **empty page**. A short page or accumulated size alone is not completion proof.

@@ -159,6 +159,8 @@ ssh -N -L 18000:127.0.0.1:18000 -L 13300:127.0.0.1:13300 your-server
 
 持久化 `maintenance_locks` 租约覆盖证据读取及提交窗口，阻止并发 PAPER start/resume（含进程 lifespan）；15 分钟租约、15 秒心跳，崩溃后仅到期才允许接替。纠正事务原子核验 owner，并在释放租约前持久化 manual hold；dry-run 不写纠正或 hold。
 
+成交历史读取在 REST 客户端层共享独立 limiter，仅对 `GET /api/v5/trade/fills-history` 按 250ms 间隔 pacing（官方限额 10 次/2 秒，按 User ID）。等待计入既有 30 秒证据总时限；50011/认证错误失败关闭，不重试、不接受部分证据。详见 [完整终态成交重建](docs/TERMINAL_FILL_RECONSTRUCTION.md)。
+
 ## 切换到 LIVE
 
 **当前版本尚未完成全部现场验收，不得启用 LIVE。** 原有 `MODE=LIVE`、`LIVE_TRADING_ENABLED=true` 和 `CONFIRM_LIVE_ACCOUNT_ID` 三项门禁保留。LIVE 配置还必须包含完整 OKX 凭据和至少 32 字符的 `API_TOKEN`；配置校验错误不展示输入凭据。启动时先读取账户配置，验证 UID、合约账户模式、单向持仓、恰好 Read/Trade 权限、无 Withdraw 权限及 API IP 绑定，然后才恢复订单及 Emergency 目标。字段依据 [OKX 账户配置 API](https://app.okx.com/docs-v5/en/#trading-account-rest-api-get-account-configuration)。
