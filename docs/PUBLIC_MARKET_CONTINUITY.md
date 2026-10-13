@@ -6,6 +6,7 @@ This is a recovery safety gate. It does not change strategy formulas, risk limit
 |---|---|
 | High-water wait succeeds and every frame is admitted | Continue normally; no hold, reset, HALT or critical notification |
 | Public frame rejected by QueueFull/backpressure timeout | Immediate HALT and continuity hold |
+| Observed pre-ACK public frames discarded on timeout/close | Same hold; original transport exception remains available for diagnostics |
 | Public handler/worker failure, protocol rejection or unexpected run-task death | Continuity uncertain; same manual-only hold; WS retains its original machine failure code |
 | Controlled shutdown abandons accepted, unfinished public frames | Record a hold before cancelling those tasks |
 | Ordinary reconnect without rejected/unapplied-data evidence | Existing transient recovery policy remains available |

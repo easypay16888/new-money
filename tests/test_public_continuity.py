@@ -1025,3 +1025,44 @@ async def test_same_runtime_clean_restart_rebases_public_generation_after_releas
     ws.generation = 0
     await warm(r, ws, now)
     assert r.public_market_continuity_ready()
+
+
+async def test_unadmitted_preack_data_also_creates_continuity_hold(continuity_runtime):
+    import json
+
+    from app.okx import WebSocketFault
+
+    r, ws, _ = continuity_runtime
+    ws.subscribed.clear()
+
+    class Wire:
+        first = True
+
+        async def recv(self):
+            if self.first:
+                self.first = False
+                return json.dumps(
+                    dict(
+                        arg=ws.subscriptions[0],
+                        data=[
+                            dict(
+                                ts=str(int(utcnow().timestamp() * 1000)),
+                                tradeId="buffered-not-applied",
+                                px="100",
+                                sz="1",
+                                side="buy",
+                            )
+                        ],
+                    )
+                )
+            raise WebSocketFault("subscription acknowledgement timeout")
+
+        async def send(self, _):
+            pass
+
+    with pytest.raises(WebSocketFault, match="subscription acknowledgement timeout"):
+        await ws._receive(Wire())
+    await drain(r)
+    assert r.public_continuity.hold["cause"] == "ws_preack_data_discarded"
+    assert r.governor.state == GovernorState.HALT and r._auto_recovery_forbidden
+    assert not r.market.latest_trades and not await r.store.latest("market_trades")

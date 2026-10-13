@@ -647,6 +647,7 @@ class OkxWebSocket:
             "processing backpressure timeout": "ws_processing_backlog",
             "business worker terminated": "ws_worker_failed",
             "business handler failed": "ws_worker_failed",
+            "public subscription buffer discarded": "ws_preack_data_discarded",
             "connection attempt timeout": "ws_connect_timeout",
         }.get(reason, "ws_protocol_error" if kind == "protocol" else "ws_connection_error")
         self.last_failure_reason_code = self.reason_code
@@ -898,11 +899,22 @@ class OkxWebSocket:
                 await asyncio.gather(self._worker_task, return_exceptions=True)
 
     async def _receive(self, ws: Any) -> None:
+        awaiting_ack: list[tuple[dict[str, Any], float]] = []
+        try:
+            await self._receive_frames(ws, awaiting_ack)
+        finally:
+            # Frames already observed before ACK are known continuity evidence.
+            # The original exception still reaches run() for transport diagnostics.
+            if awaiting_ack and self.batch_handler is not None:
+                self._fault('public subscription buffer discarded', kind='handler')
+
+    async def _receive_frames(
+        self, ws: Any, awaiting_ack: list[tuple[dict[str, Any], float]],
+    ) -> None:
         wanted = {self.feed_key(arg) for arg in self.subscriptions}
         # OKX may push the initial snapshot before its subscribe acknowledgement.
         # Buffer requested feeds until every acknowledgement arrives; neither
         # transport readiness nor applied-data freshness is granted early.
-        awaiting_ack: list[tuple[dict[str, Any], float]] = []
         ready_announced = False
         subscribe_started = self.subscribe_sent_at if self.subscribe_sent_at is not None else self._connected_at
         while True:

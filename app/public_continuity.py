@@ -39,7 +39,7 @@ def validate_event(payload: dict[str, Any], events: set[str]) -> None:
         if payload['event'] == HOLD:
             valid = (valid and payload['socket_name'] == 'public-market'
                      and type(payload['generation']) is int and payload['generation'] >= 0
-                     and payload['cause'] in {'ws_processing_backlog', 'ws_worker_failed', 'ws_protocol_error', 'ws_run_task_failed'}
+                     and payload['cause'] in {'ws_processing_backlog', 'ws_worker_failed', 'ws_protocol_error', 'ws_run_task_failed', 'ws_preack_data_discarded'}
                      and type(payload.get('loss_count', 1)) is int and payload.get('loss_count', 1) >= 1)
         if not valid:
             raise ValueError
@@ -80,7 +80,7 @@ class PublicMarketContinuity:
             'event': HOLD, 'continuity_id': uuid4().hex, 'reason_code': CODE,
             'socket_name': 'public-market', 'generation': ws.generation,
             'cause': ws.last_failure_reason_code if ws.last_failure_reason_code in
-            {'ws_processing_backlog', 'ws_worker_failed', 'ws_protocol_error', 'ws_run_task_failed'} else 'ws_worker_failed',
+            {'ws_processing_backlog', 'ws_worker_failed', 'ws_protocol_error', 'ws_run_task_failed', 'ws_preack_data_discarded'} else 'ws_worker_failed',
             'occurred_at': self.since.isoformat(),
             'loss_count': count,
         }
