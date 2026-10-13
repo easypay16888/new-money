@@ -214,3 +214,25 @@ async def test_worker_failure_during_backpressure_is_not_transient_backlog():
         await task
     assert result.value.kind == 'handler'
     assert ws.queue.qsize() == 3
+
+
+async def test_dead_worker_wakes_public_admission_and_preserves_failure_class():
+    ws, _ = ready_socket(channels=('trades',), ws_queue_maxsize=4)
+    ws.batch_handler = AsyncMock()
+    message = dict(arg=ws.subscriptions[0], data=[{}])
+    for _ in range(3):
+        ws._enqueue_message(message, 100)
+    admission = asyncio.create_task(ws._admit_message(message, 100))
+    await asyncio.sleep(0)
+
+    async def broken_worker():
+        raise RuntimeError('worker crashed')
+
+    ws._worker_task = asyncio.create_task(broken_worker())
+    ws._worker_task.add_done_callback(ws._worker_done)
+    await asyncio.gather(ws._worker_task, return_exceptions=True)
+    with pytest.raises(WebSocketFault) as result:
+        await admission
+    assert result.value.kind == 'handler'
+    assert ws.last_failure_reason_code == 'ws_worker_failed'
+    assert ws.processing_unsafe and ws.queue.qsize() == 3

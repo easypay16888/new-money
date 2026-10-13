@@ -678,6 +678,7 @@ class OkxWebSocket:
             "CancelledError" if task.cancelled() else "UnexpectedWorkerExit"
         )
         self.processing_unsafe = True
+        self._queue_progress.set()
         self._fault("business worker terminated", kind="handler")
 
     def _ensure_worker(self) -> None:
@@ -1014,6 +1015,8 @@ class OkxWebSocket:
                         self._queue_progress.clear()
                         await self._queue_progress.wait()
             except TimeoutError:
+                if self.processing_unsafe or (self._worker_task is not None and self._worker_task.done()):
+                    raise WebSocketFault("business handler failed", kind="handler") from None
                 if self.ping_pending and self.clock() - self.last_ping_at >= self.settings.ws_pong_timeout_seconds:
                     raise WebSocketFault("heartbeat timeout") from None
                 self._fault("processing backpressure timeout", kind="backlog")
