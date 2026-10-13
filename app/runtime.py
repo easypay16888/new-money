@@ -129,6 +129,9 @@ class TradingRuntime:
         self.strategies = build_strategies(settings)
         self.decision_pipeline = DecisionPipeline(settings, self.strategies)
         self.metrics = Metrics()
+        self.market.batch_latency_observer = (
+            lambda stage, elapsed: self.metrics.market_batch_latency.labels(stage=stage).observe(elapsed)
+        )
         self.client.latency_observer = self.metrics.observe_latency
         channels: list[Notification] = [ConsoleNotification()]
         if settings.alert_webhook_url:

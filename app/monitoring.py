@@ -74,6 +74,15 @@ class Metrics:
         self.ws_queue_wait = Histogram(
             "quant_ws_queue_wait_seconds", "WS business queue wait", ["socket"], registry=self.registry
         )
+        self.ws_backpressure = Histogram(
+            "quant_ws_backpressure_seconds", "Public queue admission wait", ["socket"], registry=self.registry
+        )
+        self.ws_received = Counter(
+            "quant_ws_received_messages_total", "Received business frames", ["socket"], registry=self.registry
+        )
+        self.market_batch_latency = Histogram(
+            "quant_market_batch_stage_seconds", "Public batch processing stages", ["stage"], registry=self.registry
+        )
         self.ws_handler_latency = Histogram(
             "quant_ws_handler_latency_seconds", "WS business handler latency", ["socket"], registry=self.registry
         )

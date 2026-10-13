@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import time
 from collections import defaultdict, deque
+from collections.abc import Callable
 from contextvars import ContextVar
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -55,6 +57,7 @@ class MarketDataEngine:
         self._batch_derivatives: ContextVar[set[str] | None] = ContextVar(
             "public_batch_derivatives", default=None
         )
+        self.batch_latency_observer: Callable[[str, float], None] | None = None
 
     async def handle_batch(self, messages: list[dict[str, Any]]) -> None:
         """Persist every public observation; pipeline only the latest Redis cache values."""
@@ -70,23 +73,37 @@ class MarketDataEngine:
         cache_token = self._batch_cache.set(cache)
         derivative_token = self._batch_derivatives.set(dirty)
         try:
-            async with self.store.market_batch():
-                for message in messages:
-                    await self.handle(message)
-                # Same timestamped reconstruction and all observations retained;
-                # avoid replaying the bounded history for every frame in this batch.
-                for symbol in sorted(dirty):
-                    await self._refresh_derivative_cache(symbol)
+            stage, started = "parse", time.monotonic()
+            try:
+                async with self.store.market_batch():
+                    for message in messages:
+                        await self.handle(message)
+                    # Same timestamped reconstruction and all observations retained;
+                    # avoid replaying the bounded history for every frame in this batch.
+                    for symbol in sorted(dirty):
+                        await self._refresh_derivative_cache(symbol)
+                    self._observe_batch_stage(stage, started)
+                    stage, started = "database", time.monotonic()
+            finally:
+                self._observe_batch_stage(stage, started)
             # Redis I/O is outside the durable market transaction. Failure still
             # propagates to the WS worker, fencing freshness and new entries.
             if self.redis is not None and cache:
-                async with self.redis.pipeline(transaction=False) as pipeline:
-                    for key, value in cache.items():
-                        pipeline.set(key, value, ex=120)
-                    await pipeline.execute()
+                started = time.monotonic()
+                try:
+                    async with self.redis.pipeline(transaction=False) as pipeline:
+                        for key, value in cache.items():
+                            pipeline.set(key, value, ex=120)
+                        await pipeline.execute()
+                finally:
+                    self._observe_batch_stage("redis", started)
         finally:
             self._batch_derivatives.reset(derivative_token)
             self._batch_cache.reset(cache_token)
+
+    def _observe_batch_stage(self, stage: str, started: float) -> None:
+        if self.batch_latency_observer is not None:
+            self.batch_latency_observer(stage, time.monotonic() - started)
 
     async def handle(self, message: dict[str, Any], *, historical: bool = False) -> None:
         arg = message.get("arg", {})

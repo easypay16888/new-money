@@ -573,6 +573,8 @@ class OkxWebSocket:
         self.last_close_reason = ""
         self._connected_at = 0.0
         self._queued_at: deque[float] = deque()
+        self._queue_progress = asyncio.Event()
+        self._backpressure_started_at: float | None = None
         self._handler_started_at: float | None = None
         self._stale_keys: set[str] = set()
         self._phase = "DISCONNECTED"
@@ -642,6 +644,7 @@ class OkxWebSocket:
             "subscription acknowledgement timeout": "ws_subscription_timeout",
             "server maintenance notice 64008": "ws_server_maintenance",
             "processing queue full": "ws_processing_backlog",
+            "processing backpressure timeout": "ws_processing_backlog",
             "business worker terminated": "ws_worker_failed",
             "business handler failed": "ws_worker_failed",
             "connection attempt timeout": "ws_connect_timeout",
@@ -962,7 +965,7 @@ class OkxWebSocket:
                 self.subscribed.add(key)
             if not ready_announced and wanted <= self.subscribed:
                 for buffered, arrival in awaiting_ack:
-                    self._enqueue_message(buffered, arrival)
+                    await self._admit_message(buffered, arrival)
                 awaiting_ack.clear()
                 ready_announced = True
                 self.subscriptions_completed_at = self.clock()
@@ -973,6 +976,8 @@ class OkxWebSocket:
                     self.on_ready(self)
             if "data" not in message:
                 continue
+            if self.metrics is not None:
+                self.metrics.ws_received.labels(socket=self.name).inc()
             key = self.feed_key(message.get("arg", {}))
             if key not in wanted:
                 raise WebSocketFault("unacknowledged subscription data", kind="protocol")
@@ -983,7 +988,47 @@ class OkxWebSocket:
                     raise WebSocketFault("processing queue full", kind="backlog")
                 awaiting_ack.append((message, received_at))
             else:
-                self._enqueue_message(message, received_at)
+                await self._admit_message(message, received_at)
+
+    async def _admit_message(self, message: dict[str, Any], received_at: float) -> None:
+        """Bounded public-only TCP backpressure, before the application queue fills.
+
+        Keep at most one parsed frame waiting here. websockets' bounded frame
+        buffer then propagates flow control to TCP. Never spawn pending put tasks,
+        drop observations, reorder frames, or change private-event admission.
+        """
+        high_water = max(1, self.queue.maxsize * 3 // 4)
+        if not self.private and self.batch_handler is not None and self.queue.qsize() >= high_water:
+            self._backpressure_started_at = self.clock()
+            # A short scheduling allowance, not an extension of heartbeat or
+            # freshness deadlines. A stalled consumer still fences synchronously.
+            budget = min(0.25, self.settings.ws_pong_timeout_seconds / 4)
+            if self.ping_pending:
+                budget = min(budget, max(0, self.settings.ws_pong_timeout_seconds
+                                         - (self.clock() - self.last_ping_at)))
+            try:
+                async with asyncio.timeout(budget):
+                    while self.queue.qsize() >= high_water:
+                        if self.processing_unsafe or (self._worker_task is not None and self._worker_task.done()):
+                            raise WebSocketFault("business handler failed", kind="handler")
+                        self._queue_progress.clear()
+                        await self._queue_progress.wait()
+            except TimeoutError:
+                if self.ping_pending and self.clock() - self.last_ping_at >= self.settings.ws_pong_timeout_seconds:
+                    raise WebSocketFault("heartbeat timeout") from None
+                self._fault("processing backpressure timeout", kind="backlog")
+                raise WebSocketFault("processing backpressure timeout", kind="backlog") from None
+            finally:
+                if self.metrics is not None:
+                    self.metrics.ws_backpressure.labels(socket=self.name).observe(
+                        max(0, self.clock() - self._backpressure_started_at)
+                    )
+                self._backpressure_started_at = None
+            if self.processing_unsafe:
+                raise WebSocketFault("business handler failed", kind="handler")
+            if self.ping_pending and self.clock() - self.last_ping_at >= self.settings.ws_pong_timeout_seconds:
+                raise WebSocketFault("heartbeat timeout")
+        self._enqueue_message(message, received_at)
 
     def _enqueue_message(self, message: dict[str, Any], received_at: float) -> None:
         try:
@@ -1041,6 +1086,7 @@ class OkxWebSocket:
                     )
 
     def _queue_metric(self) -> None:
+        self._queue_progress.set()
         if self.metrics is not None:
             self.metrics.ws_queue_depth.labels(socket=self.name).set(self.queue.qsize())
 
@@ -1193,6 +1239,7 @@ class OkxWebSocket:
             "last_pong_age_seconds": self._age(self.last_pong_at),
             "ping_pending": self.ping_pending, "ping_rtt_seconds": self.ping_rtt,
             "queue_depth": self.queue.qsize(), "queue_capacity": self.queue.maxsize,
+            "backpressure_active": self._backpressure_started_at is not None,
             "handler_age_seconds": (
                 max(0, self.clock() - self._handler_started_at)
                 if self._handler_started_at is not None else None

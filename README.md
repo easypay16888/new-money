@@ -230,6 +230,7 @@ LIVE 先核验账户，再非等待获取 PostgreSQL session advisory lock、原
 
 - **Transport**：必须完成连接、private login、所有 subscription ack；10 秒无入站帧发送 text `ping`，5 秒内无 `pong` 则断线重连。其他帧不会延长已等待的 pong deadline。底层 WebSocket ping 继续提供额外保护。
 - **初始数据与订阅确认竞态**：OKX 可以先返回已请求频道的初始数据，再返回 subscribe ack。这些数据与业务队列共用容量预算，暂存至所有 ack 完成后按接收顺序处理；保留原始接收时间，不提前授予 transport health 或数据 freshness。未请求频道、ack 超时或缓冲溢出仍 fail closed。
+- **公开行情突发背压**：仅 public batch 接收路径在队列达到容量的 75% 时等待 worker 腾出空间，单次最多 250ms（且不超过剩余 Pong deadline），由底层有界 WebSocket 缓冲和 TCP 流控限制突发输入。最多额外保留一帧，既不扩大队列，也不丢弃或合并成交；等待超时仍立即 HALT/reconnect，原有 freshness 和完整对账恢复门禁保留。private 与 K 线路径不使用该等待，满队列继续立即 fail closed。背压只能吸收短时突发，持续过载仍禁止开仓。`/status.websockets[].backpressure_active` 显示等待状态。
 - **公开市场写入吞吐**：公开市场 worker 每轮最多处理已排队的 64 帧，在一个任务内专用事务中提交市场记录，保留全部帧、记录及顺序，不等待凑批、不丢弃 trades、不合并快照。事务提交成功后才更新应用数据 freshness；失败继续 HALT。private 事件、K 线决策及所有交易安全写入不参与批处理。服务器 Demo SQLite 可在安全停机后使用 WAL，保持 `synchronous=FULL`；备份应使用 SQLite backup API。
 - **Data**：按 `channel:instId` 记录成功应用数据的原始到达时间，不用 pong 或其他品种的数据刷新该频道。`books5`、`tickers`、`mark-price`、`index-tickers` 必须在原有 `STALE_TIMEOUT_SECONDS=20` 内更新；K线按两倍周期加 20 秒判定。funding、OI、trades 和 private 事件流不按 20 秒业务活动判 stale。Risk Engine 的 book/tick **交易所时间戳**门禁保持不变。
 - **Processing**：每路 `WS_QUEUE_MAXSIZE=1000`，WebSocket 帧缓冲最多 16、单帧最多 1 MiB。队列溢出立即同步 HALT，原因为 `WebSocket processing backlog`；记录异常并断开，重连及完整对账后才可通过恢复门禁。handler/排队超过 20 秒也阻止开仓。若 worker 不结束，保持 HALT，不为清空队列而中断交易写请求。正常停机先有界 drain private 队列，再执行原有安全对账；超时拒绝停机并保留运行中的 handler。
@@ -240,7 +241,7 @@ LIVE 先核验账户，再非等待获取 PostgreSQL session advisory lock、原
 
 Bark 分别显示 **🚨 WebSocket 连接中断**、**⚠️ 市场数据过期**、**🚨 WebSocket 消息处理积压**、**⚠️ OKX WebSocket 服务端要求重连**，附 socket/feed/symbol/原因；恢复标题对应。沿用事故合并、60 秒确认延迟和可靠重试。短暂 WS 故障已恢复而 Governor 仍等待健康检查时，不误报连接仍断开；其他持久风险/基础设施故障仍按既有规则通知。降噪不延迟内部 HALT，也不提前恢复 NORMAL。
 
-新增 Prometheus：`quant_ws_queue_depth`、`quant_ws_queue_wait_seconds`、`quant_ws_handler_latency_seconds`、`quant_ws_ping_rtt_seconds`、`quant_ws_transport_disconnects_total`、`quant_ws_market_stale_events_total`。标签只有稳定 socket name，不包含品种、订单或消息。同步 CPU 阻塞仍会阻塞同一 Python event loop；本轮隔离的是异步 handler 等待，队列/延迟观测会反映处理不足。
+新增 Prometheus：`quant_ws_queue_depth`、`quant_ws_queue_wait_seconds`、`quant_ws_handler_latency_seconds`、`quant_ws_ping_rtt_seconds`、`quant_ws_transport_disconnects_total`、`quant_ws_market_stale_events_total`。另有 `quant_ws_received_messages_total`、`quant_ws_backpressure_seconds`，以及 `quant_market_batch_stage_seconds{stage="parse|database|redis"}`，区分输入突发、排队与持久化/缓存耗时。标签只有稳定 socket name 或固定处理阶段，不包含品种、订单或消息。同步 CPU 阻塞仍会阻塞同一 Python event loop；本轮隔离的是异步 handler 等待，队列/延迟观测会反映处理不足。
 
 本轮代码/模拟协议测试不能代替实际 443 接入、网络中断和 OKX 维护现场验收。默认仍 PAPER、LIVE 关闭，策略、风险额度及保证金目标不变。
 
