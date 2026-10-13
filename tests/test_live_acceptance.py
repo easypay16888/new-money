@@ -134,6 +134,7 @@ async def test_live_startup_requires_manual_resume_even_after_valid_identity(tmp
     runtime = TradingRuntime(live_settings())
     runtime.store.initialize = AsyncMock()
     runtime.store.bind_live_account = AsyncMock()
+    runtime.store.public_audit_state = AsyncMock(return_value=None)
     monkeypatch.setattr("app.live_lease.LiveRuntimeLease.acquire", AsyncMock())
     monkeypatch.setattr("app.live_lease.LiveRuntimeLease.verify", AsyncMock(return_value=True))
     runtime.client.account_config = AsyncMock(return_value=[account_config()])
@@ -144,6 +145,7 @@ async def test_live_startup_requires_manual_resume_even_after_valid_identity(tmp
         assert runtime.governor.state.value == "HALT"
         assert runtime.governor.reason == "LIVE startup requires manual resume"
         assert not runtime.auto_recovery_status()["eligible"]
+        assert runtime.store.public_audit_state.await_count == 2
     finally:
         await runtime.client.close()
         await runtime.store.close()
