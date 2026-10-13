@@ -83,6 +83,15 @@ class Metrics:
         self.market_batch_latency = Histogram(
             "quant_market_batch_stage_seconds", "Public batch processing stages", ["stage"], registry=self.registry
         )
+        self.public_continuity_loss = Counter(
+            'quant_public_market_continuity_loss_total', 'Confirmed public observation gaps', registry=self.registry
+        )
+        self.public_warmup_ready = Gauge(
+            'quant_public_market_warmup_ready', 'Post-gap public state is ready', registry=self.registry
+        )
+        self.public_warmup_samples = Gauge(
+            'quant_public_market_trade_warmup_samples', 'Fresh post-gap trade samples', ['symbol'], registry=self.registry
+        )
         self.ws_handler_latency = Histogram(
             "quant_ws_handler_latency_seconds", "WS business handler latency", ["socket"], registry=self.registry
         )

@@ -25,6 +25,6 @@ jobs:
         with:
           python-version: '3.12'
       - run: uv sync --extra dev
-      - run: uv run pytest
+      - run: uv run pytest -W error
       - run: uv run ruff check app tests
       - run: uv run mypy app

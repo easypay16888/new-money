@@ -61,6 +61,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/metrics", dependencies=[Depends(authorize)])
     async def metrics() -> Response:
+        runtime.public_market_continuity_status()
         runtime.metrics.update(
             runtime.portfolio,
             runtime.governor.state,
@@ -104,6 +105,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "auto_recovery": runtime.auto_recovery_status(),
             "protective_algos": list(runtime.algo_manager.algos.values()),
             "websockets": [ws.status() for ws in runtime.sockets],
+            "public_market_continuity": runtime.public_market_continuity_status(),
         }
 
     @app.get("/market", dependencies=[Depends(authorize)])

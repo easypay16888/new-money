@@ -58,8 +58,29 @@ class MarketDataEngine:
             "public_batch_derivatives", default=None
         )
         self.batch_latency_observer: Callable[[str, float], None] | None = None
+        self.public_epoch = 0
+        self.public_since: datetime | None = None
+        self._public_batch_epoch: ContextVar[int | None] = ContextVar('public_epoch', default=None)
+        self._apply_public: ContextVar[bool] = ContextVar('apply_public', default=True)
 
-    async def handle_batch(self, messages: list[dict[str, Any]]) -> None:
+    def invalidate_public_state(self, symbols: tuple[str, ...], since: datetime) -> None:
+        self.public_epoch += 1
+        self.public_since = since
+        for symbol in symbols:
+            for state in (self.latest_trades, self.latest_ticks, self.latest_books,
+                          self.latest_derivatives, self.derivative_observations,
+                          self.last_book_snapshot):
+                state.pop(symbol, None)
+
+    def _public_usable(self, timestamp: datetime | None = None) -> bool:
+        epoch = self._public_batch_epoch.get()
+        return (self._apply_public.get() and (epoch is None or epoch == self.public_epoch)
+                and (timestamp is None or self.public_since is None or timestamp >= self.public_since))
+
+    async def handle_batch(
+        self, messages: list[dict[str, Any]], *,
+        apply_public: bool | Callable[[dict[str, Any]], bool] = True,
+    ) -> None:
         """Persist every public observation; pipeline only the latest Redis cache values."""
         if len(messages) > 64 or any(message.get("arg", {}).get("channel") not in {
             "tickers", "trades", "books5", "mark-price", "index-tickers",
@@ -72,12 +93,20 @@ class MarketDataEngine:
         dirty: set[str] = set()
         cache_token = self._batch_cache.set(cache)
         derivative_token = self._batch_derivatives.set(dirty)
+        epoch_token = self._public_batch_epoch.set(self.public_epoch)
+        apply_token = self._apply_public.set(apply_public if isinstance(apply_public, bool) else True)
         try:
             stage, started = "parse", time.monotonic()
             try:
                 async with self.store.market_batch():
                     for message in messages:
-                        await self.handle(message)
+                        message_token = self._apply_public.set(
+                            apply_public(message) if callable(apply_public) else apply_public
+                        )
+                        try:
+                            await self.handle(message)
+                        finally:
+                            self._apply_public.reset(message_token)
                     # Same timestamped reconstruction and all observations retained;
                     # avoid replaying the bounded history for every frame in this batch.
                     for symbol in sorted(dirty):
@@ -88,7 +117,7 @@ class MarketDataEngine:
                 self._observe_batch_stage(stage, started)
             # Redis I/O is outside the durable market transaction. Failure still
             # propagates to the WS worker, fencing freshness and new entries.
-            if self.redis is not None and cache:
+            if self.redis is not None and cache and self._public_usable():
                 started = time.monotonic()
                 try:
                     async with self.redis.pipeline(transaction=False) as pipeline:
@@ -98,6 +127,8 @@ class MarketDataEngine:
                 finally:
                     self._observe_batch_stage("redis", started)
         finally:
+            self._apply_public.reset(apply_token)
+            self._public_batch_epoch.reset(epoch_token)
             self._batch_derivatives.reset(derivative_token)
             self._batch_cache.reset(cache_token)
 
@@ -141,8 +172,9 @@ class MarketDataEngine:
                     bid=Decimal(row["bidPx"]) if row.get("bidPx") else None,
                     ask=Decimal(row["askPx"]) if row.get("askPx") else None,
                 )
-                self.latest_ticks[symbol] = tick
-                await self._cache(f"ticker:{symbol}", tick.model_dump(mode="json"))
+                if self._public_usable(tick.timestamp):
+                    self.latest_ticks[symbol] = tick
+                    await self._cache(f"ticker:{symbol}", tick.model_dump(mode="json"))
             elif channel == "trades":
                 trade = Trade(
                     symbol=symbol,
@@ -158,7 +190,8 @@ class MarketDataEngine:
                     symbol=symbol,
                     reference_id=trade.trade_id,
                 )
-                self.latest_trades[symbol].append(trade)
+                if self._public_usable(trade.timestamp):
+                    self.latest_trades[symbol].append(trade)
             elif channel == "books5":
                 book = OrderBook(
                     symbol=symbol,
@@ -169,7 +202,8 @@ class MarketDataEngine:
                 )
                 if book.bids and book.asks and book.bids[0][0] >= book.asks[0][0]:
                     raise ValueError("crossed order book")
-                self.latest_books[symbol] = book
+                if self._public_usable(book.timestamp):
+                    self.latest_books[symbol] = book
                 previous_snapshot = self.last_book_snapshot.get(symbol)
                 if (
                     previous_snapshot is None
@@ -179,7 +213,8 @@ class MarketDataEngine:
                     await self.store.append(
                         "market_orderbook_snapshots", book.model_dump(mode="json"), symbol=symbol
                     )
-                    self.last_book_snapshot[symbol] = book.timestamp
+                    if self._public_usable(book.timestamp):
+                        self.last_book_snapshot[symbol] = book.timestamp
             elif channel in {"mark-price", "funding-rate", "open-interest", "index-tickers"}:
                 timestamp = okx_time(row["ts"])
                 if channel == "index-tickers":
@@ -198,17 +233,21 @@ class MarketDataEngine:
                     observation = DerivativeObservation(
                         symbol=symbol, timestamp=timestamp, kind=field, value=value
                     )
-                    self.derivative_observations[symbol][field].append(observation)
+                    if self._public_usable(timestamp):
+                        self.derivative_observations[symbol][field].append(observation)
                     await self.store.append(
                         "market_derivatives", observation.model_dump(mode="json"), symbol=symbol
                     )
-                    dirty = self._batch_derivatives.get()
-                    if dirty is not None:
-                        dirty.add(symbol)
-                    else:
-                        await self._refresh_derivative_cache(symbol)
+                    if self._public_usable(timestamp):
+                        dirty = self._batch_derivatives.get()
+                        if dirty is not None:
+                            dirty.add(symbol)
+                        else:
+                            await self._refresh_derivative_cache(symbol)
 
     async def _refresh_derivative_cache(self, symbol: str) -> None:
+        if not self._public_usable():
+            return
         self.latest_derivatives[symbol] = {
             key: Decimal(str(item))
             for key, item in self.derivative_context(symbol, datetime.now(UTC)).items()

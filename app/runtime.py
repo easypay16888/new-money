@@ -5,11 +5,13 @@ import json
 import logging
 from collections import deque
 from collections.abc import Awaitable
+from contextvars import ContextVar
 from datetime import datetime, timedelta
 from decimal import Decimal
 from functools import partial
 from time import monotonic
 from typing import Any
+from uuid import uuid4
 
 from redis.asyncio import Redis
 from sqlalchemy.exc import SQLAlchemyError
@@ -49,6 +51,25 @@ from app.okx import (
 )
 from app.paper_maintenance import MaintenanceBusy, MaintenanceError, PaperMaintenanceFence
 from app.portfolio import summarize_positions
+from app.public_continuity import (
+    CODE as PUBLIC_CONTINUITY_CODE,
+)
+from app.public_continuity import (
+    HOLD as PUBLIC_CONTINUITY_HOLD,
+)
+from app.public_continuity import (
+    LOSS_REASONS,
+    SESSION_CLOSE,
+    SESSION_OPEN,
+    SESSION_RESUME,
+    PublicMarketContinuity,
+)
+from app.public_continuity import (
+    REASON as PUBLIC_CONTINUITY_REASON,
+)
+from app.public_continuity import (
+    RELEASE as PUBLIC_CONTINUITY_RELEASE,
+)
 from app.recovery import HaltClass, classify_halt_reason
 from app.regime import classify
 from app.risk import RiskEngine, RiskGovernor
@@ -80,6 +101,12 @@ class TradingRuntime:
             self.store,
             orderbook_snapshot_interval_seconds=settings.orderbook_snapshot_interval_seconds,
         )
+        self.public_continuity = PublicMarketContinuity(settings.symbols)
+        self._public_audit_lock = asyncio.Lock()
+        self._public_audit_tasks: set[asyncio.Task[None]] = set()
+        self._public_session: str | None = None
+        self._public_gap_notified = False
+        self._entry_public_epoch: ContextVar[int | None] = ContextVar('entry_public_epoch', default=None)
         self.governor = RiskGovernor()
         self.live_lease: LiveRuntimeLease | None = None
         self._lease_loss_task: asyncio.Task[None] | None = None
@@ -91,7 +118,8 @@ class TradingRuntime:
         self.execution = ExecutionEngine(
             self.client,
             self.order_manager,
-            lambda: self.governor.state == GovernorState.NORMAL and (
+            lambda: self.governor.state == GovernorState.NORMAL and not self.public_continuity.required
+            and (self._entry_public_epoch.get() in (None, self.public_continuity.epoch)) and (
                 self.settings.mode != Mode.LIVE or
                 (self.live_lease is not None and self.live_lease.held)
             ),
@@ -381,7 +409,8 @@ class TradingRuntime:
     async def _live_writer_guard(self, entry: bool) -> bool:
         if self.live_lease is None or not await self.live_lease.verify():
             return False
-        return not entry or self.governor.state == GovernorState.NORMAL
+        return not entry or (self.governor.state == GovernorState.NORMAL
+                             and not self.public_continuity.required)
 
     async def _caa_owner_held(self) -> bool:
         if self.settings.mode != Mode.LIVE:
@@ -425,6 +454,7 @@ class TradingRuntime:
             # Position recovery runs, but entry requires an explicit, fully checked resume.
             self.governor.halt("LIVE startup requires manual resume")
             self._auto_recovery_forbidden = True
+        await self._restore_public_continuity()
         await self.order_manager.restore()
         await self.algo_manager.restore()
         await self.emergency.restore()
@@ -1298,6 +1328,9 @@ class TradingRuntime:
             )
         if fence is not None:
             await fence.renew()  # A paused/expired starter must never activate.
+        # A crash before a gap audit reaches the DB must never get startup's
+        # automatic NORMAL path. This guard is durable before any public receiver.
+        await self._arm_public_session()
         self.running = True
         self.tasks = [asyncio.create_task(ws.run()) for ws in self.sockets]
         for ws, task in zip(self.sockets, self.tasks, strict=True):
@@ -1401,12 +1434,26 @@ class TradingRuntime:
                 "shutdown positions or cancellations cannot be verified without credentials"
             )
         self.running = False
+        for ws in self.sockets:
+            if not ws.private and ws.batch_handler is not None and not ws.business_idle:
+                self._record_public_loss(ws)
         shutdown_tasks = [*self.tasks, *self._ws_safety_tasks.values()]
         for task in shutdown_tasks:
             task.cancel()
         await asyncio.gather(*shutdown_tasks, return_exceptions=True)
         self._ws_safety_tasks.clear()
         self._ws_reconcile_requested.clear()
+        if self._public_audit_tasks:
+            await asyncio.gather(*self._public_audit_tasks)
+        if (self._public_session is not None and not self.public_continuity.corrupt
+                and (not self.public_continuity.required or (
+                    self.public_continuity.hold is not None and self.public_continuity.persisted
+                ))):
+            await self.store.append('system_events', {
+                'event': SESSION_CLOSE, 'continuity_id': self._public_session,
+                'occurred_at': utcnow().isoformat(),
+            })
+            self._public_session = None
         try:
             await self.store.append("system_events", {"event": "stop"})
         finally:
@@ -1414,6 +1461,8 @@ class TradingRuntime:
                 await self.live_lease.close()
 
     async def close(self) -> None:
+        if self._public_audit_tasks:
+            await asyncio.gather(*self._public_audit_tasks)
         if self.live_lease is not None:
             self.governor.halt("LIVE runtime closing")
             if self._lease_loss_task is not None:
@@ -1560,12 +1609,102 @@ class TradingRuntime:
     def _on_ws_fault(self, ws: OkxWebSocket, reason: str) -> None:
         # Receive-loop callback performs immediate entry fencing without awaiting
         # notifications, cancellation HTTP, or reconciliation.
-        self._halt_state(reason)
+        if not ws.private and ws.batch_handler is not None and reason in LOSS_REASONS:
+            self._record_public_loss(ws)
+            reason = PUBLIC_CONTINUITY_REASON
+        else:
+            self._halt_state(reason)
         if ws.private:
             self.reconciliation_healthy = False
             self._last_reconcile_safe = False
             self.portfolio.synchronized = False
         self._schedule_ws_reconciliation(ws, reason)
+
+    def _record_public_loss(self, ws: OkxWebSocket) -> None:
+        # No awaited work before entry fencing and volatile invalidation.
+        self._halt_state(PUBLIC_CONTINUITY_REASON)
+        if self.public_continuity.loss(self.market, ws):
+            self.metrics.public_continuity_loss.inc()
+            hold = dict(self.public_continuity.hold or {})
+            notify = not self._public_gap_notified
+            self._public_gap_notified = True
+            if not any(not task.done() for task in self._public_audit_tasks):
+                task = asyncio.create_task(self._persist_public_gap(hold, notify))
+                self._public_audit_tasks.add(task)
+                task.add_done_callback(self._public_audit_tasks.discard)
+
+    async def _arm_public_session(self) -> None:
+        session = uuid4().hex
+        try:
+            await self.store.append('system_events', {
+                'event': SESSION_OPEN, 'continuity_id': session,
+                'occurred_at': utcnow().isoformat(),
+            })
+        except Exception:
+            self._halt_state(PUBLIC_CONTINUITY_REASON)
+            raise
+        self._public_session = session
+
+    async def _restore_public_continuity(self) -> None:
+        try:
+            hold = await self.store.public_audit_state(PUBLIC_CONTINUITY_HOLD, PUBLIC_CONTINUITY_RELEASE)
+            session = await self.store.public_audit_state(SESSION_OPEN, SESSION_CLOSE)
+        except Exception:
+            self.public_continuity.corrupt = True
+            self.public_continuity.invalidate(self.market, received_after=self._clock(), generation=-1)
+            self._halt_state(PUBLIC_CONTINUITY_REASON)
+            raise ValueError('public market continuity audit invalid') from None
+        if hold is not None:
+            self.public_continuity.hold = hold
+            self.public_continuity.persisted = True
+        if session is not None:
+            self.public_continuity.restart_unverified = True
+            if self._public_session is None:
+                self._public_session = session['continuity_id']
+        if self.public_continuity.required:
+            self._halt_state(PUBLIC_CONTINUITY_REASON)
+        if self.public_continuity.required or self.public_continuity.epoch > 0:
+            self.public_continuity.invalidate(self.market, received_after=self._clock(), generation=-1)
+
+    async def _persist_public_gap(self, hold: dict[str, Any], notify: bool) -> None:
+        # One writer and one latest pending state: DB outages cannot accumulate
+        # unbounded audit tasks. loss_count retains the coalesced incident count.
+        while True:
+            try:
+                async with self._public_audit_lock:
+                    await asyncio.wait_for(self.store.append('system_events', hold),
+                                           timeout=self.settings.request_timeout_seconds)
+                    if self.public_continuity.hold == hold:
+                        self.public_continuity.persisted = True
+            except Exception as exc:
+                logger.error('public continuity hold persistence failed',
+                             extra={'exception_type': type(exc).__name__})
+            current = self.public_continuity.hold
+            if current is None or current == hold:
+                break
+            hold = dict(current)
+        if notify:
+            try:
+                await self.alert(
+                    'CRITICAL', '🚨 Public market continuity lost',
+                    'New entries: blocked\nAutomatic recovery: disabled\n'
+                    'Waiting for fresh market warm-up and manual resume',
+                    category=NotificationCategory.RISK, priority=NotificationPriority.CRITICAL,
+                    dedup_key=f"public-market-continuity:{hold['continuity_id']}",
+                )
+            except Exception:
+                logger.error('public continuity notification unavailable')
+
+    def public_market_continuity_status(self) -> dict[str, Any]:
+        ws = next((w for w in self.sockets if not w.private and w.batch_handler is not None), None)
+        result = self.public_continuity.status(self.market, ws, self.settings.stale_timeout_seconds)
+        self.metrics.public_warmup_ready.set(bool(result['ready']))
+        for symbol, state in result['symbols'].items():
+            self.metrics.public_warmup_samples.labels(symbol=symbol).set(state['trade_samples'])
+        return result
+
+    def public_market_continuity_ready(self) -> bool:
+        return bool(self.public_market_continuity_status()['ready'])
 
     def _on_ws_ready(self, ws: OkxWebSocket) -> None:
         if ws.private:
@@ -1637,7 +1776,9 @@ class TradingRuntime:
     async def _on_public_market_batch(self, messages: list[dict[str, Any]]) -> None:
         # This callback is used only by public market subscriptions, never by
         # candles/decisions, orders, protection, emergency or reconciliation.
-        await self.market.handle_batch(messages)
+        # Old accepted frames remain durable audit observations but cannot refill
+        # volatile feature inputs. Keep FIFO and the same 64-frame transaction.
+        await self.market.handle_batch(messages, apply_public=self.public_continuity.accepts)
 
     async def _on_market(self, message: dict[str, Any]) -> None:
         try:
@@ -1655,6 +1796,9 @@ class TradingRuntime:
             logger.error("market processing failed: %s", type(exc).__name__)
 
     async def _evaluate(self, symbol: str) -> None:
+        if self.public_continuity.required:
+            return
+        public_epoch = self.public_continuity.epoch
         if not self.portfolio.synchronized or self.governor.state != GovernorState.NORMAL:
             return
         if symbol in self.entry_controller.blocked:
@@ -1698,6 +1842,8 @@ class TradingRuntime:
             self.portfolio,
             main_state=state,
         )
+        if self.public_continuity.required or public_epoch != self.public_continuity.epoch:
+            return
         for signal in signals:
             await self.store.append(
                 "signals", signal.model_dump(mode="json"), symbol=symbol, reference_id=signal.id
@@ -1713,6 +1859,8 @@ class TradingRuntime:
         book = self.market.latest_books.get(symbol)
         tick = self.market.latest_ticks.get(symbol)
         now = utcnow()
+        if self.public_continuity.required or public_epoch != self.public_continuity.epoch:
+            return
         market_fresh = bool(
             book
             and tick
@@ -1731,7 +1879,7 @@ class TradingRuntime:
             intent,
             self.portfolio,
             self.instruments[symbol],
-            data_fresh=market_fresh and self._websockets_healthy(),
+            data_fresh=market_fresh and self._websockets_healthy() and not self.public_continuity.required,
             infrastructure_healthy=self.store.healthy
             and self.redis is not None
             and self.dead_man_healthy,
@@ -1745,6 +1893,7 @@ class TradingRuntime:
             "risk_events", decision.model_dump(mode="json"), symbol=symbol, reference_id=intent.id
         )
         if decision.approved:
+            epoch_token = self._entry_public_epoch.set(public_epoch)
             try:
                 request = ExecutionEngine.from_risk(
                     decision, self.instruments[symbol], signal_expires_at=intent.expires_at
@@ -1760,6 +1909,8 @@ class TradingRuntime:
             except Exception:
                 self.metrics.order_errors.inc()
                 raise
+            finally:
+                self._entry_public_epoch.reset(epoch_token)
 
     async def _on_private(self, message: dict[str, Any]) -> None:
         channel = message.get("arg", {}).get("channel")
@@ -2071,6 +2222,8 @@ class TradingRuntime:
 
     async def _resume_health(self) -> tuple[bool, list[str]]:
         issues: list[str] = []
+        if self.public_continuity.required and not self.public_market_continuity_ready():
+            issues.append('public market warm-up incomplete')
         if self.settings.mode == Mode.LIVE and (
             self.live_lease is None or not await self.live_lease.verify()
         ):
@@ -2123,6 +2276,17 @@ class TradingRuntime:
         return not issues, issues
 
     async def resume(self) -> bool:
+        try:
+            hold = await self.store.public_audit_state(PUBLIC_CONTINUITY_HOLD, PUBLIC_CONTINUITY_RELEASE)
+            if hold is not None and self.public_continuity.hold is None:
+                self.public_continuity.hold = hold
+                self.public_continuity.persisted = True
+                self.public_continuity.invalidate(self.market, received_after=self._clock(), generation=-1)
+                self._halt_state(PUBLIC_CONTINUITY_REASON)
+        except Exception:
+            self.public_continuity.corrupt = True
+            self._halt_state(PUBLIC_CONTINUITY_REASON)
+            return False
         if self.settings.mode != Mode.PAPER:
             return await self._resume()
         try:
@@ -2137,6 +2301,7 @@ class TradingRuntime:
             return False
 
     async def _resume(self, fence: PaperMaintenanceFence | None = None) -> bool:
+        epoch = self.public_continuity.epoch
         healthy, _ = await self._reconcile_and_assess()
         if fence is not None:
             await fence.renew()
@@ -2145,10 +2310,54 @@ class TradingRuntime:
                 return False
             await self.store.append("system_events", {"event": "ledger_repair_manual_release"})
             self._ledger_repair_manual_hold = False
-        if not self.governor.resume(
-            synchronized=self.portfolio.synchronized, healthy=healthy
-        ):
-            return False
+        async with self._public_audit_lock:
+            if epoch != self.public_continuity.epoch:
+                return False
+            if self.public_continuity.required and not self.public_market_continuity_ready():
+                return False
+            hold = self.public_continuity.hold
+            released = False
+            if hold is not None:
+                try:
+                    durable = await self.store.public_audit_state(PUBLIC_CONTINUITY_HOLD, PUBLIC_CONTINUITY_RELEASE)
+                    released = durable is None and await self.store.public_release_matches(hold['continuity_id'])
+                    if not released and (durable is None or durable['continuity_id'] != hold['continuity_id']):
+                        self._halt_state(PUBLIC_CONTINUITY_REASON)
+                        return False
+                except Exception:
+                    self._halt_state(PUBLIC_CONTINUITY_REASON)
+                    return False
+            if epoch != self.public_continuity.epoch:
+                return False
+            if not self.governor.resume(synchronized=self.portfolio.synchronized, healthy=healthy):
+                return False
+            # The independent entry gate remains closed while NORMAL is provisional.
+            # A crash before release keeps the durable hold/session guard active.
+            if self.public_continuity.required:
+                if not released:
+                    try:
+                        payload = {
+                            'event': PUBLIC_CONTINUITY_RELEASE if hold else SESSION_RESUME,
+                            'continuity_id': hold['continuity_id'] if hold else self._public_session,
+                            'reason_code': PUBLIC_CONTINUITY_CODE,
+                            'occurred_at': utcnow().isoformat(),
+                        }
+                        await asyncio.wait_for(self.store.append('system_events', payload),
+                                               timeout=self.settings.request_timeout_seconds)
+                    except asyncio.CancelledError:
+                        self._halt_state(PUBLIC_CONTINUITY_REASON)
+                        raise
+                    except Exception as exc:
+                        logger.error('public continuity release persistence failed',
+                                     extra={'exception_type': type(exc).__name__})
+                        self._halt_state(PUBLIC_CONTINUITY_REASON)
+                        return False
+                if epoch != self.public_continuity.epoch or self.governor.state != GovernorState.NORMAL:
+                    self._halt_state(PUBLIC_CONTINUITY_REASON)
+                    return False
+                self.public_continuity.hold = None
+                self.public_continuity.restart_unverified = False
+                self._public_gap_notified = False
         self._auto_recovery_forbidden = False
         self._ledger_repair_attempted = False
         self._auto_recovery_circuit_breaker = False
@@ -2165,6 +2374,7 @@ class TradingRuntime:
         enabled = self.settings.auto_recovery_enabled and self.settings.mode == Mode.PAPER
         eligible = (
             enabled and not self._planned_shutdown and not self._auto_recovery_forbidden
+            and not self.public_continuity.required
             and not self._auto_recovery_circuit_breaker
             and self.governor.state == GovernorState.HALT
             and self._auto_recovery_reason == self.governor.reason
@@ -2294,6 +2504,7 @@ class TradingRuntime:
                 await self.enter_halt(ws_reason)
             elif (
                 self.governor.reason == "startup reconciliation pending"
+                and not self.public_continuity.required
                 and self.governor.state != GovernorState.EMERGENCY
             ):
                 async with self._reconcile_lock:

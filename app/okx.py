@@ -1034,6 +1034,9 @@ class OkxWebSocket:
         self._enqueue_message(message, received_at)
 
     def _enqueue_message(self, message: dict[str, Any], received_at: float) -> None:
+        if self.batch_handler is not None:
+            message = dict(message, _public_received_at=received_at,
+                           _public_generation=self.generation)
         try:
             self.queue.put_nowait((message, received_at))
             self._queued_at.append(received_at)

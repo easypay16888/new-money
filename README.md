@@ -201,7 +201,7 @@ uv run python -m app.live_preflight --status-url http://127.0.0.1:18000/status -
 
 ### PAPER 模式受控自动恢复
 
-PAPER 模式默认开启自动恢复。只有 `reconciliation failed`、`WebSocket transport unavailable`、`Market data stale`、`WebSocket processing backlog`、`Redis unavailable`、`dead man switch unavailable` 属于自动恢复白名单；旧 `WebSocket disconnected or stale` 原因仅保留兼容。协议错误、未知 handler 错误和 LIVE lease 丢失不属于白名单。进入 HALT 后至少等待 30 秒，每隔 30 秒重新完整对账并检查数据库、Redis 读写、CAA、全部 WebSocket、组合风险、未确认 entry 及 Emergency 目标；连续 3 次通过后再次完整对账和检查，才允许恢复 NORMAL。任一次失败会清零计数。`/status.auto_recovery` 显示启用状态、是否符合资格、当前连续通过次数和熔断状态。
+PAPER 模式默认开启自动恢复。只有 `reconciliation failed`、`WebSocket transport unavailable`、`Market data stale`、`WebSocket processing backlog`、`Redis unavailable`、`dead man switch unavailable` 属于自动恢复白名单；确认的 public gap 使用独立、不可自动恢复的 `Public market continuity lost` 原因和持久化锁，不能由 `WebSocket processing backlog` 自动恢复。旧 `WebSocket disconnected or stale` 原因仅保留兼容。协议错误、未知 handler 错误和 LIVE lease 丢失不属于白名单。进入 HALT 后至少等待 30 秒，每隔 30 秒重新完整对账并检查数据库、Redis 读写、CAA、全部 WebSocket、组合风险、未确认 entry 及 Emergency 目标；连续 3 次通过后再次完整对账和检查，才允许恢复 NORMAL。任一次失败会清零计数。`/status.auto_recovery` 显示启用状态、是否符合资格、当前连续通过次数和熔断状态。
 
 仓位或订单不一致、外部风险订单、意外条件单、保护单异常、保证金风险、人工 HALT、未知原因及认证/权限错误均须人工处理；安全性 HALT 不会被后续瞬态故障覆盖。EMERGENCY 永不自动恢复。`MODE=LIVE` 时自动恢复始终关闭，即使设置了 `AUTO_RECOVERY_ENABLED=true`。人工 `POST /system/resume` 保留完整对账与同一套健康检查，不会强制跳过安全门。
 
@@ -231,6 +231,7 @@ LIVE 先核验账户，再非等待获取 PostgreSQL session advisory lock、原
 - **Transport**：必须完成连接、private login、所有 subscription ack；10 秒无入站帧发送 text `ping`，5 秒内无 `pong` 则断线重连。其他帧不会延长已等待的 pong deadline。底层 WebSocket ping 继续提供额外保护。
 - **初始数据与订阅确认竞态**：OKX 可以先返回已请求频道的初始数据，再返回 subscribe ack。这些数据与业务队列共用容量预算，暂存至所有 ack 完成后按接收顺序处理；保留原始接收时间，不提前授予 transport health 或数据 freshness。未请求频道、ack 超时或缓冲溢出仍 fail closed。
 - **公开行情突发背压**：仅 public batch 接收路径在队列达到容量的 75% 时等待 worker 腾出空间，单次最多 250ms（且不超过剩余 Pong deadline），由底层有界 WebSocket 缓冲和 TCP 流控限制突发输入。最多额外保留一帧，既不扩大队列，也不丢弃或合并成交；等待超时仍立即 HALT/reconnect，原有 freshness 和完整对账恢复门禁保留。private 与 K 线路径不使用该等待，满队列继续立即 fail closed。背压只能吸收短时突发，持续过载仍禁止开仓。`/status.websockets[].backpressure_active` 显示等待状态。
+- **公开行情连续性安全**：成功背压保留全部帧时不 HALT、不清缓存、不创建人工锁；公开批处理的拒收、协议/worker 失败则立即以 `Public market continuity lost` / `public_market_continuity_lost` 封锁 entry，清除该 socket 全部品种的公开滚动状态，追加持久化 hold。重连不清此锁。每个品种重新取得 100 笔不同的新成交、新 ticker/books5、fresh mark/index 并完成账户安全对账后，仍须显式人工 `/system/resume`。funding/OI 缺失保留为 `None`，不单独阻塞预热。未正常关闭的公开会话重启也需预热与人工确认，防止缺口 audit 尚未提交就崩溃的绕过。详见 [Public Market Continuity](docs/PUBLIC_MARKET_CONTINUITY.md)。
 - **公开市场写入吞吐**：公开市场 worker 每轮最多处理已排队的 64 帧，在一个任务内专用事务中提交市场记录，保留全部帧、记录及顺序，不等待凑批、不丢弃 trades、不合并快照。事务提交成功后才更新应用数据 freshness；失败继续 HALT。private 事件、K 线决策及所有交易安全写入不参与批处理。服务器 Demo SQLite 可在安全停机后使用 WAL，保持 `synchronous=FULL`；备份应使用 SQLite backup API。
 - **Data**：按 `channel:instId` 记录成功应用数据的原始到达时间，不用 pong 或其他品种的数据刷新该频道。`books5`、`tickers`、`mark-price`、`index-tickers` 必须在原有 `STALE_TIMEOUT_SECONDS=20` 内更新；K线按两倍周期加 20 秒判定。funding、OI、trades 和 private 事件流不按 20 秒业务活动判 stale。Risk Engine 的 book/tick **交易所时间戳**门禁保持不变。
 - **Processing**：每路 `WS_QUEUE_MAXSIZE=1000`，WebSocket 帧缓冲最多 16、单帧最多 1 MiB。队列溢出立即同步 HALT，原因为 `WebSocket processing backlog`；记录异常并断开，重连及完整对账后才可通过恢复门禁。handler/排队超过 20 秒也阻止开仓。若 worker 不结束，保持 HALT，不为清空队列而中断交易写请求。正常停机先有界 drain private 队列，再执行原有安全对账；超时拒绝停机并保留运行中的 handler。

@@ -373,6 +373,40 @@ class Store:
         effective = await self.effective_fill_payloads([payload for _, payload in result])
         return [(key, payload) for (key, _), payload in zip(result, effective, strict=True)]
 
+    async def public_audit_state(self, opened: str, closed: str) -> dict[str, Any] | None:
+        from app.public_continuity import validate_event
+
+        events = ROW_TYPES['system_events']
+        async with self.sessions() as session:
+            rows = (await session.scalars(select(events).where(
+                events.payload['event'].as_string().in_([opened, closed])
+            ).order_by(events.id.desc()).limit(2))).all()
+        if not rows:
+            return None
+        for row in rows:
+            validate_event(row.payload, {opened, closed})
+        if rows[0].payload['event'] == opened:
+            return rows[0].payload
+        if (len(rows) != 2 or rows[1].payload['event'] != opened
+                or rows[0].payload['continuity_id'] != rows[1].payload['continuity_id']
+                or datetime.fromisoformat(rows[0].payload['occurred_at'])
+                < datetime.fromisoformat(rows[1].payload['occurred_at'])):
+            raise ValueError('public market continuity audit invalid')
+        return None
+
+    async def public_release_matches(self, continuity_id: str) -> bool:
+        from app.public_continuity import RELEASE, validate_event
+
+        events = ROW_TYPES['system_events']
+        async with self.sessions() as session:
+            row = await session.scalar(select(events).where(
+                events.payload['event'].as_string() == RELEASE
+            ).order_by(events.id.desc()).limit(1))
+        if row is None:
+            return False
+        validate_event(row.payload, {RELEASE})
+        return row.payload['continuity_id'] == continuity_id
+
     async def append(
         self,
         table: str,
