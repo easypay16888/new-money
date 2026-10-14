@@ -942,7 +942,8 @@ class TradingRuntime:
                 return
             now = utcnow()
             daily_rows = await self.store.since(
-                "portfolio_snapshots", now.replace(hour=0, minute=0, second=0, microsecond=0)
+                "portfolio_snapshots", now.replace(hour=0, minute=0, second=0, microsecond=0),
+                limit=1,
             )
             daily_baseline = Decimal(daily_rows[0]["equity"]) if daily_rows else equity
             stored_peak = await self.store.max_equity_since(now - timedelta(days=7))
@@ -2064,6 +2065,7 @@ class TradingRuntime:
             f"\nReason code: {ws.reason_code}"
             f"\nLast failure reason code: {ws.last_failure_reason_code or 'unavailable'}"
             f"\nClose code: {ws.last_close_code if ws.last_close_code is not None else 'unavailable'}"
+            f"\nLast handshake HTTP status: {ws.last_handshake_http_status if ws.last_handshake_http_status is not None else 'unavailable'}"
             f"\nClose reason: {ws.last_close_reason or 'unavailable'}"
             f"\nClose side: {ws.last_close_side or 'unavailable'}"
             f"\nLast Pong: {f'{pong:.1f}s' if pong is not None else 'unavailable'}"

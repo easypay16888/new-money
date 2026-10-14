@@ -23,6 +23,7 @@ REASONS = {
     "ws_run_task_failed": "WebSocket 连接任务退出",
     "ws_reconnect_stalled": "WebSocket 重连任务停止响应",
     "ws_connect_timeout": "TCP/TLS/WebSocket 握手超时",
+    "ws_handshake_unavailable": "OKX WebSocket HTTP 握手服务暂不可用，正在有界重连",
     "ws_connection_error": "连接失败，未收到明确关闭帧",
     "healthy": "连接健康",
     "ws_recovery unavailable": "WebSocket 重连后对账未完成",
@@ -141,6 +142,7 @@ TITLES = {
 LABELS = {
     "Phase": "阶段", "Failure phase": "故障阶段",
     "Reason code": "reason_code", "Close code": "关闭代码", "Close reason": "关闭原因",
+    "Last handshake HTTP status": "最近握手 HTTP 状态码",
     "Last failure reason code": "最近故障 reason_code",
     "Close side": "关闭方向", "Last Pong": "最近 Pong", "Next retry": "下次重试（秒）",
     "Transport": "连接状态", "Login": "登录", "Subscription": "订阅", "Worker": "处理任务",

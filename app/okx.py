@@ -570,11 +570,13 @@ class OkxWebSocket:
         self.disconnect_reason = "connection not established"
         self.disconnect_kind = "transport"
         self.last_close_code: int | None = None
+        self.last_handshake_http_status: int | None = None
         self.last_close_reason = ""
         self._connected_at = 0.0
         self._queued_at: deque[float] = deque()
         self._queue_progress = asyncio.Event()
         self._backpressure_started_at: float | None = None
+        self._backpressure_relieved_at: float | None = None
         self._handler_started_at: float | None = None
         self._stale_keys: set[str] = set()
         self._phase = "DISCONNECTED"
@@ -649,6 +651,8 @@ class OkxWebSocket:
             "business handler failed": "ws_worker_failed",
             "public subscription buffer discarded": "ws_preack_data_discarded",
             "connection attempt timeout": "ws_connect_timeout",
+            "handshake temporarily unavailable": "ws_handshake_unavailable",
+            "handshake rejected": "ws_protocol_error",
         }.get(reason, "ws_protocol_error" if kind == "protocol" else "ws_connection_error")
         self.last_failure_reason_code = self.reason_code
         if self.private:
@@ -837,6 +841,7 @@ class OkxWebSocket:
                     self.reconnects += 1
                     reason = exc.message if isinstance(exc, WebSocketFault) else "connection error"
                     self.last_close_code, self.last_close_reason, self.last_close_side = None, "", None
+                    self.last_handshake_http_status = None
                     if isinstance(exc, websockets.exceptions.ConnectionClosed):
                         reason = "connection closed"
                         self.last_close_code = exc.rcvd.code if exc.rcvd else None
@@ -850,7 +855,15 @@ class OkxWebSocket:
                     kind = (exc.kind if isinstance(exc, WebSocketFault) else "transport"
                             if isinstance(exc, (OSError, TimeoutError, websockets.exceptions.ConnectionClosed))
                             else "protocol")
-                    if kind == "protocol" and not isinstance(exc, WebSocketFault):
+                    if isinstance(exc, websockets.exceptions.InvalidStatus):
+                        # HTTP upgrade rejection isn't an invalid market frame.
+                        # Only documented temporary server statuses are retryable
+                        # transport failures. Unknown/auth/config errors stay closed.
+                        self.last_handshake_http_status = exc.response.status_code
+                        temporary = self.last_handshake_http_status in {500, 502, 503, 504}
+                        kind = "transport" if temporary else "protocol"
+                        reason = "handshake temporarily unavailable" if temporary else "handshake rejected"
+                    elif kind == "protocol" and not isinstance(exc, WebSocketFault):
                         reason = "invalid protocol or configuration"
                     if kind == "maintenance":
                         self.maintenance_reconnects += 1
@@ -875,6 +888,7 @@ class OkxWebSocket:
                                "websocket session ended", extra={
                         "socket_name": self.name, "exception_type": type(exc).__name__,
                         "close_code": self.last_close_code, "close_reason": self.last_close_reason,
+                        "handshake_http_status": self.last_handshake_http_status,
                         "close_side": self.last_close_side, "phase": self.last_disconnect_phase,
                         "ws_reason": reason, "reason_class": self.reason_code,
                         "session_age": self._age(self._connected_at),
@@ -1013,12 +1027,14 @@ class OkxWebSocket:
         high_water = max(1, self.queue.maxsize * 3 // 4)
         if not self.private and self.batch_handler is not None and self.queue.qsize() >= high_water:
             self._backpressure_started_at = self.clock()
+            self._backpressure_relieved_at = None
             # A short scheduling allowance, not an extension of heartbeat or
             # freshness deadlines. A stalled consumer still fences synchronously.
             budget = min(0.25, self.settings.ws_pong_timeout_seconds / 4)
             if self.ping_pending:
                 budget = min(budget, max(0, self.settings.ws_pong_timeout_seconds
                                          - (self.clock() - self.last_ping_at)))
+            deadline = self._backpressure_started_at + budget
             try:
                 async with asyncio.timeout(budget):
                     while self.queue.qsize() >= high_water:
@@ -1031,14 +1047,29 @@ class OkxWebSocket:
                     raise WebSocketFault("business handler failed", kind="handler") from None
                 if self.ping_pending and self.clock() - self.last_ping_at >= self.settings.ws_pong_timeout_seconds:
                     raise WebSocketFault("heartbeat timeout") from None
-                self._fault("processing backpressure timeout", kind="backlog")
-                raise WebSocketFault("processing backpressure timeout", kind="backlog") from None
+                # The timeout callback and consumer wake-up may race. Accept only
+                # timestamped relief within the original budget, never a late
+                # queue-size observation or an extension of the wait allowance.
+                if (self._backpressure_relieved_at is None
+                        or self._backpressure_relieved_at > deadline
+                        or self.queue.qsize() >= high_water):
+                    self._fault("processing backpressure timeout", kind="backlog")
+                    raise WebSocketFault("processing backpressure timeout", kind="backlog") from None
+            else:
+                if self.processing_unsafe or (self._worker_task is not None and self._worker_task.done()):
+                    raise WebSocketFault("business handler failed", kind="handler")
+                if self.ping_pending and self.clock() - self.last_ping_at >= self.settings.ws_pong_timeout_seconds:
+                    raise WebSocketFault("heartbeat timeout")
+                if self._backpressure_relieved_at is None or self._backpressure_relieved_at > deadline:
+                    self._fault("processing backpressure timeout", kind="backlog")
+                    raise WebSocketFault("processing backpressure timeout", kind="backlog")
             finally:
                 if self.metrics is not None:
                     self.metrics.ws_backpressure.labels(socket=self.name).observe(
                         max(0, self.clock() - self._backpressure_started_at)
                     )
                 self._backpressure_started_at = None
+                self._backpressure_relieved_at = None
             if self.processing_unsafe:
                 raise WebSocketFault("business handler failed", kind="handler")
             if self.ping_pending and self.clock() - self.last_ping_at >= self.settings.ws_pong_timeout_seconds:
@@ -1104,6 +1135,9 @@ class OkxWebSocket:
                     )
 
     def _queue_metric(self) -> None:
+        if (self._backpressure_started_at is not None and self._backpressure_relieved_at is None
+                and self.queue.qsize() < max(1, self.queue.maxsize * 3 // 4)):
+            self._backpressure_relieved_at = self.clock()
         self._queue_progress.set()
         if self.metrics is not None:
             self.metrics.ws_queue_depth.labels(socket=self.name).set(self.queue.qsize())
@@ -1245,6 +1279,7 @@ class OkxWebSocket:
             "last_failure_reason_code": self.last_failure_reason_code,
             "last_disconnect_phase": self.last_disconnect_phase,
             "close_code": self.last_close_code, "close_reason": self.last_close_reason,
+            "last_handshake_http_status": self.last_handshake_http_status,
             "close_side": self.last_close_side,
             "last_ping_age_seconds": self._age(self.last_ping_at),
             "transport_healthy": self.is_transport_healthy(),

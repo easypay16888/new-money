@@ -32,6 +32,7 @@ class JsonFormatter(logging.Formatter):
             "phase", "close_side", "reason_class", "session_age", "ping_pending",
             "login_ok", "subscriptions_acked", "reconciliation_required", "backoff_seconds",
             "endpoint_host", "endpoint_port", "endpoint_path",
+            "handshake_http_status",
         ):
             value = getattr(record, key, None)
             payload[key] = value
