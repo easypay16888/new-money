@@ -301,3 +301,13 @@ REST `/order` 的 `fee` 是订单累计手续费，`accFillSz` 是累计成交�
 本轮仅代码、测试、CI、commit 和 GitHub push，不部署服务器、不恢复 Demo、不启用 LIVE。完整成交集合不替代最终 account / position / pending order / algo reconciliation，失败仍禁止新 entry；策略、风险上限、CAA、Emergency、WS 架构和 LIVE fencing 均不变。官方契约与验证边界见 [Terminal Fill Reconstruction](docs/TERMINAL_FILL_RECONSTRUCTION.md)。
 
 验证结果：新增 77 项回归，全部 884 passed / 0 failed / 0 skipped / 0 warnings（`-W error`）；真实隔离 PostgreSQL、Ruff 和 mypy（36 source files）通过。代码通过不代表已经部署或完成独立审计。
+
+### External advisory / shadow research (V2 feature branch)
+
+The isolated offline research CLI supports manually supplied OKX AI-style analysis,
+time-aligned historical snapshots, outcome labels and JSON/CSV reports. It has **zero
+trading authority**, uses a **separate research database**, and is not loaded by the
+trading app, `/health`, `/status` or watchdog. No AI analysis endpoint, LLM call or
+trading observer is enabled. See [research design and CLI](docs/EXTERNAL_ADVISORY_V2.md)
+for bounds, evidence format, append-only storage, statistical limitations and tests.
+This feature requires independent audit before merge; it has not been deployed.
