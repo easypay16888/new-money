@@ -84,6 +84,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "running": runtime.running,
             "risk_state": runtime.governor.state,
             "reason": runtime.governor.reason,
+            "last_manual_resume": {
+                "attempted_at": runtime._last_resume_at,
+                "issues": runtime._last_resume_issues,
+            },
+            "cancel_all_after": runtime.caa_status(),
             "synchronized": runtime.portfolio.synchronized,
             "ledger_repair": {
                 "manual_resume_required": (
@@ -169,7 +174,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def resume() -> dict:
         if not await runtime.resume():
             raise HTTPException(
-                status_code=409, detail="cannot resume until all dependencies and state are healthy"
+                status_code=409, detail={
+                    'message': 'cannot resume until all dependencies and state are healthy',
+                    'issues': runtime._last_resume_issues,
+                }
             )
         return {"state": runtime.governor.state}
 

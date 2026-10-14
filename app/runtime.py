@@ -108,6 +108,7 @@ class TradingRuntime:
         self._public_gap_notified = False
         self._entry_public_epoch: ContextVar[int | None] = ContextVar('entry_public_epoch', default=None)
         self.governor = RiskGovernor()
+        self._halt_generation = 0
         self.live_lease: LiveRuntimeLease | None = None
         self._lease_loss_task: asyncio.Task[None] | None = None
         self.client.live_writer_guard = self._live_writer_guard
@@ -143,6 +144,9 @@ class TradingRuntime:
         self.evaluated_candles: dict[str, int] = {}
         self.dead_man_healthy = False
         self._last_caa_success_at: float | None = None
+        self._last_caa_failure: dict[str, Any] | None = None
+        self._last_resume_at: str | None = None
+        self._last_resume_issues: list[str] = []
         self._caa_lock = asyncio.Lock()
         self._caa_shutting_down = False
         self.reconciliation_healthy = False
@@ -219,6 +223,7 @@ class TradingRuntime:
         self._ws_reconcile_requested: set[str] = set()
 
     def _halt_state(self, reason: str, *, emergency: bool = False) -> tuple[str, bool, bool]:
+        self._halt_generation += 1
         self.entry_controller.client = self.client
         emergency = emergency or self.governor.state == GovernorState.EMERGENCY
         if (
@@ -2222,22 +2227,39 @@ class TradingRuntime:
             if self.running:
                 await self._send_observation(self._publish_heartbeat())
 
+    async def _wait_public_resume_idle(self) -> bool:
+        # Wait for accepted work, never pause recv/handlers or discard frames.
+        # The existing request budget bounds this manual recovery wait.
+        if not self.public_continuity.required:
+            return False
+        ws = next((w for w in self.sockets if not w.private and w.batch_handler is not None), None)
+        if ws is not None and not ws.business_idle and ws.is_processing_healthy():
+            try:
+                await asyncio.wait_for(ws.queue.join(), timeout=self.settings.request_timeout_seconds)
+            except TimeoutError:
+                pass  # The unchanged readiness gate below still rejects busy work.
+            return True
+        return False
+
+    def _deny_resume(self, *issues: str) -> bool:
+        self._last_resume_issues = list(issues)
+        logger.warning('manual resume denied issues=%s', self._last_resume_issues)
+        return False
+
+    def caa_status(self) -> dict[str, Any]:
+        age = (None if self._last_caa_success_at is None
+               else max(0.0, self._clock() - self._last_caa_success_at))
+        max_age = min(self.settings.cancel_all_after_seconds,
+                      self.settings.cancel_all_after_refresh_seconds * 2)
+        return {
+            'healthy': self.dead_man_healthy and not self._caa_shutting_down
+            and (not self.running or (age is not None and age <= max_age)),
+            'last_success_age_seconds': age,
+            'last_failure': self._last_caa_failure,
+        }
+
     async def _resume_health(self) -> tuple[bool, list[str]]:
         issues: list[str] = []
-        if self.public_continuity.required and not self.public_market_continuity_ready():
-            issues.append('public market warm-up incomplete')
-        if self.settings.mode == Mode.LIVE and (
-            self.live_lease is None or not await self.live_lease.verify()
-        ):
-            issues.append("live_writer_lease")
-        if not self.reconciliation_healthy:
-            issues.append("reconciliation")
-        if not self._last_reconcile_safe:
-            issues.append("reconciliation_safety")
-        if not self.portfolio.synchronized:
-            issues.append("portfolio_sync")
-        if not self.store.healthy:
-            issues.append("database")
         if self.redis is None:
             issues.append("redis")
         else:
@@ -2252,6 +2274,21 @@ class TradingRuntime:
                     issues.append("redis_read_write")
             except Exception:
                 issues.append("redis_read_write")
+        # Probes yield to workers. Drain accepted public work before checking
+        # mutable safety state, so faults during the wait cannot be overlooked.
+        await self._wait_public_resume_idle()
+        if self.settings.mode == Mode.LIVE and (
+            self.live_lease is None or not await self.live_lease.verify()
+        ):
+            issues.append("live_writer_lease")
+        if not self.reconciliation_healthy:
+            issues.append("reconciliation")
+        if not self._last_reconcile_safe:
+            issues.append("reconciliation_safety")
+        if not self.portfolio.synchronized:
+            issues.append("portfolio_sync")
+        if not self.store.healthy:
+            issues.append("database")
         caa_max_age = min(
             self.settings.cancel_all_after_seconds,
             self.settings.cancel_all_after_refresh_seconds * 2,
@@ -2275,9 +2312,14 @@ class TradingRuntime:
             issues.append("websockets")
         if self.portfolio_monitor.breached(self.portfolio, [])[0]:
             issues.append("portfolio_limits")
+        if self.public_continuity.required and not self.public_market_continuity_ready():
+            issues.append('public market warm-up incomplete')
         return not issues, issues
 
     async def resume(self) -> bool:
+        authorized_state = (self.governor.state, self.governor.reason, self._halt_generation)
+        self._last_resume_at = utcnow().isoformat()
+        self._last_resume_issues = []
         try:
             hold = await self.store.public_audit_state(PUBLIC_CONTINUITY_HOLD, PUBLIC_CONTINUITY_RELEASE)
             if hold is not None and self.public_continuity.hold is None:
@@ -2288,35 +2330,41 @@ class TradingRuntime:
         except Exception:
             self.public_continuity.corrupt = True
             self._halt_state(PUBLIC_CONTINUITY_REASON)
-            return False
+            return self._deny_resume('public_continuity_audit_invalid')
         if self.settings.mode != Mode.PAPER:
-            return await self._resume()
+            return await self._resume(authorized_state=authorized_state)
         try:
             async with PaperMaintenanceFence(self.store, 'resume', self._paper_fence_lost).hold() as fence:
                 if await self.store.ledger_repair_hold():
                     self._ledger_repair_manual_hold = True
-                return await self._resume(fence)
+                return await self._resume(fence, authorized_state=authorized_state)
         except MaintenanceBusy:
-            return False
+            return self._deny_resume('maintenance_busy')
         except (MaintenanceError, SQLAlchemyError):
             self._paper_fence_lost()
-            return False
+            return self._deny_resume('maintenance_storage_failure')
 
-    async def _resume(self, fence: PaperMaintenanceFence | None = None) -> bool:
+    async def _resume(
+        self, fence: PaperMaintenanceFence | None = None, *,
+        authorized_state: tuple[GovernorState, str, int] | None = None,
+    ) -> bool:
+        authorized_state = authorized_state or (
+            self.governor.state, self.governor.reason, self._halt_generation
+        )
         epoch = self.public_continuity.epoch
-        healthy, _ = await self._reconcile_and_assess()
+        healthy, issues = await self._reconcile_and_assess()
         if fence is not None:
             await fence.renew()
+        if not healthy or not self.portfolio.synchronized:
+            return self._deny_resume(*(issues or ['portfolio_sync']))
         if self._ledger_repair_manual_hold:
             if not healthy or not self.portfolio.synchronized:
-                return False
+                return self._deny_resume('ledger_repair_reconciliation_incomplete')
             await self.store.append("system_events", {"event": "ledger_repair_manual_release"})
             self._ledger_repair_manual_hold = False
         async with self._public_audit_lock:
             if epoch != self.public_continuity.epoch:
-                return False
-            if self.public_continuity.required and not self.public_market_continuity_ready():
-                return False
+                return self._deny_resume('public_continuity_epoch_changed')
             hold = self.public_continuity.hold
             released = False
             if hold is not None:
@@ -2325,14 +2373,27 @@ class TradingRuntime:
                     released = durable is None and await self.store.public_release_matches(hold['continuity_id'])
                     if not released and (durable is None or durable['continuity_id'] != hold['continuity_id']):
                         self._halt_state(PUBLIC_CONTINUITY_REASON)
-                        return False
+                        return self._deny_resume('public_continuity_audit_mismatch')
                 except Exception:
                     self._halt_state(PUBLIC_CONTINUITY_REASON)
-                    return False
+                    return self._deny_resume('public_continuity_audit_invalid')
+            # Audit reads can overlap another normal batch. Recheck all original
+            # warm-up/worker/idle conditions after bounded drain, before release.
+            if fence is not None:
+                await fence.renew()
+            healthy, issues = await self._resume_health()
+            if not healthy:
+                return self._deny_resume(*issues)
+            if fence is not None and fence.lost:
+                return self._deny_resume('maintenance_ownership_lost')
+            if (self.governor.state, self.governor.reason, self._halt_generation) != authorized_state:
+                return self._deny_resume('risk_state_changed_during_resume')
+            if self.public_continuity.required and not self.public_market_continuity_ready():
+                return self._deny_resume('public market warm-up incomplete')
             if epoch != self.public_continuity.epoch:
-                return False
+                return self._deny_resume('public_continuity_epoch_changed')
             if not self.governor.resume(synchronized=self.portfolio.synchronized, healthy=healthy):
-                return False
+                return self._deny_resume('governor_health_gate')
             # The independent entry gate remains closed while NORMAL is provisional.
             # A crash before release keeps the durable hold/session guard active.
             if self.public_continuity.required:
@@ -2353,10 +2414,10 @@ class TradingRuntime:
                         logger.error('public continuity release persistence failed',
                                      extra={'exception_type': type(exc).__name__})
                         self._halt_state(PUBLIC_CONTINUITY_REASON)
-                        return False
+                        return self._deny_resume('public_continuity_release_persistence_failed')
                 if epoch != self.public_continuity.epoch or self.governor.state != GovernorState.NORMAL:
                     self._halt_state(PUBLIC_CONTINUITY_REASON)
-                    return False
+                    return self._deny_resume('public_continuity_changed_during_release')
                 self.public_continuity.hold = None
                 self.public_continuity.restart_unverified = False
                 self._public_gap_notified = False
@@ -2538,11 +2599,22 @@ class TradingRuntime:
                         return
                 self.dead_man_healthy = True
                 self._last_caa_success_at = self._clock()
-            except Exception:
+            except Exception as exc:
                 self.dead_man_healthy = False
                 self._last_caa_success_at = None
                 if not await self._caa_owner_held():
                     return
+                # Fixed machine fields only; never format exceptions or responses.
+                _, _, code, status, error_type = safe_reconciliation_diagnostics(exc) if isinstance(
+                    exc, OkxError
+                ) else ('unknown', 'unknown', 'unknown', None, 'InternalError')
+                self._last_caa_failure = {
+                    'occurred_at': utcnow().isoformat(), 'code': code,
+                    'http_status': status, 'error_type': error_type,
+                }
+                logger.error('CAA refresh failed', extra={
+                    'error_code': code, 'http_status': status, 'exception_type': error_type,
+                })
                 await self.enter_halt("dead man switch unavailable")
             await asyncio.sleep(self.settings.cancel_all_after_refresh_seconds)
 

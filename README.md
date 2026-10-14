@@ -125,6 +125,15 @@ Watchdog 将“告警已生成”“发送中”“Bark 已确认”分别记录
 
 ## 独立服务器 Demo 部署
 
+人工恢复时，`POST /system/resume` 继续执行完整对账和原有安全门禁。
+若公共行情批次正在处理，会在现有 `REQUEST_TIMEOUT_SECONDS` 预算内等待已接收队列完成，
+不暂停接收、不丢帧、不放宽 WS 超时；等待后再次校验健康与连续性 epoch。
+持续积压、预热不足、新 gap 或其他依赖失败仍返回 409，并保留人工锁。
+409 的 `detail.issues` 和 `/status.last_manual_resume` 给出本次失败项；
+`/status.cancel_all_after` 提供 CAA 当前健康、最近成功年龄和脱敏错误码/HTTP 状态/错误类型。
+历史 CAA 失败与当前健康分别展示，CAA 恢复不会自动解除 EMERGENCY 或连续性人工锁。
+这些诊断不包含交易凭据，也不会重试交易写请求或改变自动恢复白名单。
+
 `docker-compose.server.yml` 用独立的 `new-money-demo` Compose 项目运行 app、watchdog、Redis、Prometheus 和 Grafana。它固定 `MODE=PAPER`、`LIVE_TRADING_ENABLED=false`，保留 SQLite 状态数据库；不会连接服务器上其他应用的 Redis 或数据库。app、Prometheus、Grafana 默认只绑定服务器回环地址的 `18000`、`18090`、`13300` 端口，启动前确认这些端口空闲。Watchdog 仅获配通知与状态检查变量，不接收 OKX 凭据。Docker 构建通过 `.dockerignore` 排除 `.env`、数据库和本机虚拟环境。
 
 迁移前先构建镜像、测试服务器的 OKX Demo REST/WS 连通性，并确认其他机器人不会操作同一 Demo 账户。然后在旧实例调用 `POST /system/stop`，必须得到 HTTP 200 和 `running=false` 才停止其进程监督器。若安全停机失败，保留原实例处理仓位，不启动第二个交易引擎。使用 SQLite backup API 导出 `data/demo-trading-usdt.db`，验证完整性，通过 SSH 传输数据库和未跟踪的 `.env`；数据库与 `.env` 权限设为 `600`，数据目录设为 `700`。保留旧实例停机后的数据库备份，避免遗漏订单、止损、Emergency 目标和审计历史。

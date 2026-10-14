@@ -578,6 +578,7 @@ async def test_only_explicit_successful_resume_releases_persistent_hold(tmp_path
         assert not await runtime.resume()
         assert await runtime.store.ledger_repair_hold()
         runtime._reconcile_and_assess = AsyncMock(return_value=(True, []))
+        runtime._resume_health = AsyncMock(return_value=(True, []))
         assert await runtime.resume()
         assert not await runtime.store.ledger_repair_hold()
         assert runtime.governor.state.value == "NORMAL"

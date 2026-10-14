@@ -38,6 +38,7 @@ async def continuity_runtime(tmp_path):
     runtime.alert = AsyncMock()
     runtime.portfolio = PortfolioState(equity=5000, available_balance=5000, synchronized=True)
     runtime._reconcile_and_assess = AsyncMock(return_value=(True, []))
+    runtime._resume_health = AsyncMock(return_value=(True, []))
     yield runtime, ws, now
     await drain(runtime)
     ws._stopping = True
@@ -831,6 +832,7 @@ async def test_restart_warmup_complete_still_requires_explicit_resume(continuity
         other.sockets = [ws]
         other.portfolio = PortfolioState(equity=5000, available_balance=5000, synchronized=True)
         other._reconcile_and_assess = AsyncMock(return_value=(True, []))
+        other._resume_health = AsyncMock(return_value=(True, []))
         other.alert = AsyncMock()
         await warm(other, ws, now)
         await other._auto_recovery_check()
@@ -871,6 +873,7 @@ async def test_hold_persistence_error_does_not_log_exception_secret(continuity_r
 
 async def test_real_resume_health_keeps_all_original_safety_gates(continuity_runtime):
     r, ws, now = continuity_runtime
+    del r._resume_health  # This test exercises real dependencies, unlike the unit fixture.
     gap(r, ws)
     await drain(r)
     await warm(r, ws, now)
