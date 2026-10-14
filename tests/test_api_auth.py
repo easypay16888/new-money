@@ -34,9 +34,10 @@ async def test_live_sensitive_endpoints_require_token(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_resume_rejects_failed_reconciliation_even_with_old_synced_state(monkeypatch):
-    app = create_app(Settings(_env_file=None))
+async def test_resume_rejects_failed_reconciliation_even_with_old_synced_state(monkeypatch, tmp_path):
+    app = create_app(Settings(_env_file=None, database_url=f"sqlite+aiosqlite:///{tmp_path}/resume.db"))
     runtime = app.state.runtime
+    await runtime.store.initialize()
     runtime.portfolio = PortfolioState(
         equity=Decimal("10000"), available_balance=Decimal("10000"), synchronized=True
     )
@@ -44,7 +45,11 @@ async def test_resume_rejects_failed_reconciliation_even_with_old_synced_state(m
     runtime.dead_man_healthy = True
     runtime.redis = object()
 
+    reconciled = False
+
     async def failed_reconcile():
+        nonlocal reconciled
+        reconciled = True
         runtime.reconciliation_healthy = False
 
     monkeypatch.setattr(runtime, "_reconcile_impl", failed_reconcile)
@@ -53,6 +58,8 @@ async def test_resume_rejects_failed_reconciliation_even_with_old_synced_state(m
     ) as client:
         response = await client.post("/system/resume")
     assert response.status_code == 409
+    assert reconciled
     assert runtime.governor.state.value == "HALT"
+    await runtime.notifications.close()
     await runtime.client.close()
     await runtime.store.close()

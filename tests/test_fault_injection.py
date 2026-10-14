@@ -186,8 +186,9 @@ async def test_partial_fill_triggers_reduce_only_emergency(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_redis_restart_stays_halted_until_reconciliation(monkeypatch):
-    runtime = TradingRuntime(Settings(_env_file=None))
+async def test_redis_restart_stays_halted_until_reconciliation(monkeypatch, tmp_path):
+    runtime = TradingRuntime(Settings(_env_file=None, database_url=f"sqlite+aiosqlite:///{tmp_path}/redis.db"))
+    await runtime.store.initialize()
 
     class FakeRedis:
         def __init__(self, available):
@@ -217,5 +218,7 @@ async def test_redis_restart_stays_halted_until_reconciliation(monkeypatch):
     assert runtime.redis is recovered
     assert runtime.market.redis is recovered
     assert runtime.governor.state == GovernorState.HALT
+    await runtime.notifications.close()
+    await recovered.aclose()
     await runtime.client.close()
     await runtime.store.close()

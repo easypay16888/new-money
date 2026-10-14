@@ -500,6 +500,7 @@ async def test_reconciliation_endpoint_transient_fault_then_auto_recovers(
     assert runtime.auto_recovery_status()["eligible"]
     await three_checks(runtime, clock)
     assert runtime.governor.state == GovernorState.NORMAL
+    await runtime.notifications.close()
     await runtime.store.close()
 
 
@@ -532,6 +533,7 @@ async def test_authentication_failure_remains_manual_only(tmp_path):
     await runtime.reconcile()
     assert runtime.governor.reason == "reconciliation permanent failure"
     assert not runtime.auto_recovery_status()["eligible"]
+    await runtime.notifications.close()
     await runtime.store.close()
 
 
@@ -657,4 +659,5 @@ async def test_okx_error_log_redacts_credentials_and_server_message(
     assert "http_status=429" in caplog.text
     assert all(marker not in caplog.text for marker in markers)
     assert "?" not in caplog.text
+    await runtime.notifications.close()
     await runtime.store.close()
