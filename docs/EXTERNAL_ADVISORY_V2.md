@@ -113,10 +113,48 @@ time, horizon, content or revision changes create distinct records. The first
 logged. Revisions must reference an existing same-provider/symbol/horizon predecessor
 at an equal or earlier generated time. Revisions never replace the prior view.
 
-`source_timestamp_trusted` is an **operator attestation**, not a cryptographic proof.
-Never set it for unverifiable screenshots, revised pages or invented timestamps.
-Late imports without it stay PENDING, excluded from performance scoring. Timely
-imports still require the operator to preserve accurate original source time.
+`source_timestamp_trusted` is retained as **source metadata for compatibility**;
+it has no authority to verify a late import. Provenance is evaluated separately:
+
+- REALTIME_INGEST: within the original/configured late-import tolerance.
+- UNVERIFIED_HISTORICAL: late with no independently supplied review, even if the source
+  says `source_timestamp_trusted=true`. New outcomes remain PENDING.
+- VERIFIED_HISTORICAL: late with a separately supplied, validated operator review.
+
+Primary performance cohorts use REALTIME_INGEST + VERIFIED_HISTORICAL only.
+`provenance_counts`, `primary_observations` and separate UNVERIFIED_HISTORICAL diagnostics
+expose excluded observations. Old self-trusted labels are never pooled into primary
+statistics. `--exclude-late` still excludes all late imports, including verified ones.
+No data is deleted or rewritten.
+
+For independently reviewed history, pass **another file** to evaluation:
+
+```sh
+uv run python -m app.advisory evaluate --advisory-id <returned-id> --input evidence.json --verification review.json
+```
+
+```json
+{
+  "advisory_id": "<exact 64-character advisory ID>",
+  "evidence_reference": "archived screenshot 01",
+  "reviewed_by": "operator 01",
+  "verified_at": "2026-10-14T12:00:00Z"
+}
+```
+
+The review must match the advisory ID, use bounded non-secret reference/reviewer
+labels and have generated_at<=verified_at<=evaluation time. It is validated and stored
+with the immutable outcome/evaluation. The provider input cannot supply this object;
+its schema forbids that field. This records an independent operator/research review,
+**not cryptographic authentication or automatic source validation**. The operator must
+actually inspect archived evidence before supplying it. Timely imports likewise
+require accurate original source times.
+
+Adding a review appends a new outcome/evaluation. It preserves the prediction and
+unverified/pending versions. Outcome IDs preserve one complete label per advisory/policy; review evidence is
+immutable payload, not a bypass of that unique key. Repeat identical review is
+idempotent; changing review evidence on an already completed label conflicts. Reports retain one selected evaluation per advisory and prefer a
+complete verified evaluation over later unverified/incomplete observations.
 
 ## Storage / audit / failure isolation
 
@@ -205,9 +243,12 @@ All research policy is independent of trading Settings:
 - `level_tolerance_bps=1`: documented ±1bp research touch/break tolerance; configurable.
 - future timestamp tolerance60s; late import tolerance300s.
 - maximum internal age1800s; maximum observed-price gap900s.
+- `endpoint_max_age_seconds=60`, strict integer0–300;0 retains exact-endpoint mode.
 - minimum sample30 (allowed minimum10); deterministic bootstrap500 resamples.
 
-Policies are saved with outcomes; reports never pool different policies. Do not search
+Policy version is `research-v2.1`. Policies are saved with outcomes; reports never pool different policies.
+The new endpoint field and version distinguish old exact-time evaluations. Old rows
+remain untouched and are not relabeled as new-policy results. Do not search
 for a best threshold or optimize these against outcomes in V2.
 
 Internal direction mapping:
@@ -223,10 +264,18 @@ STRONG stances have the same directional interpretation as their ordinary varian
 without invented confidence. Nine agreement classes distinguish directional agreement,
 direct conflict, both neutral, four directional/neutral mixes, and UNCLASSIFIED.
 
-Outcome is PENDING until T+H is reached, the endpoint has an exact timestamped price,
-start price was available by T, and the sampled window has no gap >900s. Do not
-interpolate missing endpoint data or use a T+H+1 price. A timestamp conflict rejects
-the evidence. This conservative rule may leave irregular observations PENDING.
+Outcome is PENDING until T+H is reached, an acceptable endpoint is available,
+start price was available by T, and the sampled window has no gap >900s.
+Endpoint = latest available price with observed_at<=requested end; its age must be
+<=endpoint_max_age_seconds. A closer observation AFTER the horizon is never chosen.
+Do not interpolate. Keep all internal price-gap checks; endpoint tolerance does not
+bridge a missing interval within the window. Conflicting timestamp evidence fails.
+
+Every LABELED outcome retains `requested_end_at`, `actual_end_observed_at` and
+`endpoint_age_seconds`, alongside window_start/window_end (requested end), original
+prices and evidence digest. Irregular generated times and subsecond observations
+therefore label without pretending the sampled endpoint was exact. Provenance and
+separate review metadata are also retained. No trading Settings are consulted.
 
 Returns/range/MFE/MAE are percentage points, **not fractions**:
 
@@ -308,6 +357,17 @@ Metrics use an **independent CollectorRegistry**, never imported by trading moni
 - `quant_external_advisory_pending_outcomes`
 - `quant_external_advisory_labeled_total{horizon}`
 - `quant_external_advisory_provider_health{provider}`
+- `quant_external_advisory_storage_health`
+- `quant_external_advisory_service_health`
+
+Provider parser/timeout errors affect provider health. DB I/O errors affect storage
+health and preserve provider health. Evaluation/report computation errors affect
+service health and preserve provider health. A successful operation restores only
+its appropriate health signal: provider parse success may restore provider, DB
+success restores storage, completed evaluation/report/import restores service.
+Service health/`healthy` describe the last service operation; they are not a combined
+trading readiness gate. A successful report does not hide an outstanding provider
+failure. These three metrics remain in the separate research registry.
 
 Counters are per research service process and reset on CLI invocation; pending is
 reconstructed during report. The metrics CLI exports the standalone registry; it
@@ -326,7 +386,7 @@ The non-interference test uses real DecisionPipeline (including higher/entry tim
 ExecutionEngine.from_risk→submit against a mock exchange. It freezes clocks/UUIDs
 only to compare every resulting field, including actual outgoing order payload.
 No-advisory, bullish, bearish, corrupt, unavailable provider, failed research DB,
-hostile prompt and absent research-service cases give identical regime, signal,
+hostile prompt, unverified historical, all-three-research-health-unhealthy and absent research-service cases give identical regime, signal,
 TradeIntent, RiskDecision, contract size, stop/entry, ExecutionRequest, HTTP write
 and Governor NORMAL. It does not prove real OKX field execution or hardware
 resource isolation; those require separate acceptance. Structural import tests
@@ -344,7 +404,7 @@ Q5 undocumented/private OKX AI endpoints: **NO**.
 
 This branch is code for independent audit, not deployment or LIVE readiness.
 
-## Local verification at feature completion
+## Previous audited feature verification (`a66370e`)
 
 - 137 new research tests passed, including5 real PostgreSQL16 tests and the CLI.
 - Requested targeted safety/regression set:659 passed before the final16 added checks.
@@ -357,3 +417,27 @@ This branch is code for independent audit, not deployment or LIVE readiness.
   Emergency/lease files, Docker/compose and CI workflow are unchanged.
 - The feature branch must also pass its exact-SHA GitHub Actions run; do not substitute
   baseline/main CI. Audit delivery report links that run separately.
+
+## Independent audit fix verification
+
+Fix baseline: `a66370e37bedcc26444255613139495aff3b6d13`. Scope: endpoint alignment,
+late-import provenance and provider/storage/service health semantics only.
+
+- ResearchPolicy `research-v2.1`, endpoint age60s default, strict0–300s bounds.
+- Before-horizon selection, non-grid/subsecond times, exact/within/beyond tolerance,
+  post-end exclusion, start availability and internal PRICE_GAP regressions passed.
+- Source self-trust cannot verify history; separate operator review and conservative
+  primary/diagnostic cohorts tested, including old labels and immutable re-evaluation.
+- Provider/storage/service error and recovery semantics tested independently.
+- All three unhealthy research metrics and unverified history leave the actual
+  DecisionPipeline→strategy→meta→risk→execution/submit outputs unchanged.
+- 50 added audit-fix tests; total research tests187 passed, including7 real PostgreSQL16
+  tests, SQLite and the CLI. Existing tests retained; three expectations updated to
+  reflect corrected provenance/health behavior rather than the audited defects.
+- Requested targeted safety/research run723 passed before the final2 added checks.
+- Final full suite1275 collected /1275 passed /0 failed /0 skipped /0 pytest warnings
+  with `uv run pytest -W error`; local PostgreSQL16.14.
+- Ruff PASS; mypy PASS,48 source files. All40 baseline app files byte-identical.
+- No main merge, SSH, deployment, PAPER resume, `.env` or Demo/server DB modification.
+- Exact final-SHA CI evidence and the two reviewable diffs are linked in the delivery
+  report. No code verification substitutes for independent re-audit.

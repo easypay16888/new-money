@@ -7,7 +7,9 @@ from typing import Any
 from app.advisory.models import (
     EvidenceBundle,
     ExternalAdvisory,
+    HistoricalVerification,
     PriceObservation,
+    Provenance,
     ResearchPolicy,
     Stance,
     aware,
@@ -113,12 +115,46 @@ def correct(direction: int, return_pct: float, threshold: float) -> bool:
     return abs(return_pct) <= threshold
 
 
+def advisory_provenance(
+    advisory: ExternalAdvisory,
+    policy: ResearchPolicy,
+    *,
+    as_of: datetime,
+    verification: HistoricalVerification | None = None,
+) -> Provenance:
+    late = (
+        advisory.late_import
+        or (advisory.ingested_at - advisory.generated_at).total_seconds()
+        > policy.late_import_seconds
+    )
+    if verification is not None:
+        verification = HistoricalVerification.model_validate(verification.model_dump(mode="json"))
+        if (
+            verification.advisory_id != advisory.advisory_id
+            or not advisory.generated_at <= verification.verified_at <= aware(as_of)
+        ):
+            raise ValueError("invalid independent historical verification")
+    if not late:
+        return Provenance.REALTIME_INGEST
+    return (
+        Provenance.VERIFIED_HISTORICAL
+        if verification is not None
+        else Provenance.UNVERIFIED_HISTORICAL
+    )
+
+
 def outcome(
-    advisory: ExternalAdvisory, bundle: EvidenceBundle, policy: ResearchPolicy, *, as_of: datetime
+    advisory: ExternalAdvisory,
+    bundle: EvidenceBundle,
+    policy: ResearchPolicy,
+    *,
+    as_of: datetime,
+    verification: HistoricalVerification | None = None,
 ) -> dict[str, Any]:
     as_of = aware(as_of)
     start_at = advisory.generated_at
     end_at = start_at + timedelta(hours=advisory.horizon.hours)
+    provenance = advisory_provenance(advisory, policy, as_of=as_of, verification=verification)
     base: dict[str, Any] = {
         "advisory_id": advisory.advisory_id,
         "symbol": advisory.symbol,
@@ -126,9 +162,12 @@ def outcome(
         "status": "PENDING",
         "window_start": start_at.isoformat(),
         "window_end": end_at.isoformat(),
+        "requested_end_at": end_at.isoformat(),
+        "provenance": provenance.value,
+        "verification": verification.model_dump(mode="json") if verification is not None else None,
         "policy": policy.model_dump(mode="json"),
     }
-    if advisory.late_import and not advisory.source_timestamp_trusted:
+    if provenance == Provenance.UNVERIFIED_HISTORICAL:
         return dict(base, pending_reason="UNTRUSTED_LATE_SOURCE")
     if as_of < end_at:
         return dict(base, pending_reason="WINDOW_INCOMPLETE")
@@ -142,7 +181,12 @@ def outcome(
         and (start_at - p.observed_at).total_seconds() <= policy.max_price_gap_seconds
     ]
     future = [p for p in prices if start_at < p.observed_at <= end_at]
-    if not starts or not future or future[-1].observed_at != end_at:
+    if not starts or not future:
+        return dict(base, pending_reason="PRICE_WINDOW_INCOMPLETE")
+    # Latest available observation <= requested end; never the nearest after it.
+    actual_end = future[-1]
+    endpoint_age = (end_at - actual_end.observed_at).total_seconds()
+    if endpoint_age > policy.endpoint_max_age_seconds:
         return dict(base, pending_reason="PRICE_WINDOW_INCOMPLETE")
     points = [starts[-1], *future]
     if any(
@@ -159,6 +203,8 @@ def outcome(
     result = dict(
         base,
         status="LABELED",
+        actual_end_observed_at=actual_end.observed_at.isoformat(),
+        endpoint_age_seconds=endpoint_age,
         start_price=start,
         end_price=end,
         return_pct=ret,

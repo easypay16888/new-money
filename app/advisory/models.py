@@ -184,6 +184,32 @@ class ExternalAdvisory(AdvisoryInput):
     _ingest_time = field_validator("ingested_at")(aware)
 
 
+class Provenance(StrEnum):
+    REALTIME_INGEST = "REALTIME_INGEST"
+    VERIFIED_HISTORICAL = "VERIFIED_HISTORICAL"
+    UNVERIFIED_HISTORICAL = "UNVERIFIED_HISTORICAL"
+
+
+class HistoricalVerification(FrozenModel):
+    """Separately supplied operator review, never parsed from provider source content."""
+
+    advisory_id: str = Field(pattern=r"^[a-f0-9]{64}$")
+    evidence_reference: str = Field(min_length=1, max_length=256)
+    reviewed_by: str = Field(min_length=1, max_length=128)
+    verified_at: datetime
+    _time_input = field_validator("verified_at", mode="before")(timestamp_input)
+    _time = field_validator("verified_at")(aware)
+
+    @field_validator("evidence_reference", "reviewed_by")
+    @classmethod
+    def safe_reference(cls, value: str) -> str:
+        safe_text(value)
+        if not value.strip():
+            raise ValueError("verification reference must not be blank")
+        AdvisoryInput.reference(value)
+        return value
+
+
 class ResearchPolicy(FrozenModel):
     # Research thresholds only; no Settings or risk configuration references.
     direction_threshold_pct: float = Field(default=0.1, ge=0, le=100)
@@ -192,9 +218,10 @@ class ResearchPolicy(FrozenModel):
     late_import_seconds: int = Field(default=300, ge=0, le=86400)
     context_max_age_seconds: int = Field(default=1800, ge=1, le=86400)
     max_price_gap_seconds: int = Field(default=900, ge=1, le=3600)
+    endpoint_max_age_seconds: int = Field(default=60, ge=0, le=300, strict=True)
     minimum_sample: int = Field(default=30, ge=10, le=10000)
     bootstrap_samples: int = Field(default=500, ge=100, le=2000)
-    version: Literal["research-v2"] = "research-v2"
+    version: Literal["research-v2.1"] = "research-v2.1"
 
 
 class InternalEvidence(FrozenModel):

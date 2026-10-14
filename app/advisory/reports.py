@@ -6,8 +6,8 @@ from collections import defaultdict
 from datetime import datetime
 from typing import Any
 
-from app.advisory.evaluation import correct, internal_direction
-from app.advisory.models import ResearchPolicy
+from app.advisory.evaluation import advisory_provenance, correct, internal_direction
+from app.advisory.models import ExternalAdvisory, HistoricalVerification, Provenance, ResearchPolicy
 
 
 def statistics_summary(values: list[float], policy: ResearchPolicy) -> dict[str, Any]:
@@ -31,17 +31,40 @@ def statistics_summary(values: list[float], policy: ResearchPolicy) -> dict[str,
     return result
 
 
+def report_provenance(row: dict[str, Any], policy: ResearchPolicy) -> Provenance:
+    # Never elevate a source flag or an unverified legacy label into the primary cohort.
+    a = ExternalAdvisory.model_validate(row["advisory"])
+    proof_raw = row["outcome"].get("verification")
+    proof = HistoricalVerification.model_validate(proof_raw) if proof_raw is not None else None
+    at = max(a.ingested_at, proof.verified_at) if proof is not None else a.ingested_at
+    return advisory_provenance(a, policy, as_of=at, verification=proof)
+
+
 def build_report(
     rows: list[dict[str, Any]], policy: ResearchPolicy, *, include_late: bool = True
 ) -> dict[str, Any]:
     # One selected evaluation per immutable advisory; no duplicate versions in statistics.
     rows = [r for r in rows if include_late or not r["advisory"]["late_import"]]
+    classifications = {r["advisory"]["advisory_id"]: report_provenance(r, policy) for r in rows}
+    primary = [
+        r
+        for r in rows
+        if classifications[r["advisory"]["advisory_id"]] != Provenance.UNVERIFIED_HISTORICAL
+    ]
+    unverified = [
+        r
+        for r in rows
+        if classifications[r["advisory"]["advisory_id"]] == Provenance.UNVERIFIED_HISTORICAL
+    ]
     providers: dict[str, list[dict[str, Any]]] = defaultdict(list)
     cohorts: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for row in rows:
         a, s, o = row["advisory"], row["snapshot"], row["outcome"]
         providers[a["provider"]].append(row)
-        if o["status"] != "LABELED":
+        if (
+            o["status"] != "LABELED"
+            or classifications[a["advisory_id"]] == Provenance.UNVERIFIED_HISTORICAL
+        ):
             continue
         t = datetime.fromisoformat(a["generated_at"])
         features = s["evidence"].get("features", {}).get("content_json")
@@ -70,6 +93,7 @@ def build_report(
         )
         groups = [
             "baseline:EXTERNAL",
+            "provenance:" + classifications[a["advisory_id"]].value,
             "agreement:" + s["agreement"],
             "regime:" + str(s["regime"]),
             "symbol:" + a["symbol"],
@@ -128,7 +152,7 @@ def build_report(
             "mean_MAE_pct": statistics.mean(maes) if maes else None,
             "adverse_excursion_pct": statistics_summary(maes, policy),
         }
-    ranges = [r["outcome"]["range"] for r in rows if r["outcome"].get("range")]
+    ranges = [r["outcome"]["range"] for r in primary if r["outcome"].get("range")]
     revisions = []
     by_id = {r["advisory"]["advisory_id"]: r["advisory"] for r in rows}
     for row in rows:
@@ -154,6 +178,26 @@ def build_report(
         "trading_authority": False,
         "policy": policy.model_dump(mode="json"),
         "observations": len(rows),
+        "primary_observations": len(primary),
+        "provenance_counts": {
+            p.value: sum(value == p for value in classifications.values()) for p in Provenance
+        },
+        "diagnostics": {
+            Provenance.UNVERIFIED_HISTORICAL.value: {
+                "n": len(unverified),
+                "included_in_primary_performance": False,
+                "labeled": sum(r["outcome"]["status"] == "LABELED" for r in unverified),
+                "pending": sum(r["outcome"]["status"] == "PENDING" for r in unverified),
+                "returns_pct": statistics_summary(
+                    [
+                        r["outcome"]["return_pct"]
+                        for r in unverified
+                        if r["outcome"]["status"] == "LABELED"
+                    ],
+                    policy,
+                ),
+            }
+        },
         "pending": sum(r["outcome"]["status"] == "PENDING" for r in rows),
         "providers": {
             provider: {

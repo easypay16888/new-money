@@ -106,3 +106,50 @@ async def test_pg16_concurrent_conflicting_complete_outcomes(pg_research_store):
     assert sum(isinstance(r, ResearchError) for r in results) == 1
     assert len(await pg_research_store.records("external_advisory_outcomes")) == 1
     assert len(await pg_research_store.records("external_advisory_evaluations")) == 1
+
+
+async def test_pg16_audit_endpoint_re_evaluation_append_only(pg_research_store):
+    from datetime import timedelta
+
+    from app.advisory.models import ResearchPolicy
+    from tests.test_advisory_audit_fix import endpoint_bundle
+
+    strict = AdvisoryResearch(pg_research_store, ResearchPolicy(endpoint_max_age_seconds=0))
+    a, _ = await strict.ingest(raw(), now=T)
+    pending = await strict.evaluate(
+        a.advisory_id, endpoint_bundle(0.1), as_of=T + timedelta(hours=1)
+    )
+    assert pending["outcome"]["status"] == "PENDING"
+    relaxed = AdvisoryResearch(pg_research_store)
+    labeled = await relaxed.evaluate(
+        a.advisory_id, endpoint_bundle(0.1), as_of=T + timedelta(hours=1)
+    )
+    assert (
+        labeled["outcome"]["status"] == "LABELED"
+        and labeled["outcome"]["endpoint_age_seconds"] == 0.1
+    )
+    rows = await pg_research_store.records("external_advisory_outcomes")
+    assert len(rows) == 2 and pending["outcome"] in rows and labeled["outcome"] in rows
+
+
+async def test_pg16_audit_provenance_promoted_by_separate_evidence_only(pg_research_store):
+    from datetime import timedelta
+
+    from tests.test_advisory_audit_fix import proof
+
+    service = AdvisoryResearch(pg_research_store)
+    a, _ = await service.ingest(raw(source_timestamp_trusted=True), now=T + timedelta(hours=2))
+    pending = await service.evaluate(a.advisory_id, bundle(), as_of=T + timedelta(hours=2))
+    assert pending["outcome"]["status"] == "PENDING"
+    assert (await service.report())["primary_observations"] == 0
+    verified = await service.evaluate(
+        a.advisory_id, bundle(), as_of=T + timedelta(hours=2), verification=proof(a)
+    )
+    assert verified["provenance"] == "VERIFIED_HISTORICAL"
+    report = await service.report()
+    assert (
+        report["primary_observations"] == 1
+        and report["provenance_counts"]["VERIFIED_HISTORICAL"] == 1
+    )
+    assert len(await pg_research_store.records("external_advisory_outcomes")) == 2
+    assert len(await pg_research_store.records("external_advisories")) == 1

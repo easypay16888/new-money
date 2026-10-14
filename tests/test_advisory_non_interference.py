@@ -126,6 +126,8 @@ async def test_identical_authority_outputs_across_advisories_and_research_failur
         "database_failure",
         "prompt_injection",
         "removed",
+        "unverified_historical",
+        "research_health_unhealthy",
     )
     for case in cases:
         if case in {"bullish", "bearish", "prompt_injection"}:
@@ -157,5 +159,26 @@ async def test_identical_authority_outputs_across_advisories_and_research_failur
                 )
                 with pytest.raises(ResearchError):
                     await service.ingest(raw(), now=T)
+        elif case == "unverified_historical":
+            late, _ = await service.ingest(
+                raw(source_timestamp_trusted=True, summary="retrospective observation"),
+                now=T + timedelta(days=7),
+            )
+            report = await service.report()
+            assert report["diagnostics"]["UNVERIFIED_HISTORICAL"]["n"] >= 1
+            assert late.late_import
+        elif case == "research_health_unhealthy":
+            service.provider_health.labels("manual_okx_ai").set(0)
+            service.storage_health.set(0)
+            service.service_health.set(0)
+            service.healthy = False
+            assert (
+                service.registry.get_sample_value(
+                    "quant_external_advisory_provider_health", {"provider": "manual_okx_ai"}
+                )
+                == 0
+            )
+            assert service.registry.get_sample_value("quant_external_advisory_storage_health") == 0
+            assert service.registry.get_sample_value("quant_external_advisory_service_health") == 0
         # Removed scenario runs with NO research service supplied to the trading path.
         assert await authority_outputs(tmp_path, monkeypatch, case) == baseline

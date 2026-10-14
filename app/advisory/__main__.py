@@ -17,6 +17,7 @@ from app.advisory.models import (
     MAX_EVIDENCE_BYTES,
     MAX_INPUT_BYTES,
     EvidenceBundle,
+    HistoricalVerification,
     ResearchPolicy,
     bounded_json,
 )
@@ -64,7 +65,16 @@ async def execute(args: argparse.Namespace) -> None:
             bundle = EvidenceBundle.model_validate(
                 bounded_json(read_input(args.input, MAX_EVIDENCE_BYTES), MAX_EVIDENCE_BYTES)
             )
-            output = await research.evaluate(args.advisory_id, bundle, as_of=now)
+            verification = (
+                HistoricalVerification.model_validate(
+                    bounded_json(read_input(args.verification, MAX_INPUT_BYTES))
+                )
+                if args.verification
+                else None
+            )
+            output = await research.evaluate(
+                args.advisory_id, bundle, as_of=now, verification=verification
+            )
         elif args.action == "report":
             output = await research.report(include_late=not args.exclude_late)
         elif args.action == "export":
@@ -109,6 +119,9 @@ def main() -> int:
         command.add_argument("--input", required=True)
         if action == "evaluate":
             command.add_argument("--advisory-id", required=True)
+            command.add_argument(
+                "--verification", help="Separate operator-reviewed historical provenance JSON"
+            )
     command = sub.add_parser("report")
     command.add_argument("--exclude-late", action="store_true")
     command = sub.add_parser("export")

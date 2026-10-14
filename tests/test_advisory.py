@@ -14,6 +14,7 @@ from app.advisory.__main__ import csv_cell, read_input
 from app.advisory.evaluation import agreement, outcome, snapshot
 from app.advisory.models import (
     EvidenceBundle,
+    HistoricalVerification,
     Horizon,
     InternalEvidence,
     PriceObservation,
@@ -420,7 +421,7 @@ async def test_provider_timeout_and_database_failure_safe_diagnostics(research_s
     with pytest.raises(ResearchError):
         await research.ingest(raw(), now=T)
     assert "secret URL credential" not in caplog.text
-    assert 'reason="import"' in research.metrics().decode()
+    assert 'reason="storage"' in research.metrics().decode()
 
 
 async def test_worker_crash_cannot_involve_runtime(research_store):
@@ -444,7 +445,15 @@ def test_small_sample_and_bootstrap_are_descriptive():
 async def test_report_calibration_filters_late_and_policy_separation(research_store):
     service = AdvisoryResearch(research_store)
     a, _ = await service.ingest(raw(confidence=0.8), now=T + timedelta(hours=2))
-    result = await service.evaluate(a.advisory_id, bundle(), as_of=T + timedelta(hours=2))
+    proof = HistoricalVerification(
+        advisory_id=a.advisory_id,
+        evidence_reference="archived screenshot 01",
+        reviewed_by="independent reviewer",
+        verified_at=T + timedelta(hours=2),
+    )
+    result = await service.evaluate(
+        a.advisory_id, bundle(), as_of=T + timedelta(hours=2), verification=proof
+    )
     report = build_report([result], service.policy)
     assert "confidence_bucket:8" in report["cohorts"]
     assert build_report([result], service.policy, include_late=False)["observations"] == 0
@@ -693,9 +702,26 @@ def test_offline_cli_import_evaluate_report_export_and_safe_error(tmp_path):
     first = json.loads(call("import", "--input", str(input_path)).stdout)
     assert first["added"]
     assert not json.loads(call("import", "--input", str(input_path)).stdout)["added"]
+    verification_path = tmp_path / "verification.json"
+    verification_path.write_text(
+        json.dumps(
+            {
+                "advisory_id": first["advisory_id"],
+                "evidence_reference": "archived immutable screenshot 01",
+                "reviewed_by": "operator",
+                "verified_at": T.isoformat(),
+            }
+        )
+    )
     evaluated = json.loads(
         call(
-            "evaluate", "--advisory-id", first["advisory_id"], "--input", str(evidence_path)
+            "evaluate",
+            "--advisory-id",
+            first["advisory_id"],
+            "--input",
+            str(evidence_path),
+            "--verification",
+            str(verification_path),
         ).stdout
     )
     assert evaluated["outcome"]["status"] == "LABELED"
