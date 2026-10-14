@@ -711,3 +711,23 @@ def test_offline_cli_import_evaluate_report_export_and_safe_error(tmp_path):
     error = call("report", expected=1)
     assert "credential-that-must-not-appear" not in error.stderr
     assert "Traceback" not in error.stderr and error.stdout == ""
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "OKX_API_KEY",
+        "uid",
+        "account_digest",
+        "continuity_id",
+        "STATUS_API_TOKEN",
+        "BARK_DEVICE_KEY",
+        "secret",
+        "authorization",
+    ],
+)
+async def test_private_fields_never_enter_snapshot_storage_or_export(research_store, field, caplog):
+    with pytest.raises(ValueError):
+        evidence("features", nested={field: "PRIVATE_VALUE_MUST_NOT_APPEAR"})
+    assert not await research_store.records("external_advisory_snapshots")
+    assert "PRIVATE_VALUE_MUST_NOT_APPEAR" not in caplog.text

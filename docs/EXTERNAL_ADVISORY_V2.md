@@ -287,7 +287,9 @@ Import <=256KiB; evidence export <=8MiB; JSON nesting<=32. Strict known provider
 symbols, horizons, timezone-aware dates2020–2100, finite numeric values and valid ranges.
 Summary<=8192chars;32 reasoning points<=2048chars each;32 levels per type.
 Unknown fields, duplicate JSON keys, NaN/Infinity, excessive futures, unsafe controls,
-secret-like/path/URL source references are rejected. Source prose may contain HTML,
+secret-like/path/URL source references are rejected. Nested structured evidence also
+rejects recognized credential, UID/account digest and continuity-ID fields before
+persistence or export. Free-form prose must still be checked by the operator. Source prose may contain HTML,
 SQL, hostile prompts or commands: it stays inert JSON text, is never executed,
 rendered as HTML, interpreted as instructions, or passed to a model or trading API.
 Operators must not paste credentials into prose; no system can identify every
@@ -319,7 +321,8 @@ SQLite and **real PostgreSQL16** in a unique generated test DB. TEST_POSTGRES_UR
 required; tests fail rather than skip if missing. Research tests never clean shared
 ledger tables. Existing safety suites retain their own isolated CI ledger database.
 
-The non-interference test uses real classify→TrendStrategy→meta→RiskEngine→
+The non-interference test uses real DecisionPipeline (including higher/entry timeframe confirmation)
+→classify→TrendStrategy→meta→RiskEngine→
 ExecutionEngine.from_risk→submit against a mock exchange. It freezes clocks/UUIDs
 only to compare every resulting field, including actual outgoing order payload.
 No-advisory, bullish, bearish, corrupt, unavailable provider, failed research DB,
@@ -343,9 +346,9 @@ This branch is code for independent audit, not deployment or LIVE readiness.
 
 ## Local verification at feature completion
 
-- 129 new research tests passed, including5 real PostgreSQL16 tests and the CLI.
-- Requested targeted safety/regression set:659 passed before the final8 added checks.
-- Final full suite:1217 collected /1217 passed /0 failed /0 skipped /0 warnings
+- 137 new research tests passed, including5 real PostgreSQL16 tests and the CLI.
+- Requested targeted safety/regression set:659 passed before the final16 added checks.
+- Final full suite:1225 collected /1225 passed /0 failed /0 skipped /0 warnings
   with `uv run pytest -W error` (local PostgreSQL16.14).
 - `uv run ruff check app tests`:PASS.
 - `uv run mypy app`:PASS,48 source files.

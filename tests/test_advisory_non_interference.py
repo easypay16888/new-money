@@ -13,9 +13,9 @@ import app.meta as meta_module
 import app.models as models_module
 from app.advisory.service import AdvisoryResearch, ResearchError
 from app.config import Settings
+from app.decision import DecisionPipeline
 from app.execution import ExecutionEngine, OrderManager
-from app.meta import fuse
-from app.models import GovernorState, MarketStateVector
+from app.models import Candle, GovernorState, MarketStateVector
 from app.regime import classify
 from app.risk import RiskEngine, RiskGovernor
 from app.storage import Store
@@ -56,10 +56,28 @@ async def authority_outputs(tmp_path, monkeypatch, scenario):
         volume_ratio=2,
     )
     regime = classify(state, settings)
-    signal = await TrendStrategy(settings).generate_signal(state, portfolio(), regime)
-    assert signal is not None
-    intent = fuse([signal], portfolio(), settings.min_signal_confidence, as_of=T)
-    assert intent is not None
+    contexts = {
+        timeframe: [
+            Candle(
+                symbol=state.symbol,
+                timeframe=timeframe,
+                timestamp=T - timedelta(minutes=duration * (200 - i)),
+                open=Decimal(49900 + i),
+                high=Decimal(49901 + i),
+                low=Decimal(49899 + i),
+                close=Decimal(49900 + i),
+                volume=Decimal(10),
+                confirmed=True,
+            )
+            for i in range(201)
+        ]
+        for timeframe, duration in (("15m", 15), ("1H", 60), ("4H", 240), ("5m", 5))
+    }
+    signals, intent = await DecisionPipeline(settings, (TrendStrategy(settings),)).decide(
+        contexts, portfolio(), main_state=state
+    )
+    assert len(signals) == 1 and intent is not None
+    signal = signals[0]
     intent.timestamp = T  # Freeze model default clock, not a trading-rule modification.
     governor = RiskGovernor()
     assert governor.resume(synchronized=True, healthy=True)

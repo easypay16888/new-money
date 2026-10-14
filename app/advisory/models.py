@@ -13,6 +13,32 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 SYMBOLS = ("BTC-USDT-SWAP", "ETH-USDT-SWAP")
 MAX_INPUT_BYTES = 262144
 MAX_EVIDENCE_BYTES = 8 * 1024 * 1024
+SENSITIVE_FIELDS = frozenset(
+    {
+        "uid",
+        "accountid",
+        "accountdigest",
+        "apikey",
+        "okxapikey",
+        "secret",
+        "secretkey",
+        "okxsecretkey",
+        "passphrase",
+        "okxpassphrase",
+        "token",
+        "apitoken",
+        "statusapitoken",
+        "devicekey",
+        "barkdevicekey",
+        "continuityid",
+        "signature",
+        "cookie",
+        "cookies",
+        "authorization",
+        "password",
+        "databasepassword",
+    }
+)
 
 
 def timestamp_input(value: Any) -> Any:
@@ -264,6 +290,8 @@ def bounded_json(raw: str | bytes, max_bytes: int = MAX_INPUT_BYTES) -> Any:
         if isinstance(value, dict):
             for key, item in value.items():
                 safe_text(key)
+                if re.sub(r"[^a-z0-9]", "", key.lower()) in SENSITIVE_FIELDS:
+                    raise ValueError("sensitive research field forbidden")
                 validate(item, depth + 1)
         elif isinstance(value, list):
             for item in value:
