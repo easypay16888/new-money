@@ -107,6 +107,7 @@ class TradingRuntime:
         self._public_session: str | None = None
         self._public_gap_notified = False
         self._entry_public_epoch: ContextVar[int | None] = ContextVar('entry_public_epoch', default=None)
+        self._entry_account_version: ContextVar[int | None] = ContextVar('entry_account_version', default=None)
         self.governor = RiskGovernor()
         self._halt_generation = 0
         self.live_lease: LiveRuntimeLease | None = None
@@ -120,6 +121,8 @@ class TradingRuntime:
             self.client,
             self.order_manager,
             lambda: self.governor.state == GovernorState.NORMAL and not self.public_continuity.required
+            and not self.account_refresh_pending
+            and self._entry_account_version.get() in (None, self._account_refresh_version)
             and (self._entry_public_epoch.get() in (None, self.public_continuity.epoch)) and (
                 self.settings.mode != Mode.LIVE or
                 (self.live_lease is not None and self.live_lease.held)
@@ -154,6 +157,9 @@ class TradingRuntime:
         self._reconciliation_completed_at: float | None = None
         self._last_reconcile_safe = False
         self._reconcile_lock = asyncio.Lock()
+        self._account_refresh_requested = asyncio.Event()
+        self._account_refresh_version = 0
+        self._account_refresh_verified = 0
         self._ledger_repair_active = False
         self._ledger_repair_attempted = False
         self._ledger_repair_manual_hold = False
@@ -415,7 +421,9 @@ class TradingRuntime:
         if self.live_lease is None or not await self.live_lease.verify():
             return False
         return not entry or (self.governor.state == GovernorState.NORMAL
-                             and not self.public_continuity.required)
+                             and not self.public_continuity.required
+                             and not self.account_refresh_pending
+                             and self._entry_account_version.get() in (None, self._account_refresh_version))
 
     async def _caa_owner_held(self) -> bool:
         if self.settings.mode != Mode.LIVE:
@@ -504,6 +512,16 @@ class TradingRuntime:
         async with self._reconcile_lock:
             await self._run_reconciliation()
 
+    @property
+    def account_refresh_pending(self) -> bool:
+        return self._account_refresh_version != self._account_refresh_verified
+
+    def _request_account_refresh(self) -> None:
+        # Account/position notifications are invalidations, not authoritative fills.
+        # Fence entries immediately; one consumer refreshes the latest snapshot.
+        self._account_refresh_version += 1
+        self._account_refresh_requested.set()
+
     async def _reconcile_and_assess(self) -> tuple[bool, list[str]]:
         async with self._reconcile_lock:
             await self._run_reconciliation()
@@ -511,6 +529,7 @@ class TradingRuntime:
 
     async def _run_reconciliation(self) -> None:
         completed = False
+        refresh_version = self._account_refresh_version
         epochs = [(ws, ws.generation) for ws in self.sockets
                   if ws.private and ws.is_transport_healthy() and ws.business_idle]
         try:
@@ -521,8 +540,12 @@ class TradingRuntime:
             self._reconciliation_observed_result = completed and self.reconciliation_healthy
             self._reconciliation_completed_at = self._clock()
             if completed and self.reconciliation_healthy and self._last_reconcile_safe:
+                self._account_refresh_verified = refresh_version
+                if not self.account_refresh_pending:
+                    self._account_refresh_requested.clear()
                 for ws, generation in epochs:
-                    if ws.generation == generation and ws.is_transport_healthy() and ws.business_idle:
+                    if (not self.account_refresh_pending and ws.generation == generation
+                            and ws.is_transport_healthy() and ws.business_idle):
                         ws.reconciliation_required = False
                         ws.processing_unsafe = False
 
@@ -735,12 +758,19 @@ class TradingRuntime:
         prior_positions = dict(self.portfolio.positions) if self.portfolio.synchronized else {}
         read_phase = True
         try:
-            account, positions, orders, algos = await asyncio.gather(
-                self.client.account(),
-                self.client.positions(),
-                self.client.pending_orders(),
-                self.client.pending_algos(),
-            )
+            # A failed read must not leave sibling GETs running into the next cycle.
+            # Only reads participate; trading writes are never cancelled/retried here.
+            reads = [asyncio.create_task(read()) for read in (
+                self.client.account, self.client.positions,
+                self.client.pending_orders, self.client.pending_algos,
+            )]
+            try:
+                account, positions, orders, algos = await asyncio.gather(*reads)
+            finally:
+                for task in reads:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*reads, return_exceptions=True)
             config = await self.client.account_config()
             account, positions, orders, algos = await self._refresh_terminal_order_snapshot(
                 account, positions, orders, algos
@@ -1805,7 +1835,9 @@ class TradingRuntime:
         if self.public_continuity.required:
             return
         public_epoch = self.public_continuity.epoch
-        if not self.portfolio.synchronized or self.governor.state != GovernorState.NORMAL:
+        account_version = self._account_refresh_version
+        if (self.account_refresh_pending or not self.portfolio.synchronized
+                or self.governor.state != GovernorState.NORMAL):
             return
         if symbol in self.entry_controller.blocked:
             return
@@ -1848,7 +1880,8 @@ class TradingRuntime:
             self.portfolio,
             main_state=state,
         )
-        if self.public_continuity.required or public_epoch != self.public_continuity.epoch:
+        if (self.public_continuity.required or public_epoch != self.public_continuity.epoch
+                or account_version != self._account_refresh_version):
             return
         for signal in signals:
             await self.store.append(
@@ -1900,6 +1933,7 @@ class TradingRuntime:
         )
         if decision.approved:
             epoch_token = self._entry_public_epoch.set(public_epoch)
+            account_token = self._entry_account_version.set(account_version)
             try:
                 request = ExecutionEngine.from_risk(
                     decision, self.instruments[symbol], signal_expires_at=intent.expires_at
@@ -1917,6 +1951,7 @@ class TradingRuntime:
                 raise
             finally:
                 self._entry_public_epoch.reset(epoch_token)
+                self._entry_account_version.reset(account_token)
 
     async def _on_private(self, message: dict[str, Any]) -> None:
         channel = message.get("arg", {}).get("channel")
@@ -1997,7 +2032,7 @@ class TradingRuntime:
                     await self.enter_halt("unexpected order", emergency=True)
                     await self.reconcile()
         elif channel in {"positions", "account"}:
-            await self.reconcile()
+            self._request_account_refresh()
 
     async def _refresh_redis(self) -> None:
         if self.redis is None:
@@ -2283,6 +2318,8 @@ class TradingRuntime:
             issues.append("live_writer_lease")
         if not self.reconciliation_healthy:
             issues.append("reconciliation")
+        if self.account_refresh_pending:
+            issues.append("account_refresh_pending")
         if not self._last_reconcile_safe:
             issues.append("reconciliation_safety")
         if not self.portfolio.synchronized:
@@ -2582,9 +2619,26 @@ class TradingRuntime:
 
     async def _reconcile_loop(self) -> None:
         while self.running:
-            await asyncio.sleep(self.settings.reconcile_interval_seconds)
+            try:
+                await asyncio.wait_for(self._account_refresh_requested.wait(),
+                                       self.settings.reconcile_interval_seconds)
+            except TimeoutError:
+                pass
+            self._account_refresh_requested.clear()
+            if not self.running:
+                return
             if self.settings.has_credentials:
-                await self.reconcile()
+                try:
+                    await self.reconcile()
+                except Exception as exc:
+                    self.reconciliation_healthy = False
+                    self._last_reconcile_safe = False
+                    await self.enter_halt("reconciliation permanent failure")
+                    logger.error("reconciliation worker failed: %s", type(exc).__name__)
+                if not self.reconciliation_healthy:
+                    # A sustained outage must not turn WS invalidations into a
+                    # tight REST retry loop. The pending entry fence remains set.
+                    await asyncio.sleep(self.settings.reconcile_interval_seconds)
 
     async def _dead_man_loop(self) -> None:
         while self.running:

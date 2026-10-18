@@ -90,6 +90,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             },
             "cancel_all_after": runtime.caa_status(),
             "synchronized": runtime.portfolio.synchronized,
+            "account_refresh_pending": runtime.account_refresh_pending,
             "ledger_repair": {
                 "manual_resume_required": (
                     runtime._ledger_repair_manual_hold or runtime._ledger_repair_attempted
