@@ -1,6 +1,7 @@
 """Bounded REST resources; retire a stuck pool without retrying any request."""
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable
 
 import httpx
@@ -27,7 +28,11 @@ class RestPool:
         self.active += 1
         try:
             return await client.request(method, path, **kwargs)
-        except httpx.PoolTimeout:
+        except (httpx.TransportError, asyncio.CancelledError):
+            # A proxy CONNECT may succeed before TLS fails or is cancelled.
+            # httpcore can retain that tunnel as ACTIVE, exhausting capacity on
+            # the next call. Retire on the original failure, not a later pool
+            # timeout. Propagate unchanged; never replay an ambiguous write.
             self.failed = True
             raise
         finally:
