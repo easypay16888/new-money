@@ -327,7 +327,8 @@ async def test_unsolicited_pre_ack_data_is_still_rejected():
 
 async def test_slow_private_reconcile_does_not_block_transport_pong(tmp_path):
     runtime = TradingRuntime(
-        Settings(_env_file=None, database_url=f"sqlite+aiosqlite:///{tmp_path}/slow.db")
+        Settings(_env_file=None, database_url=f"sqlite+aiosqlite:///{tmp_path}/slow.db",
+                 okx_api_key="test", okx_secret_key="test", okx_passphrase="test")
     )
     entered, release = asyncio.Event(), asyncio.Event()
 
@@ -336,6 +337,8 @@ async def test_slow_private_reconcile_does_not_block_transport_pong(tmp_path):
         await release.wait()
 
     runtime.reconcile = slow_reconcile
+    runtime.running = True
+    reconcile = asyncio.create_task(runtime._reconcile_loop())
     ws, now = ready_socket(private=True, channels=("positions",))
     ws.handler = runtime._on_private
     wire = Wire([dict(arg=ws.subscriptions[0], data=[{"pos": "0"}])])
@@ -348,12 +351,17 @@ async def test_slow_private_reconcile_does_not_block_transport_pong(tmp_path):
         await wait_until(lambda: ws.last_pong_at == now[0])
         assert ws.is_transport_healthy()
         assert ws.is_data_fresh()
-        assert not ws.is_processing_healthy()  # A processing delay is reported accurately.
+        await asyncio.wait_for(ws.queue.join(), 1)
+        assert ws.is_processing_healthy()  # Snapshot refresh no longer occupies this worker.
+        assert runtime.account_refresh_pending
+        assert not runtime.execution.entry_allowed()  # Pending verification still fences entry.
     finally:
+        runtime.running = False
         release.set()
         receive.cancel()
         worker.cancel()
-        await asyncio.gather(receive, worker, return_exceptions=True)
+        reconcile.cancel()
+        await asyncio.gather(receive, worker, reconcile, return_exceptions=True)
         await runtime.close()
 
 

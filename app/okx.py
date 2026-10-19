@@ -14,6 +14,7 @@ from collections import deque
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from decimal import Decimal
+from functools import partial
 from typing import Any
 from urllib.parse import urlencode, urlsplit
 
@@ -23,6 +24,7 @@ import websockets
 from app.config import Mode, Settings
 from app.models import Instrument
 from app.monitoring import Metrics
+from app.rest_pool import RestPool
 
 logger = logging.getLogger("okx")
 
@@ -118,11 +120,22 @@ class OkxRestClient:
             base_url=settings.okx_rest_url, timeout=settings.request_timeout_seconds
         )
         self.owns_client = client is None
+        self._initial_client = self.client
+        self._pools: dict[str, RestPool] = {}
+        if self.owns_client:
+            for lane, capacity in {"read": 8, "entry": 2, "safety": 4, "caa": 1}.items():
+                self._pools[lane] = RestPool(partial(self._new_http_client, capacity))
         self.latency_observer: Callable[[str, float], None] | None = None
         self._verified_live_identity: bytes | None = None
         self._live_account_anchor: bytes | None = None
         self.live_writer_guard: Callable[[bool], Awaitable[bool]] | None = None
         self._fills_history_limiter = FillHistoryLimiter()
+
+    def _new_http_client(self, capacity: int) -> httpx.AsyncClient:
+        return httpx.AsyncClient(
+            base_url=self.settings.okx_rest_url, timeout=self.settings.request_timeout_seconds,
+            limits=httpx.Limits(max_connections=capacity, max_keepalive_connections=capacity),
+        )
 
     def _live_identity(self) -> bytes:
         # Invalidate the grant if account, credentials or endpoint changes in memory.
@@ -134,8 +147,27 @@ class OkxRestClient:
         return hashlib.sha256(json.dumps(values).encode()).digest()
 
     async def close(self) -> None:
+        for pool in self._pools.values():
+            await pool.close()
         if self.owns_client:
             await self.client.aclose()
+
+    def _transport(self, method: str, path: str, body: Any) -> httpx.AsyncClient | RestPool:
+        # Explicitly supplied transports remain caller-owned (including test adapters).
+        if not self.owns_client or self.client is not self._initial_client:
+            return self.client
+        if method == "GET":
+            lane = "read"
+        elif path == "/api/v5/trade/cancel-all-after":
+            lane = "caa"
+        elif path in {"/api/v5/trade/cancel-order", "/api/v5/trade/cancel-algos"} or (
+            path in {"/api/v5/trade/order", "/api/v5/trade/order-algo"}
+            and isinstance(body, dict) and body.get("reduceOnly") in (True, "true")
+        ):
+            lane = "safety"
+        else:
+            lane = "entry"
+        return self._pools[lane]
 
     async def request(
         self,
@@ -213,7 +245,7 @@ class OkxRestClient:
         operation = RECONCILIATION_OPERATIONS.get(path, method.lower())
         started = time.monotonic()
         try:
-            response = await self.client.request(
+            response = await self._transport(method, path, body).request(
                 method, request_path, content=body_text or None, headers=headers
             )
         except httpx.HTTPError as exc:

@@ -86,7 +86,8 @@ async def ensure_schema(store: Store) -> None:
 
 
 async def maintenance_status(store: Store) -> dict:
-    await ensure_schema(store)
+    # Schema is initialized by startup/acquisition, never by a monitoring read.
+    # Missing/corrupt schema still fails closed at the API boundary.
     async with store.engine.connect() as connection:
         row, now = await read_lock(connection)
     active = row is not None and row['kind'] == 'maintenance' and row['expires_at'] > now
