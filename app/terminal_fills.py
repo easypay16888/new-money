@@ -9,6 +9,7 @@ from typing import Any
 from app.fill_identity import FillKey, fill_key
 from app.ledger_repair import decimal_value, parse_fill
 from app.okx import OkxError
+from app.products import base_fee_delta, is_spot
 
 PAGE_SIZE = 100
 MAX_PAGES = 51
@@ -41,8 +42,9 @@ def validate_fill(row: dict[str, Any], detail: dict[str, Any]) -> dict[str, Any]
         if detail.get('feeCcy') and canonical.get('feeCcy') != detail['feeCcy']:
             raise TerminalFillError('terminal_fill_identity_mismatch')
         # This path needs complete accounting; missing fee/PnL is not a zero.
-        for field in ('fee', 'fillPnl'):
+        for field in (('fee',) if is_spot(canonical['instId']) else ('fee', 'fillPnl')):
             decimal_value(canonical.get(field))
+        base_fee_delta(canonical)
         if canonical.get('fillFee') not in (None, '') and decimal_value(canonical['fillFee']) != decimal_value(canonical['fee']):
             raise TerminalFillError('terminal_fill_evidence_conflict')
         if (not isinstance(canonical.get('feeCcy'), str)

@@ -111,6 +111,7 @@ class EventDrivenBacktester:
     def __init__(self, settings: Settings, instrument: Instrument) -> None:
         self.settings = settings
         self.instrument = instrument
+        self.fee_rate = settings.spot_fee_rate if instrument.market_type == 'SPOT' else settings.taker_fee
         self.strategies = build_strategies(settings)
         self.decision_pipeline = DecisionPipeline(settings, self.strategies)
 
@@ -133,7 +134,7 @@ class EventDrivenBacktester:
             params={
                 "initial_equity": str(initial_equity),
                 "maker_fee": self.settings.maker_fee,
-                "taker_fee": self.settings.taker_fee,
+                "taker_fee": self.fee_rate,
                 "slippage_bps": self.settings.slippage_bps,
                 "spread_bps": self.settings.backtest_spread_bps,
                 "funding_rate": self.settings.backtest_funding_rate,
@@ -187,7 +188,7 @@ class EventDrivenBacktester:
                         ).to_integral_value(rounding=ROUND_DOWN) * self.instrument.lot_size
                         if contracts >= self.instrument.min_size:
                             notional = contracts * self.instrument.contract_value * entry
-                            fee = notional * Decimal(str(self.settings.taker_fee))
+                            fee = notional * Decimal(str(self.fee_rate))
                             slip = (
                                 contracts * self.instrument.contract_value * candle.open * slip_rate
                             )
@@ -200,7 +201,8 @@ class EventDrivenBacktester:
                             position = SimPosition(pending, contracts, entry, fee, slip, spread)
                 pending = None
             if position:
-                if candle.timestamp.hour in (0, 8, 16) and candle.timestamp.minute == 0:
+                if (self.instrument.market_type != 'SPOT'
+                        and candle.timestamp.hour in (0, 8, 16) and candle.timestamp.minute == 0):
                     funding_direction = (
                         Decimal(1) if position.signal.side == Side.LONG else Decimal(-1)
                     )
@@ -246,7 +248,7 @@ class EventDrivenBacktester:
                         exit_price
                         * position.contracts
                         * multiplier
-                        * Decimal(str(self.settings.taker_fee))
+                        * Decimal(str(self.fee_rate))
                     )
                     slip = (
                         position.contracts
@@ -321,7 +323,7 @@ class EventDrivenBacktester:
             direction = Decimal(1) if side == Side.LONG else Decimal(-1)
             gross = (exit_price - position.entry) * position.contracts * multiplier * direction
             fee = (
-                exit_price * position.contracts * multiplier * Decimal(str(self.settings.taker_fee))
+                exit_price * position.contracts * multiplier * Decimal(str(self.fee_rate))
             )
             slip = position.contracts * multiplier * base_exit * slip_rate
             spread = position.contracts * multiplier * base_exit * half_spread

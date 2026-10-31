@@ -11,6 +11,7 @@ from uuid import uuid4
 from app.fill_identity import FillKey, equivalent_fill, fill_key
 from app.models import ExecutionRequest, Instrument, OrderState, RiskDecision, Side
 from app.okx import OkxError, OkxOrderRejected, OkxRestClient
+from app.products import base_fee_delta, is_spot, number
 from app.storage import Store
 
 logger = logging.getLogger("execution")
@@ -22,6 +23,8 @@ class OrderManager:
         self.orders: dict[str, dict] = {}
         self.seen_trade_ids: set[FillKey] = set()
         self.ledger_lock = asyncio.Lock()
+        self.spot_fees: dict[str, Decimal] = {}
+        self.reconciled_spot_fees: dict[str, Decimal] = {}
         self.terminal_fill_recovery: Callable[[dict, dict], Awaitable[None]] | None = None
 
     async def create(self, request: ExecutionRequest) -> None:
@@ -32,7 +35,7 @@ class OrderManager:
         expires = request.signal_expires_at
         if expires is not None and expires.tzinfo is None:
             expires = expires.replace(tzinfo=UTC)
-        row = {
+        row: dict[str, Any] = {
             "clOrdId": request.client_order_id,
             "symbol": request.symbol,
             "state": OrderState.CREATED.value,
@@ -58,6 +61,9 @@ class OrderManager:
                 "a" + request.client_order_id[1:] if not request.reduce_only else ""
             ),
         }
+        if request.market_type == 'SPOT':
+            row['market_type'] = 'SPOT'
+            row['risk_decision'] = request.risk_decision.model_dump(mode='json')
         await self.store.append(
             "orders", row, symbol=request.symbol, reference_id=request.client_order_id
         )
@@ -74,6 +80,15 @@ class OrderManager:
         for row in self.orders.values():
             row["reconciled_filled"] = row.get("filled", "0")
         self.seen_trade_ids = {key for key, _ in await self.store.fill_records()}
+        await self.refresh_spot_fees()
+        self.reconciled_spot_fees = dict(self.spot_fees)
+
+    async def refresh_spot_fees(self) -> None:
+        fees: dict[str, Decimal] = {}
+        for key, fill in await self.store.fill_records():
+            if is_spot(key[0]):
+                fees[key[0]] = fees.get(key[0], Decimal(0)) + base_fee_delta(fill)
+        self.spot_fees = fees
 
     async def transition(self, client_order_id: str, state: OrderState, **changes: str) -> None:
         row = self.orders[client_order_id]
@@ -102,6 +117,7 @@ class OrderManager:
         existing_fill = None
         if event.get("fillSz") and Decimal(event["fillSz"]) > 0:
             key = fill_key(event.get("instId"), event.get("tradeId"))
+            base_fee_delta(event)  # Validate cash fee evidence before appending any state.
             existing_fill = await self.store.fill_for_key(key)
             if existing_fill is not None and not equivalent_fill(existing_fill, event):
                 # Validate immutable evidence before appending any order event.
@@ -124,6 +140,13 @@ class OrderManager:
             order_id = str(event.get("ordId", ""))
             if parent is None or not order_id:
                 raise OkxError("unexpected order event")
+            if is_spot(parent['symbol']) and (
+                parent['direction'] != 'LONG' or event.get('side') != 'sell'
+                or event.get('tdMode') != 'cash'
+                or event.get('instId') != parent['symbol']
+                or event.get('state') not in {'live', 'partially_filled', 'filled', 'canceled', 'mmp_canceled'}
+            ):
+                raise OkxError('unexpected cash protective order event')
             if key is not None and parent["symbol"] != key[0]:
                 raise OkxError("ledger fill conflict")
             client_id = "protective-" + order_id
@@ -145,10 +168,26 @@ class OrderManager:
                     "reduce_only": True,
                     "protective_algo_id": "",
                 }
+                if is_spot(parent['symbol']):
+                    size = number(event.get('sz'))
+                    owned = sum((number(row['filled']) * (1 if row['direction'] == 'LONG' else -1)
+                                 for row in self.orders.values() if row['symbol'] == parent['symbol']), Decimal(0))
+                    owned += self.spot_fees.get(parent['symbol'], Decimal(0))
+                    if not (size > 0 and 0 <= number(event.get('accFillSz')) <= size <= owned):
+                        raise OkxError('cash protective exit exceeds owned inventory')
+                    synthetic.update(approved_contracts=str(size), market_type='SPOT')
                 await self.store.append(
                     "orders", synthetic, symbol=parent["symbol"], reference_id=client_id
                 )
                 self.orders[client_id] = synthetic
+        known = self.orders[client_id]
+        if is_spot(known['symbol']):
+            cumulative = number(event.get('accFillSz') or '0')
+            if (event.get('instId') != known['symbol'] or event.get('tdMode') != 'cash'
+                    or event.get('side') != ('buy' if known['direction'] == 'LONG' else 'sell')
+                    or event.get('state') not in {'live', 'partially_filled', 'filled', 'canceled', 'mmp_canceled'}
+                    or not number(known['filled']) <= cumulative <= number(known['approved_contracts'])):
+                raise OkxError('cash order identity or quantity mismatch')
         state = {
             "live": OrderState.ACKNOWLEDGED,
             "partially_filled": OrderState.PARTIALLY_FILLED,
@@ -165,6 +204,8 @@ class OrderManager:
                 await self.store.append(
                     "fills", event, symbol=key[0], reference_id=key[1]
                 )
+                if is_spot(key[0]):
+                    self.spot_fees[key[0]] = self.spot_fees.get(key[0], Decimal(0)) + base_fee_delta(event)
             self.seen_trade_ids.add(key)
 
     def expected_deltas(self) -> dict[str, Decimal]:
@@ -173,6 +214,8 @@ class OrderManager:
             size = Decimal(row["filled"]) - Decimal(row["reconciled_filled"])
             signed = size if row["direction"] == Side.LONG.value else -size
             deltas[row["symbol"]] = deltas.get(row["symbol"], Decimal(0)) + signed
+        for symbol, fee in self.spot_fees.items():
+            deltas[symbol] = deltas.get(symbol, Decimal(0)) + fee - self.reconciled_spot_fees.get(symbol, Decimal(0))
         return deltas
 
     def pending_entries(self) -> list[dict]:
@@ -185,6 +228,7 @@ class OrderManager:
     def mark_reconciled(self) -> None:
         for row in self.orders.values():
             row["reconciled_filled"] = row["filled"]
+        self.reconciled_spot_fees = dict(self.spot_fees)
 
 
 class ExecutionEngine:
@@ -199,6 +243,7 @@ class ExecutionEngine:
         self.manager = manager
         self.entry_allowed = entry_allowed
         self.entry_lock = entry_lock
+        self.entry_request_guard: Callable[[ExecutionRequest], Awaitable[bool]] | None = None
 
     @staticmethod
     def from_risk(
@@ -217,6 +262,8 @@ class ExecutionEngine:
             raise ValueError("execution requires approved risk decision")
         if order_type not in {"limit", "market"}:
             raise ValueError("unsupported order type")
+        if instrument.market_type == 'SPOT' and not reduce_only and order_type != 'limit':
+            raise ValueError('spot entries require limit orders with attached protection')
         price = None
         if order_type == "limit":
             if decision.entry_reference is None:
@@ -231,6 +278,7 @@ class ExecutionEngine:
             order_type=order_type,
             price=price,
             reduce_only=reduce_only,
+            market_type=instrument.market_type,
             signal_expires_at=(
                 signal_expires_at
                 or decision.signal_expires_at
@@ -248,6 +296,15 @@ class ExecutionEngine:
     async def _submit_unlocked(self, request: ExecutionRequest) -> None:
         if not request.reduce_only and self.entry_allowed and not self.entry_allowed():
             raise OkxError("risk-increasing order blocked")
+        if (not request.reduce_only and self.entry_request_guard is not None
+                and not await self.entry_request_guard(request)):
+            raise OkxError('shared account entry budget unverified')
+        if request.market_type == 'SPOT' and (
+            (not request.reduce_only and request.risk_decision.direction != Side.LONG)
+            or (request.reduce_only and request.risk_decision.direction != Side.SHORT)
+            or request.risk_decision.leverage != 1
+        ):
+            raise OkxError('spot execution requires unleveraged cash inventory')
         if not request.reduce_only and request.signal_expires_at:
             expires = request.signal_expires_at
             if expires.tzinfo is None:
@@ -266,6 +323,12 @@ class ExecutionEngine:
             "clOrdId": request.client_order_id,
             "reduceOnly": request.reduce_only,
         }
+        if request.market_type == 'SPOT':
+            body['tdMode'] = 'cash'
+            body.pop('posSide')
+            body.pop('reduceOnly')
+            if request.order_type == 'market':
+                body.update(tgtCcy='base_ccy', banAmend=True)
         if request.price is not None:
             body["px"] = str(request.price)
         if not request.reduce_only:
@@ -287,6 +350,10 @@ class ExecutionEngine:
                         "tpOrdPx": "-1",
                     }
                 )
+            if request.market_type == 'SPOT':
+                body['attachAlgoOrds'][0]['slTriggerPxType'] = 'last'
+                if 'tpTriggerPxType' in body['attachAlgoOrds'][0]:
+                    body['attachAlgoOrds'][0]['tpTriggerPxType'] = 'last'
         await self.manager.transition(request.client_order_id, OrderState.SUBMITTED)
         if not request.reduce_only and request.signal_expires_at:
             expiry = request.signal_expires_at
@@ -298,6 +365,10 @@ class ExecutionEngine:
         if not request.reduce_only and self.entry_allowed and not self.entry_allowed():
             await self.manager.transition(request.client_order_id, OrderState.CANCELLED)
             raise OkxError("risk-increasing order blocked")
+        if (not request.reduce_only and self.entry_request_guard is not None
+                and not await self.entry_request_guard(request)):
+            await self.manager.transition(request.client_order_id, OrderState.CANCELLED)
+            raise OkxError('shared account entry budget unverified')
         queried_order = False
         try:
             result = await self.client.place_order(body)

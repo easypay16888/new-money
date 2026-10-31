@@ -30,6 +30,8 @@ class Settings(BaseSettings):
     live_lease_database_url: SecretStr = SecretStr("")
     redis_url: str = "redis://localhost:6379/0"
     symbols: tuple[str, ...] = ("BTC-USDT-SWAP", "ETH-USDT-SWAP")
+    spot_symbols: tuple[str, ...] = ()
+    spot_fee_rate: float = Field(default=0.001, ge=0, lt=1, allow_inf_nan=False)
     timeframes: tuple[str, ...] = ("1m", "5m", "15m", "1H", "4H")
     risk_per_trade: float = Field(default=0.0025, gt=0)
     max_risk_per_trade: float = Field(default=0.0035, gt=0)
@@ -110,6 +112,13 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_live(self) -> Settings:
+        if self.spot_symbols and self.mode == Mode.LIVE:
+            raise ValueError('spot support requires PAPER or BACKTEST; LIVE spot is not enabled')
+        if (len(set(self.spot_symbols)) != len(self.spot_symbols)
+                or any(len(s.split('-')) != 2 or not s.endswith('-USDT')
+                       or not s.split('-')[0].isalnum() for s in self.spot_symbols)
+                or set(self.symbols) & set(self.spot_symbols)):
+            raise ValueError('invalid or duplicate USDT spot symbols')
         if self.mode == Mode.LIVE and not (
             self.live_trading_enabled and self.confirm_live_account_id
         ):
@@ -142,6 +151,10 @@ class Settings(BaseSettings):
         if self.risk_per_trade > self.max_risk_per_trade:
             raise ValueError("risk per trade exceeds configured maximum")
         return self
+
+    @property
+    def trading_symbols(self) -> tuple[str, ...]:
+        return self.symbols + self.spot_symbols
 
     @property
     def ws_base(self) -> str:

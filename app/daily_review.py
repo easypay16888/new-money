@@ -4,6 +4,7 @@ from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
+from app.products import is_spot
 from app.storage import Store
 
 
@@ -16,7 +17,15 @@ async def build_daily_review(store: Store, day: date) -> dict[str, Any]:
     orders = await store.between("orders", start, end)
     equity_start = Decimal(snapshots[0]["equity"]) if snapshots else None
     equity_end = Decimal(snapshots[-1]["equity"]) if snapshots else None
-    fees = sum((Decimal(row.get("fillFee") or row.get("fee") or "0") for row in fills), Decimal(0))
+    fees = Decimal(0)
+    fees_by_currency: dict[str, Decimal] = {}
+    for row in fills:
+        fee = Decimal(row.get('fillFee') or row.get('fee') or '0')
+        currency = row.get('feeCcy') or 'UNKNOWN'
+        fees_by_currency[currency] = fees_by_currency.get(currency, Decimal(0)) + fee
+        if is_spot(str(row.get('instId') or '')) and currency == row['instId'].split('-')[0]:
+            fee *= Decimal(row['fillPx'])
+        fees += fee
     pnl_values = [row.get("fillPnl") for row in fills]
     realized_pnl = (
         sum((Decimal(str(value)) for value in pnl_values), Decimal(0))
@@ -42,6 +51,7 @@ async def build_daily_review(store: Store, day: date) -> dict[str, Any]:
         "orders": len(orders),
         "fills": len(fills),
         "fees": str(fees),
+        "fees_by_currency": {k: str(v) for k, v in fees_by_currency.items()},
         "max_drawdown": str(max_drawdown) if snapshots else None,
         "risk_events": len(risk_events),
         "halt_count": sum(

@@ -81,6 +81,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return {
             'maintenance': maintenance,
             "mode": settings.mode,
+            "trading_products": {'swap': list(settings.symbols), 'spot': list(settings.spot_symbols)},
             "running": runtime.running,
             "risk_state": runtime.governor.state,
             "reason": runtime.governor.reason,

@@ -75,6 +75,10 @@ REASONS = {
     "startup leverage exceeds limit": "启动时杠杆超过限制",
     "derivatives account mode required": "账户需要使用合约模式",
     "USDT margin unavailable": "USDT 保证金不可用",
+    'spot inventory mismatch': '现货余额与本系统成交账本不一致，需要人工检查',
+    'unowned spot inventory': '发现非本系统现货余额，未接管或卖出，新开仓已禁止',
+    'orphan spot protective order': '空仓时仍有现货条件单，需要人工检查',
+    'spot partial fill evidence unavailable': '现货部分成交证据不完整，已进入紧急风控',
     "algo state audit failed": "条件单状态审计失败",
     "unowned algo order": "发现非本系统条件单",
     "partial fill before protective stop active": "止损保护生效前出现部分成交",
@@ -140,6 +144,7 @@ TITLES = {
     "UNSAFE_SHUTDOWN": "🚨 安全停机尚未完成",
 }
 LABELS = {
+    'Base quantity': '基础币数量',
     "Phase": "阶段", "Failure phase": "故障阶段",
     "Reason code": "reason_code", "Close code": "关闭代码", "Close reason": "关闭原因",
     "Last handshake HTTP status": "最近握手 HTTP 状态码",
@@ -312,6 +317,9 @@ def localize_bark_event(event: NotificationEvent) -> NotificationEvent:
         parts = event.title.split()
         symbol = parts[1] if len(parts) > 2 else ""
     symbol = symbol or "交易"
+    spot = bool(event.symbol and len(event.symbol.split('-')) == 2 and event.symbol.endswith('-USDT'))
+    if spot:
+        symbol += ' 现货'
     side = context.metadata.get("side")
     if code == "TRADE_FILLED":
         title = (
@@ -319,6 +327,8 @@ def localize_bark_event(event: NotificationEvent) -> NotificationEvent:
             if side == "SHORT"
             else f"🟢 {symbol} 多单已成交" if side == "LONG" else f"🟢 {symbol} 订单已成交"
         )
+        if spot:
+            title = f'🟢 {symbol} 买入已成交' if side == 'LONG' else f'🟢 {symbol} 订单已成交'
     elif code == "ENTRY_SUBMITTED":
         title = f"📤 {symbol} 开仓订单已提交"
     elif code == "TRADE_PARTIAL_FILL":
