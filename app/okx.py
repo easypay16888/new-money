@@ -24,6 +24,7 @@ import websockets
 from app.config import Mode, Settings
 from app.models import Instrument
 from app.monitoring import Metrics
+from app.products import instrument_type, is_spot, reduces_exposure, spot_balance_positions
 from app.rest_pool import RestPool
 
 logger = logging.getLogger("okx")
@@ -129,6 +130,7 @@ class OkxRestClient:
         self._verified_live_identity: bytes | None = None
         self._live_account_anchor: bytes | None = None
         self.live_writer_guard: Callable[[bool], Awaitable[bool]] | None = None
+        self.spot_writer_guard: Callable[[str, dict[str, Any]], Awaitable[bool]] | None = None
         self._fills_history_limiter = FillHistoryLimiter()
 
     def _new_http_client(self, capacity: int) -> httpx.AsyncClient:
@@ -162,7 +164,7 @@ class OkxRestClient:
             lane = "caa"
         elif path in {"/api/v5/trade/cancel-order", "/api/v5/trade/cancel-algos"} or (
             path in {"/api/v5/trade/order", "/api/v5/trade/order-algo"}
-            and isinstance(body, dict) and body.get("reduceOnly") in (True, "true")
+            and isinstance(body, dict) and (body.get("reduceOnly") in (True, "true") or reduces_exposure(body))
         ):
             lane = "safety"
         else:
@@ -179,6 +181,16 @@ class OkxRestClient:
         private: bool = False,
     ) -> list[Any]:
         method = method.upper()
+        if method != 'GET':
+            items = body if isinstance(body, list) else [body]
+            for item in items:
+                if not isinstance(item, dict) or not is_spot(str(item.get('instId') or '')):
+                    continue
+                if (self.settings.mode != Mode.PAPER
+                        or item['instId'] not in self.settings.spot_symbols
+                        or self.spot_writer_guard is None
+                        or not await self.spot_writer_guard(path, item)):
+                    raise OkxError('spot write blocked: cash ownership or permission unverified')
         if self.settings.mode == Mode.LIVE and self._verified_live_identity != self._live_identity():
             self._verified_live_identity = None
         if self.settings.mode == Mode.LIVE and method != "GET":
@@ -296,7 +308,7 @@ class OkxRestClient:
 
     async def instruments(self) -> dict[str, Instrument]:
         rows = await self.request("GET", "/api/v5/public/instruments", params={"instType": "SWAP"})
-        return {
+        instruments = {
             row["instId"]: Instrument(
                 symbol=row["instId"],
                 contract_value=Decimal(row["ctVal"]),
@@ -308,6 +320,17 @@ class OkxRestClient:
             for row in rows
             if row.get("state") == "live"
         }
+        if self.settings.spot_symbols:
+            spots = await self.request('GET', '/api/v5/public/instruments', params={'instType': 'SPOT'})
+            for row in spots:
+                if row.get('instId') in self.settings.spot_symbols and row.get('state') == 'live':
+                    instruments[row['instId']] = Instrument(
+                        symbol=row['instId'], contract_value=Decimal(1),
+                        contract_currency=row['baseCcy'], lot_size=Decimal(row['lotSz']),
+                        min_size=Decimal(row['minSz']), tick_size=Decimal(row['tickSz']),
+                        market_type='SPOT',
+                    )
+        return instruments
 
     async def account(self) -> list[dict[str, Any]]:
         return await self.request("GET", "/api/v5/account/balance", private=True)
@@ -366,14 +389,21 @@ class OkxRestClient:
         )
 
     async def positions(self) -> list[dict[str, Any]]:
-        return await self.request(
+        positions = await self.request(
             "GET", "/api/v5/account/positions", params={"instType": "SWAP"}, private=True
         )
+        if self.settings.spot_symbols:
+            positions += spot_balance_positions(await self.account(), self.settings.spot_symbols)
+        return positions
 
     async def pending_orders(self) -> list[dict[str, Any]]:
-        return await self.request(
+        orders = await self.request(
             "GET", "/api/v5/trade/orders-pending", params={"instType": "SWAP"}, private=True
         )
+        if self.settings.spot_symbols:
+            orders += await self.request('GET', '/api/v5/trade/orders-pending',
+                                         params={'instType': 'SPOT'}, private=True)
+        return orders
 
     async def fills(
         self, symbol: str | None = None, *, after: str = "", before: str = "", limit: int = 100,
@@ -395,7 +425,7 @@ class OkxRestClient:
     ) -> list[dict[str, Any]]:
         if not 1 <= limit <= 100:
             raise ValueError("invalid fill page limit")
-        params = {"instType": "SWAP", "limit": str(limit)}
+        params = {"instType": instrument_type(symbol) if symbol else "SWAP", "limit": str(limit)}
         for key, value in (("instId", symbol), ("ordId", order_id), ("after", after), ("before", before)):
             if value:
                 params[key] = value
@@ -1349,9 +1379,11 @@ def public_subscriptions(symbols: tuple[str, ...]) -> list[dict[str, str]]:
             "funding-rate",
             "open-interest",
         )
+        if not is_spot(symbol) or channel in {'tickers', 'trades', 'books5'}
     ]
     subscriptions.extend(
-        {"channel": "index-tickers", "instId": symbol.removesuffix("-SWAP")} for symbol in symbols
+        {"channel": "index-tickers", "instId": symbol.removesuffix("-SWAP")}
+        for symbol in symbols if not is_spot(symbol)
     )
     return subscriptions
 

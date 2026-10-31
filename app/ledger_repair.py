@@ -9,6 +9,7 @@ from typing import Any
 from app.config import Mode, Settings
 from app.execution import OrderManager
 from app.fill_identity import FillKey, equivalent_fill, fill_key
+from app.products import base_fee_delta, is_spot, reduces_exposure
 from app.storage import Store
 
 
@@ -238,6 +239,10 @@ class LedgerRepairService:
         for row in local_orders.values():
             signed = decimal_value(row["filled"]) * (1 if row["direction"] == "LONG" else -1)
             positions[row["symbol"]] = positions.get(row["symbol"], Decimal(0)) + signed
+        for fill in existing.values():
+            symbol = fill['instId']
+            if is_spot(symbol):
+                positions[symbol] = positions.get(symbol, Decimal(0)) + base_fee_delta(fill)
         records: list[tuple[str, dict[str, Any], str]] = []
         fills_added = orders_added = 0
         algo_cache: dict[str, list[dict[str, Any]]] = {}
@@ -305,13 +310,17 @@ class LedgerRepairService:
             delta = total - local_filled
             sign = 1 if row["direction"] == "LONG" else -1
             symbol = row["symbol"]
+            missing_base_fees = sum((base_fee_delta(f) for f in fills
+                                     if fill_key(f['instId'], f['tradeId']) not in existing), Decimal(0))
             if row["reduce_only"] and delta:
                 exposure = positions.get(symbol, Decimal(0))
                 if exposure * sign >= 0 or delta > abs(exposure):
                     raise LedgerEvidenceError("ledger fill conflict")
             if not row["reduce_only"] and total > decimal_value(row["approved_contracts"]):
                 raise LedgerEvidenceError("ledger fill conflict")
-            positions[symbol] = positions.get(symbol, Decimal(0)) + sign * delta
+            positions[symbol] = positions.get(symbol, Decimal(0)) + sign * delta + missing_base_fees
+            if is_spot(symbol) and positions[symbol] < 0:
+                raise LedgerEvidenceError('ledger fill conflict')
             cid = row["clOrdId"]
             if parent:
                 records.append(("orders", row.copy(), cid))
@@ -440,6 +449,8 @@ class LedgerRepairService:
                     int(first["fillTime"]) / 1000, UTC
                 ).isoformat(),
             }
+            if is_spot(symbol):
+                row.update(approved_contracts=str(decimal_value(d.get('sz'), positive=True)), market_type='SPOT')
         elif len(candidates) == 1:
             row = candidates[0]
         else:
@@ -447,7 +458,8 @@ class LedgerRepairService:
         if (
             row["symbol"] != symbol
             or (row["direction"] == "LONG") != (side == "buy")
-            or (str(d.get("reduceOnly")).lower() in {"true", "1"}) != bool(row["reduce_only"])
+            or (reduces_exposure(d) != bool(row['reduce_only']) if is_spot(symbol)
+                else (str(d.get("reduceOnly")).lower() in {"true", "1"}) != bool(row["reduce_only"]))
             or any(r.get("clOrdId") and d.get("clOrdId") != r["clOrdId"] for r in fills)
             or (row.get("order_id") and row["order_id"] != oid)
         ):

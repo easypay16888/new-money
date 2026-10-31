@@ -51,6 +51,7 @@ from app.okx import (
 )
 from app.paper_maintenance import MaintenanceBusy, MaintenanceError, PaperMaintenanceFence
 from app.portfolio import summarize_positions
+from app.products import is_spot, number, reduces_exposure
 from app.public_continuity import (
     CODE as PUBLIC_CONTINUITY_CODE,
 )
@@ -79,6 +80,7 @@ from app.safety import (
     EntryOrderController,
     PortfolioRiskMonitor,
 )
+from app.spot import SpotSafety, normalize_positions
 from app.storage import Store
 from app.strategies import build_strategies
 from app.terminal_fills import (
@@ -101,7 +103,7 @@ class TradingRuntime:
             self.store,
             orderbook_snapshot_interval_seconds=settings.orderbook_snapshot_interval_seconds,
         )
-        self.public_continuity = PublicMarketContinuity(settings.symbols)
+        self.public_continuity = PublicMarketContinuity(settings.trading_symbols)
         self._public_audit_lock = asyncio.Lock()
         self._public_audit_tasks: set[asyncio.Task[None]] = set()
         self._public_session: str | None = None
@@ -114,6 +116,8 @@ class TradingRuntime:
         self._lease_loss_task: asyncio.Task[None] | None = None
         self.client.live_writer_guard = self._live_writer_guard
         self.risk = RiskEngine(settings, self.governor)
+        self.spot_safety = SpotSafety(self)
+        self.client.spot_writer_guard = self.spot_safety.write_guard
         self.order_manager = OrderManager(self.store)
         self.order_manager.terminal_fill_recovery = self._recover_terminal_order
         self.entry_action_lock = asyncio.Lock()
@@ -133,6 +137,7 @@ class TradingRuntime:
         self.entry_controller = EntryOrderController(
             self.client, self.order_manager, self.store, self.entry_action_lock
         )
+        self.execution.entry_request_guard = self.spot_safety.entry_guard
         self.algo_manager = AlgoOrderManager(self.store)
         self.portfolio_monitor = PortfolioRiskMonitor(settings)
         self.emergency = EmergencyController(
@@ -372,6 +377,7 @@ class TradingRuntime:
         critical = emergency_state or self.governor.reason in {
             "position mismatch", "startup position mismatch", "startup fill size mismatch",
             "LIVE writer lease lost",
+            'spot inventory mismatch', 'unowned spot inventory',
         }
         lines = [f"Reason: {self.governor.reason}", "New entries: blocked"]
         if symbol:
@@ -493,7 +499,7 @@ class TradingRuntime:
             self.instruments.update(await self.client.instruments())
         except Exception:
             await self.enter_halt("instrument metadata unavailable")
-        for symbol in self.settings.symbols:
+        for symbol in self.settings.trading_symbols:
             for timeframe in self.settings.timeframes:
                 try:
                     rows = await self.client.candles(symbol, timeframe)
@@ -578,7 +584,7 @@ class TradingRuntime:
             and not any(row["symbol"] == symbol for row in self.order_manager.pending_entries())
             and not any(
                 row.get("instId") == symbol
-                and str(row.get("reduceOnly", "false")).lower() not in {"true", "1"}
+                and not reduces_exposure(row)
                 for row in pending
             )
             and {key: value for key, value in self._audited_positions().items() if value}
@@ -628,17 +634,27 @@ class TradingRuntime:
         }
 
     @staticmethod
-    def _verified_terminal_order(local: dict[str, Any], remote: dict[str, Any]) -> bool:
+    def _verified_terminal_order(
+        local: dict[str, Any], remote: dict[str, Any], *, terminal: bool = True,
+    ) -> bool:
         """Only exchange-confirmed owned terminal orders can resolve a snapshot race."""
         if (
-            remote.get("clOrdId") != local["clOrdId"]
+            (remote.get("clOrdId") != local["clOrdId"] and not (
+                is_spot(local['symbol']) and local.get('reduce_only')
+                and local['clOrdId'] == 'protective-' + str(remote.get('ordId') or '')
+                and remote.get('clOrdId') in (None, '')
+                and local.get('order_id') == remote.get('ordId')
+            ))
+            or (is_spot(local['symbol']) and remote.get('tdMode') != 'cash')
             or remote.get("instId") != local["symbol"]
             or remote.get("side") != ("buy" if local["direction"] == "LONG" else "sell")
-            or str(remote.get("reduceOnly", "")).lower()
-            != ("true" if local["reduce_only"] else "false")
+            or (reduces_exposure(remote) != bool(local['reduce_only'])
+                if is_spot(local['symbol']) else str(remote.get("reduceOnly", "")).lower()
+                != ("true" if local["reduce_only"] else "false"))
             or not remote.get("ordId")
             or (local.get("order_id") and remote["ordId"] != local["order_id"])
-            or remote.get("state") not in {"filled", "canceled", "mmp_canceled"}
+            or remote.get("state") not in ({"filled", "canceled", "mmp_canceled"}
+                                          if terminal else {"partially_filled"})
         ):
             return False
         try:
@@ -695,6 +711,7 @@ class TradingRuntime:
 
     async def _append_terminal_fills(
         self, detail: dict[str, Any], evidence: list[dict[str, Any]],
+        *, spot_partial: bool = False,
     ) -> None:
         evidence = [validate_fill(row, detail) for row in evidence]
         validate_fill_set(evidence, detail)
@@ -702,9 +719,12 @@ class TradingRuntime:
         async with manager.ledger_lock:
             client_id, symbol = detail["clOrdId"], detail["instId"]
             local = manager.orders.get(client_id)
-            if local is None or not self._verified_terminal_order(local, detail):
+            if (spot_partial and not is_spot(symbol)) or local is None or not self._verified_terminal_order(
+                local, detail, terminal=not spot_partial,
+            ):
                 raise TerminalFillError("terminal_fill_identity_mismatch")
-            terminal_state = "FILLED" if detail["state"] == "filled" else "CANCELLED"
+            terminal_state = ("PARTIALLY_FILLED" if spot_partial else
+                              "FILLED" if detail["state"] == "filled" else "CANCELLED")
             if local["state"] in {"FILLED", "CANCELLED", "REJECTED"} and local["state"] != terminal_state:
                 raise TerminalFillError("terminal_fill_evidence_conflict")
             snapshots = {
@@ -749,6 +769,8 @@ class TradingRuntime:
             # so the existing position delta reconciliation still sees new fills.
             local.update(terminal)
             manager.seen_trade_ids.update(remote)
+            if is_spot(symbol):
+                await manager.refresh_spot_fees()
 
     async def _reconcile_impl(self) -> None:
         self.entry_controller.client = self.client
@@ -775,6 +797,7 @@ class TradingRuntime:
             account, positions, orders, algos = await self._refresh_terminal_order_snapshot(
                 account, positions, orders, algos
             )
+            positions = normalize_positions(account, positions, self.settings.spot_symbols)
             read_phase = False
             if not config or config[0].get("posMode") != "net_mode":
                 raise RuntimeError("net position mode required")
@@ -790,6 +813,10 @@ class TradingRuntime:
             )
             equity = Decimal(usdt.get("eq") or "0")
             available = Decimal(usdt.get("availEq") or usdt.get("availBal") or "0")
+            if self.settings.spot_symbols:
+                equity += sum((number(p['notionalUsd']) for p in positions
+                               if is_spot(p['instId'])), Decimal(0))
+                available = min(available, number(usdt['availBal']))
             remote_positions = {
                 p["instId"]: Decimal(p["pos"]) for p in positions if Decimal(p["pos"]) != 0
             }
@@ -801,7 +828,10 @@ class TradingRuntime:
             foreign_order: dict[str, Any] | None = None
             for order in orders:
                 local = self.order_manager.orders.get(order.get("clOrdId", ""))
-                remote_reduce_only = str(order.get("reduceOnly", "false")).lower() in {"true", "1"}
+                remote_reduce_only = reduces_exposure(order)
+                if is_spot(str(order.get('instId') or '')) and local is None:
+                    foreign_order = order
+                    continue
                 if (local is None and not remote_reduce_only) or (
                     local is not None
                     and (
@@ -811,6 +841,16 @@ class TradingRuntime:
                 ):
                     foreign_order = order
                     continue
+                if (local and is_spot(local['symbol'])
+                        and Decimal(str(order.get('accFillSz') or '0')) > 0):
+                    try:
+                        if not self._verified_terminal_order(local, order, terminal=False):
+                            raise TerminalFillError('terminal_fill_identity_mismatch')
+                        evidence = await read_terminal_fills(self.client, order)
+                        await self._append_terminal_fills(order, evidence, spot_partial=True)
+                    except Exception:
+                        await self.enter_emergency(local['symbol'], 'spot partial fill evidence unavailable')
+                        return
                 if local and not local["reduce_only"] and not self.portfolio.synchronized:
                     raw_filled = order.get("accFillSz")
                     if raw_filled in (None, ""):
@@ -916,13 +956,27 @@ class TradingRuntime:
             if cancellation_unconfirmed:
                 await self.enter_halt("startup entry cancellation unconfirmed")
                 return
+            audited_spot = self._audited_positions()
+            for symbol in self.settings.spot_symbols:
+                if audited_spot.get(symbol, Decimal(0)) != remote_positions.get(symbol, Decimal(0)):
+                    reason = ('unowned spot inventory' if not audited_spot.get(symbol)
+                              else 'spot inventory mismatch')
+                    await self.enter_halt(reason)
+                    if audited_spot.get(symbol):
+                        await self._repair_position_ledger(reason, remote_positions)
+                    return
+                if not remote_positions.get(symbol) and any(
+                    a.get('instId') == symbol and a.get('state') == 'live' for a in algos
+                ):
+                    await self.enter_halt('orphan spot protective order')
+                    return
             for symbol, quantity in remote_positions.items():
                 if not await self._verify_protection(symbol, quantity, algos):
                     return
             if any(
                 Decimal(p.get("mgnRatio") or "0") < Decimal(str(self.settings.min_margin_ratio))
                 for p in positions
-                if Decimal(p.get("pos") or "0") != 0
+                if Decimal(p.get("pos") or "0") != 0 and not is_spot(p['instId'])
             ):
                 for symbol in remote_positions:
                     await self.enter_emergency(symbol, "margin ratio danger")
@@ -951,6 +1005,8 @@ class TradingRuntime:
                     current = self.portfolio.positions.get(symbol, Decimal(0))
                     delta = remote - current
                     authorized = expected.get(symbol, Decimal(0))
+                    if delta == 0:
+                        continue  # Another product may have changed while this holding is unchanged.
                     if delta * authorized <= 0 or abs(delta) > abs(authorized):
                         unexpected = True
                         break
@@ -1040,6 +1096,8 @@ class TradingRuntime:
                 weekly_drawdown=(weekly_peak - equity) / weekly_peak if weekly_peak else Decimal(0),
                 open_risk=open_risk,
                 positions=remote_positions,
+                spot_notional=sum((number(p['notionalUsd']) for p in positions
+                                   if is_spot(p['instId'])), Decimal(0)),
                 synchronized=True,
             )
             await self.store.append("portfolio_snapshots", self.portfolio.model_dump(mode="json"))
@@ -1172,7 +1230,8 @@ class TradingRuntime:
             )
             if not (
                 quantity * direction > 0
-                and abs(quantity) >= Decimal(entry["filled"])
+                and (abs(quantity) >= Decimal(entry["filled"])
+                     or (is_spot(symbol) and quantity == self._audited_positions().get(symbol)))
                 and instrument is not None
                 and stop
                 and self.algo_manager.valid(
@@ -1230,6 +1289,10 @@ class TradingRuntime:
             "reduceOnly": "true",
             "algoClOrdId": "a" + __import__("uuid").uuid4().hex[:30],
         }
+        if is_spot(symbol):
+            body.update(tdMode='cash', slTriggerPxType='last')
+            body.pop('posSide')
+            body.pop('reduceOnly')
         try:
             await self.client.place_algo(body)
             deadline = asyncio.get_running_loop().time() + self.settings.protection_confirm_seconds
@@ -1323,7 +1386,7 @@ class TradingRuntime:
         self.sockets = [
             OkxWebSocket(
                 base + "/public",
-                public_subscriptions(self.settings.symbols),
+                public_subscriptions(self.settings.trading_symbols),
                 self._on_market,
                 self.settings, name="public-market", metrics=self.metrics,
                 on_fault=self._on_ws_fault, on_ready=self._on_ws_ready,
@@ -1331,7 +1394,7 @@ class TradingRuntime:
             ),
             OkxWebSocket(
                 base + "/business",
-                candle_subscriptions(self.settings.symbols, self.settings.timeframes),
+                candle_subscriptions(self.settings.trading_symbols, self.settings.timeframes),
                 self._on_market,
                 self.settings, name="business-candles", metrics=self.metrics,
                 on_fault=self._on_ws_fault, on_ready=self._on_ws_ready,
@@ -1442,7 +1505,7 @@ class TradingRuntime:
                 raise RuntimeError("shutdown cancellation or protection unconfirmed")
             pending = await self.client.pending_orders()
             if self.order_manager.pending_entries() or any(
-                str(order.get("reduceOnly", "false")).lower() not in {"true", "1"}
+                not reduces_exposure(order)
                 for order in pending
             ):
                 raise RuntimeError("shutdown risk-increasing entry remains pending")
@@ -1519,11 +1582,17 @@ class TradingRuntime:
         for row in self.order_manager.orders.values():
             signed = Decimal(row["filled"]) * (1 if row["direction"] == "LONG" else -1)
             positions[row["symbol"]] = positions.get(row["symbol"], Decimal(0)) + signed
+        for symbol, fees in self.order_manager.spot_fees.items():
+            positions[symbol] = positions.get(symbol, Decimal(0)) + fees
         return positions
 
     @staticmethod
     def _short_symbol(symbol: str) -> str:
         return symbol.split("-")[0]
+
+    @staticmethod
+    def _quantity_unit(symbol: str) -> str:
+        return symbol.split('-')[0] if is_spot(symbol) else 'contracts'
 
     @staticmethod
     def _positive_decimal(value: Any) -> Decimal | None:
@@ -1537,7 +1606,7 @@ class TradingRuntime:
         symbol = order["symbol"]
         lines = [
             f"Side: {order['direction']}",
-            f"Size: {order['approved_contracts']} contracts",
+            f"Size: {order['approved_contracts']} {self._quantity_unit(symbol)}",
             f"Entry ref: {order['entry_reference']}",
             f"Stop: {order['stop_price']}",
         ]
@@ -1556,7 +1625,7 @@ class TradingRuntime:
         remaining = max(Decimal(0), Decimal(order["approved_contracts"]) - filled)
         await self.alert(
             "WARNING", f"⚠️ {self._short_symbol(symbol)} Partial Fill",
-            f"Filled: {filled} contracts\nRemaining: {remaining} contracts"
+            f"Filled: {filled} {self._quantity_unit(symbol)}\nRemaining: {remaining} {self._quantity_unit(symbol)}"
             f"\nProtection: {'confirmed' if protected else 'pending / emergency'}",
             category=NotificationCategory.TRADE,
             priority=NotificationPriority.TIME_SENSITIVE,
@@ -1571,7 +1640,8 @@ class TradingRuntime:
             return
         self._entry_filled_announced.add(client_id)
         symbol = order["symbol"]
-        lines = [f"Contracts: {order['filled']}"]
+        lines = ([f"Base quantity: {order['filled']} {self._quantity_unit(symbol)}"] if is_spot(symbol)
+                 else [f"Contracts: {order['filled']}"])
         price = (exchange_event or {}).get("avgPx") or (exchange_event or {}).get("fillPx")
         if self._positive_decimal(price) is not None:
             lines.insert(0, f"Entry: {price}")
@@ -1984,6 +2054,17 @@ class TradingRuntime:
                     expired = bool(expiry_at and expiry_at <= utcnow())
                     await self.order_manager.ingest(row)
                     local_after = self.order_manager.orders.get(row.get("clOrdId", ""))
+                    if is_spot(str(row.get('instId') or '')):
+                        local_after = local_after or self.order_manager.orders.get(
+                            'protective-' + str(row.get('ordId') or '')
+                        )
+                        if local_after and row.get('state') in {'filled', 'canceled', 'mmp_canceled'}:
+                            details = (await self.client.order_by_id(row['instId'], row['ordId'])
+                                       if not row.get('clOrdId') else
+                                       await self.client.order(row['instId'], row['clOrdId']))
+                            if len(details) != 1:
+                                raise TerminalFillError('terminal_fill_evidence_incomplete')
+                            await self._recover_terminal_order(local_after, details[0])
                     if (
                         local_after and local_after["reduce_only"]
                         and self._positive_decimal(row.get("fillSz")) is not None
@@ -2326,6 +2407,8 @@ class TradingRuntime:
             issues.append("portfolio_sync")
         if not self.store.healthy:
             issues.append("database")
+        if any(symbol not in self.instruments for symbol in self.settings.spot_symbols):
+            issues.append('spot_instrument_metadata')
         caa_max_age = min(
             self.settings.cancel_all_after_seconds,
             self.settings.cancel_all_after_refresh_seconds * 2,

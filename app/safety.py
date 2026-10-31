@@ -9,6 +9,7 @@ from typing import Any
 from app.config import Settings
 from app.execution import ExecutionEngine, OrderManager
 from app.models import OrderState, PortfolioState, Side
+from app.products import is_spot
 from app.storage import Store
 
 logger = logging.getLogger("safety")
@@ -165,6 +166,11 @@ class AlgoOrderManager:
             "failReason": event.get("failReason", ""),
             "reduceOnly": event.get("reduceOnly", ""),
         }
+        if is_spot(row['symbol']):
+            row.update(tdMode=event.get('tdMode', ''),
+                       trigger_type=event.get('slTriggerPxType', ''),
+                       stop_order_price=event.get('slOrdPx', ''),
+                       ordType=event.get('ordType', ''))
         self.algos[client_id] = row
         await self.store.append("algo_events", row, symbol=row["symbol"], reference_id=client_id)
 
@@ -190,6 +196,17 @@ class AlgoOrderManager:
             trigger = Decimal(str(algo.get("slTriggerPx", algo.get("trigger", ""))))
         except Exception:
             return False
+        if is_spot(symbol):
+            return (
+                position.is_finite() and position > 0 and size.is_finite() and size == position
+                and trigger.is_finite() and trigger > 0
+                and abs(trigger - stop_price) <= tolerance
+                and algo.get('state') in self.ACTIVE and not self.has_failure(algo)
+                and algo.get('tdMode') == 'cash'
+                and algo.get('slTriggerPxType', algo.get('trigger_type')) == 'last'
+                and str(algo.get('slOrdPx', algo.get('stop_order_price'))) == '-1'
+                and algo.get('ordType') in {'conditional', 'oco'}
+            )
         return (
             size >= abs(position)
             and abs(trigger - stop_price) <= tolerance
@@ -256,6 +273,22 @@ class EmergencyController:
         )
         remaining = remote - target
         if remaining == 0:
+            if is_spot(symbol):
+                previous = self.inflight.get(symbol)
+                local = self.manager.orders.get(previous or '')
+                if local and self.manager.terminal_fill_recovery:
+                    try:
+                        details = await self.client.order(symbol, previous)
+                        if len(details) != 1:
+                            return False
+                        await self.manager.terminal_fill_recovery(local, details[0])
+                    except Exception:
+                        return False
+                audited = sum((Decimal(row['filled']) * (1 if row['direction'] == 'LONG' else -1)
+                               for row in self.manager.orders.values() if row['symbol'] == symbol), Decimal(0))
+                audited += self.manager.spot_fees.get(symbol, Decimal(0))
+                if audited != target:
+                    return False
             self.targets.pop(symbol)
             self.inflight.pop(symbol, None)
             await self.store.append(
@@ -278,6 +311,12 @@ class EmergencyController:
                 if not details:
                     return False
                 detail = details[0]
+                if (is_spot(symbol) and detail.get('state') in {'filled', 'canceled', 'mmp_canceled'}
+                        and self.manager.terminal_fill_recovery):
+                    try:
+                        await self.manager.terminal_fill_recovery(row, detail)
+                    except Exception:
+                        return False
                 state = {
                     "filled": OrderState.FILLED,
                     "canceled": OrderState.CANCELLED,
@@ -328,7 +367,7 @@ class PortfolioRiskMonitor:
     ) -> tuple[str, str | None]:
         p = portfolio
         for row in positions:
-            if Decimal(row.get("pos") or "0") and Decimal(row.get("mgnRatio") or "0") < Decimal(
+            if not is_spot(row.get('instId', '')) and Decimal(row.get("pos") or "0") and Decimal(row.get("mgnRatio") or "0") < Decimal(
                 str(self.settings.min_margin_ratio)
             ):
                 return "margin ratio danger", row["instId"]

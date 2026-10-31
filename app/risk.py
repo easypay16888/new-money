@@ -54,10 +54,17 @@ class RiskEngine:
 
         if self.governor.state != GovernorState.NORMAL:
             return reject(self.governor.reason, "HALT")
+        spot = instrument.market_type == 'SPOT'
+        if spot and (intent.symbol not in self.settings.spot_symbols or intent.direction != Side.LONG):
+            return reject('spot permits configured cash long entries only')
+        if spot and (instrument.contract_value != 1
+                     or instrument.contract_currency != intent.symbol.split('-')[0]):
+            return reject('invalid spot unit metadata')
+        leverage = 1 if spot else self.settings.leverage
         # Validate before Decimal comparisons/rounding; unknown numeric state fails closed.
         values = [
             portfolio.equity, portfolio.available_balance, portfolio.margin_used,
-            portfolio.position_notional, portfolio.open_risk, portfolio.daily_pnl,
+            portfolio.position_notional, portfolio.spot_notional, portfolio.open_risk, portfolio.daily_pnl,
             portfolio.weekly_drawdown, intent.entry_reference, intent.stop_price,
             instrument.contract_value, instrument.lot_size, instrument.min_size,
             instrument.tick_size, spread, *portfolio.positions.values(),
@@ -77,7 +84,7 @@ class RiskEngine:
                 instrument.lot_size, instrument.min_size, instrument.tick_size,
             ))
             or any(value < 0 for value in (
-                portfolio.margin_used, portfolio.position_notional, portfolio.open_risk,
+                portfolio.margin_used, portfolio.position_notional, portfolio.spot_notional, portfolio.open_risk,
                 portfolio.weekly_drawdown, spread, *config_values[2:5],
             ))
             or not Decimal(0) < config_values[0] < config_values[1]
@@ -87,6 +94,7 @@ class RiskEngine:
         if not portfolio.synchronized or not data_fresh or not infrastructure_healthy:
             self.governor.halt("state or data unhealthy")
             return reject(self.governor.reason, "HALT")
+        committed = portfolio.margin_used + portfolio.spot_notional
         if portfolio.equity <= 0 or portfolio.available_balance <= 0:
             return reject("no available equity")
         if portfolio.daily_pnl <= -portfolio.equity * Decimal(str(self.settings.max_daily_loss)):
@@ -128,23 +136,26 @@ class RiskEngine:
             portfolio.equity * Decimal(self.settings.max_leverage) - portfolio.position_notional,
         )
         cap_margin = (
-            portfolio.equity * Decimal(str(self.settings.max_margin_usage)) - portfolio.margin_used
-        ) * Decimal(self.settings.leverage)
+            portfolio.equity * Decimal(str(self.settings.max_margin_usage)) - committed
+        ) * Decimal(leverage)
         # M + N/L <= target * (E - existing stop/cost reserves - N * adverse_rate).
         # Risk-per-trade still determines desired_notional; this cap can only reduce it.
         target_usage = Decimal(str(self.settings.margin_usage_target))
         costs = (Decimal(2) * max(Decimal(str(self.settings.maker_fee)),
                                  Decimal(str(self.settings.taker_fee)))
                  + Decimal(2) * Decimal(str(self.settings.slippage_bps)) / Decimal(10000))
+        if spot:
+            costs = (Decimal(2) * Decimal(str(self.settings.spot_fee_rate))
+                     + Decimal(2) * Decimal(str(self.settings.slippage_bps)) / Decimal(10000))
         adverse_rate = distance / entry + costs
         stressed_equity = (portfolio.equity - portfolio.open_risk
                            - portfolio.position_notional * costs)
         cap_buffer = max(Decimal(0),
-                         (target_usage * stressed_equity - portfolio.margin_used)
-                         / (Decimal(1) / Decimal(self.settings.leverage)
+                         (target_usage * stressed_equity - committed)
+                         / (Decimal(1) / Decimal(leverage)
                             + target_usage * adverse_rate))
         cap_available = portfolio.available_balance / (
-            Decimal(1) / Decimal(self.settings.leverage) + adverse_rate
+            Decimal(1) / Decimal(leverage) + adverse_rate
         )
         notional = max(Decimal(0), min(desired_notional, cap_leverage, cap_margin,
                                      cap_buffer, cap_available))
@@ -159,8 +170,10 @@ class RiskEngine:
         ) * instrument.lot_size
         if contracts < instrument.min_size:
             return reject("below minimum contract size")
+        if spot and contracts * (1 - Decimal(str(self.settings.spot_fee_rate))) < instrument.min_size:
+            return reject('spot net inventory below minimum exit size')
         actual_notional = contracts * per_contract
-        if actual_notional / Decimal(self.settings.leverage) > portfolio.available_balance:
+        if actual_notional / Decimal(leverage) > portfolio.available_balance:
             return reject("insufficient available balance")
         target = None
         if intent.take_profit_reference is not None:
@@ -181,7 +194,7 @@ class RiskEngine:
             direction=intent.direction,
             approved_contracts=contracts,
             approved_notional=actual_notional,
-            leverage=self.settings.leverage,
+            leverage=leverage,
             stop_price=stop,
             entry_reference=entry,
             take_profit_reference=target,
@@ -193,6 +206,8 @@ class RiskEngine:
     ) -> RiskDecision:
         if self.governor.state != GovernorState.EMERGENCY or contracts <= 0:
             raise ValueError("emergency reduce requires active EMERGENCY and positive size")
+        if instrument.market_type == 'SPOT' and open_direction != Side.LONG:
+            raise ValueError('spot emergency cannot buy to cover or borrow')
         size = (contracts / instrument.lot_size).to_integral_value(
             rounding=ROUND_DOWN
         ) * instrument.lot_size

@@ -150,6 +150,7 @@ class Instrument(BaseModel):
     lot_size: Decimal
     min_size: Decimal
     tick_size: Decimal
+    market_type: Literal['SWAP', 'SPOT'] = 'SWAP'
 
 
 class MarketStateVector(BaseModel):
@@ -248,6 +249,7 @@ class PortfolioState(BaseModel):
     open_risk: Decimal = Decimal(0)
     positions: dict[str, Decimal] = Field(default_factory=dict)
     synchronized: bool = False
+    spot_notional: Decimal = Decimal(0)
 
 
 class RiskDecision(BaseModel):
@@ -273,6 +275,7 @@ class ExecutionRequest(BaseModel):
     price: Decimal | None = None
     reduce_only: bool = False
     signal_expires_at: datetime | None = None
+    market_type: Literal['SWAP', 'SPOT'] = 'SWAP'
 
     @property
     def symbol(self) -> str:

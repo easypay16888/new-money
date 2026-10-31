@@ -10,6 +10,7 @@ from uuid import uuid4
 from app.market import MarketDataEngine
 from app.models import utcnow
 from app.okx import OkxWebSocket
+from app.products import is_spot
 
 REASON = "Public market continuity lost"
 CODE = "public_market_continuity_lost"
@@ -105,7 +106,7 @@ class PublicMarketContinuity:
             return bool(timestamp is not None and timestamp >= self.since
                         and 0 <= (now - timestamp).total_seconds() < stale_seconds)
 
-        symbols = {}
+        symbols: dict[str, dict[str, Any]] = {}
         for symbol in self.symbols:
             tick, book = market.latest_ticks.get(symbol), market.latest_books.get(symbol)
             observations = market.derivative_observations.get(symbol)
@@ -123,6 +124,9 @@ class PublicMarketContinuity:
                                     and fresh(index[-1].timestamp)),
                 'trade_samples': samples, 'trade_samples_required': TRADE_SAMPLES,
             }
+            if is_spot(symbol):
+                symbols[symbol].update(mark_ready=None, index_ready=None,
+                                       derivative_feeds_required=False)
         ready = bool(
             not self.corrupt and (self.persisted or self.hold is None)
             and ws is not None and ws.worker_alive and ws.is_transport_healthy()
@@ -130,9 +134,10 @@ class PublicMarketContinuity:
             and ws.is_processing_healthy() and ws.is_data_fresh() and ws.business_idle
             and (not self.required or ws.generation > self.generation_after)
             and (not self.required or all(
-                row['ticker_ready'] and row['book_ready'] and row['mark_ready']
-                and row['index_ready'] and row['trade_samples'] >= TRADE_SAMPLES
-                for row in symbols.values()
+                row['ticker_ready'] and row['book_ready']
+                and (is_spot(symbol) or (row['mark_ready'] and row['index_ready']))
+                and row['trade_samples'] >= TRADE_SAMPLES
+                for symbol, row in symbols.items()
             ))
         )
         return {'hold_active': self.hold is not None or self.corrupt,
